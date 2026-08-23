@@ -1,0 +1,1 @@
+"""desktop.widgets -- Reusable Qt widgets for the Lytrize desktop app."""

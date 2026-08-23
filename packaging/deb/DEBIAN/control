@@ -1,0 +1,17 @@
+Package: lytrize
+Version: 1.0
+Architecture: amd64
+Maintainer: Lytrize <vnat8638@gmail.com>
+Depends: python3 (>= 3.11), libgl1, libegl1, libglib2.0-0, libxcb-cursor0, libdbus-1-3
+Recommends: chromium-browser | google-chrome-stable | firefox,
+  fonts-noto, fonts-source-sans-pro, fonts-lato, fonts-oswald, fonts-barlow,
+  fonts-ebgaramond, fonts-firacode, fonts-jetbrains-mono, fonts-dejavu
+Description: Lytrize — Offline Desktop Analytics
+ Analyse CSV and Excel files locally with interactive Plotly charts,
+ saved dashboards, KPI cards, and export to PDF/image.
+ .
+ Features: distribution analysis, time series, correlation, outlier
+ detection, categorical charts, map plots, and more.
+ .
+ Fully offline — no internet connection, no cloud account, and no
+ telemetry. All data stays on this device.

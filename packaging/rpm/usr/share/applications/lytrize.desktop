@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Lytrize
+Comment=Local-first data analysis platform
+Exec=/usr/local/bin/lytrize
+Icon=/usr/share/pixmaps/lytrize.png
+Type=Application
+Categories=Office;Science;DataVisualization;Utility;
+Terminal=false
+StartupNotify=true
+StartupWMClass=Lytrize
+X-GNOME-Autostart-enabled=false

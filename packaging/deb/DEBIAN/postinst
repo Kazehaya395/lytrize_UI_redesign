@@ -1,0 +1,100 @@
+#!/bin/bash
+# postinst -- Lytrize post-install script
+# NOTE: no "set -e" — individual steps fail gracefully so one broken
+# optional step cannot prevent the rest (caches, icons) from running.
+
+VENV=/opt/lytrize/venv
+ASSETS=/opt/lytrize/backend/assets
+ICON_SRC="$ASSETS/lytrize.png"
+
+# ── 1. Clear stale bytecode ───────────────────────────────────────────────────
+find /opt/lytrize/backend -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+find /opt/lytrize/backend -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete 2>/dev/null || true
+
+# ── 2. Re-link venv to this machine's Python ─────────────────────────────────
+# Replaces build-machine python symlinks with the target machine's python3.
+# Never calls "venv --upgrade" (which needs ensurepip / python3-venv).
+PYTHON_BIN="$(command -v python3 2>/dev/null || true)"
+
+if [ -z "$PYTHON_BIN" ]; then
+    echo "WARNING: python3 not found — skipping venv re-link." >&2
+else
+    echo "Linking Lytrize to system Python ($PYTHON_BIN)..."
+
+    PYTHON_VER="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
+    PYTHON_DIR="$(dirname "$(readlink -f "$PYTHON_BIN")" 2>/dev/null || true)"
+
+    ln -sf "$PYTHON_BIN" "$VENV/bin/python"              2>/dev/null || true
+    ln -sf "$PYTHON_BIN" "$VENV/bin/python3"             2>/dev/null || true
+    [ -n "$PYTHON_VER" ] && \
+        ln -sf "$PYTHON_BIN" "$VENV/bin/python${PYTHON_VER}" 2>/dev/null || true
+
+    # Update pyvenv.cfg home + version so venv autodiscovery is correct
+    if [ -f "$VENV/pyvenv.cfg" ] && [ -n "$PYTHON_DIR" ]; then
+        FULL_VER="$(python3 --version 2>&1 | awk '{print $2}')"
+        sed -i "s|^home = .*|home = $PYTHON_DIR|"     "$VENV/pyvenv.cfg" 2>/dev/null || true
+        sed -i "s|^version = .*|version = $FULL_VER|" "$VENV/pyvenv.cfg" 2>/dev/null || true
+    fi
+
+    # If the venv was built with a different Python minor version, create a
+    # lib/python3.Y → lib/python3.X symlink so packages are found.
+    if [ -n "$PYTHON_VER" ]; then
+        VENV_LIB="$VENV/lib"
+        BUILD_PYVER="$(ls "$VENV_LIB" 2>/dev/null \
+            | grep -E '^python[0-9]+\.[0-9]+$' | head -1 | sed 's/^python//')"
+        if [ -n "$BUILD_PYVER" ] && [ "$BUILD_PYVER" != "$PYTHON_VER" ]; then
+            echo "  Note: built with Python $BUILD_PYVER, target is $PYTHON_VER — creating compat link."
+            ln -sfn "$VENV_LIB/python${BUILD_PYVER}" \
+                    "$VENV_LIB/python${PYTHON_VER}" 2>/dev/null || true
+        fi
+    fi
+fi
+
+# ── 3. Fix permissions ────────────────────────────────────────────────────────
+# Ensure all of /opt/lytrize is world-readable so non-root users can run it
+find /opt/lytrize -type d -exec chmod 755 {} \;      2>/dev/null || true
+find /opt/lytrize -type f -exec chmod 644 {} \;      2>/dev/null || true
+chmod 755 /opt/lytrize/desktop/launcher.py           2>/dev/null || true
+chmod 755 /opt/lytrize/desktop/gui.py                2>/dev/null || true
+find "$VENV/bin" -type f -exec chmod 755 {} \;       2>/dev/null || true
+
+# ── 4. Create per-user data directory ────────────────────────────────────────
+# During "sudo apt install" $HOME is /root.  Resolve the real user via
+# SUDO_USER so the data dir lands in their home, not in /root.
+TARGET_USER="${SUDO_USER:-}"
+if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
+    USER_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)"
+    if [ -n "$USER_HOME" ] && [ -d "$USER_HOME" ]; then
+        mkdir -p "$USER_HOME/.local/share/lytrize"
+        chown "$TARGET_USER" "$USER_HOME/.local/share/lytrize" 2>/dev/null || true
+    fi
+fi
+
+# ── 5. Icons ──────────────────────────────────────────────────────────────────
+# The .deb already contains /usr/share/pixmaps/lytrize.png and
+# /usr/share/icons/hicolor/256x256/apps/lytrize.png (put there by build.sh).
+# This step additionally tries to create scaled copies at common sizes.
+if [ -f "$ICON_SRC" ]; then
+    for SIZE in 16 22 24 32 48 64 96 128 256; do
+        IDIR="/usr/share/icons/hicolor/${SIZE}x${SIZE}/apps"
+        mkdir -p "$IDIR"
+        if command -v convert >/dev/null 2>&1; then
+            convert "$ICON_SRC" -resize "${SIZE}x${SIZE}" "$IDIR/lytrize.png" 2>/dev/null \
+                || cp "$ICON_SRC" "$IDIR/lytrize.png" 2>/dev/null || true
+        else
+            cp "$ICON_SRC" "$IDIR/lytrize.png" 2>/dev/null || true
+        fi
+    done
+    mkdir -p /usr/share/icons/hicolor/scalable/apps /usr/share/pixmaps
+    cp "$ICON_SRC" /usr/share/icons/hicolor/scalable/apps/lytrize.png 2>/dev/null || true
+    cp "$ICON_SRC" /usr/share/pixmaps/lytrize.png                     2>/dev/null || true
+fi
+
+# ── 6. Refresh caches ─────────────────────────────────────────────────────────
+gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
+update-desktop-database /usr/share/applications      2>/dev/null || true
+xdg-desktop-menu forceupdate                         2>/dev/null || true
+
+echo "Lytrize installed successfully."
+echo "Launch from your application menu or run: lytrize"
+exit 0

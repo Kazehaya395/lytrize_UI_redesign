@@ -1,0 +1,43 @@
+#!/bin/bash
+# /usr/local/bin/lytrize — Lytrize launcher stub
+
+VENV=/opt/lytrize/venv
+LOG=/tmp/lytrize-launch.log
+
+# ── Sanity checks ─────────────────────────────────────────────────────────────
+if [ ! -d "$VENV" ]; then
+    echo "ERROR: Lytrize installation not found at /opt/lytrize" >&2
+    echo "Try reinstalling: sudo dpkg -i lytrize_*.deb" >&2
+    exit 1
+fi
+
+if [ ! -x "$VENV/bin/python" ] && [ ! -L "$VENV/bin/python" ]; then
+    echo "ERROR: Venv Python not found at $VENV/bin/python" >&2
+    exit 1
+fi
+
+# ── PYTHONPATH — guarantee packages are found regardless of Python version ────
+# The venv packages live in lib/python3.X/site-packages where 3.X is the build
+# version.  Setting PYTHONPATH explicitly bypasses venv autodiscovery entirely,
+# so the app works even when the target Python minor version differs.
+SITE_PKG="$(find "$VENV/lib" -maxdepth 2 -name site-packages -type d 2>/dev/null | head -1)"
+if [ -n "$SITE_PKG" ]; then
+    export PYTHONPATH="$SITE_PKG${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
+# ── Qt / PySide6 environment ───────────────────────────────────────────────────
+# Help PySide6 locate its bundled Qt plugins (xcb platform, cursor theme, etc.)
+# These variables are ignored by non-Qt processes.
+PYSIDE6_DIR="$(find "$VENV/lib" -maxdepth 4 -type d -name PySide6 2>/dev/null | head -1)"
+if [ -n "$PYSIDE6_DIR" ]; then
+    export QT_PLUGIN_PATH="$PYSIDE6_DIR/Qt/plugins"
+    export QT_QPA_PLATFORM_PLUGIN_PATH="$PYSIDE6_DIR/Qt/plugins/platforms"
+    # Add PySide6 shared libs to LD_LIBRARY_PATH so xcb plugin links resolve
+    export LD_LIBRARY_PATH="$PYSIDE6_DIR:$PYSIDE6_DIR/Qt/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+# Suppress noisy Qt debug output unless the user explicitly wants it
+export QT_LOGGING_RULES="${QT_LOGGING_RULES:-*.debug=false;qt.qpa.*=false}"
+
+# ── Launch ────────────────────────────────────────────────────────────────────
+exec "$VENV/bin/python" /opt/lytrize/desktop/launcher.py "$@" 2>>"$LOG"
