@@ -16,6 +16,7 @@ Exercises every operation that changed during the fixes:
   - String Ops: all 6 ops value-checked + preview/apply + stale-state reset (11, 12)
   - Numeric Clean: all 9 ops value-checked + op-key round-trip + reset (13, 14)
   - Dtype: close button, bounded preview table, honest lossy preview, apply (15)
+  - Date conversion: day-first detection for DD/MM/YYYY columns (user report)
 """
 from __future__ import annotations
 
@@ -704,6 +705,95 @@ def test_dtype_extra():
           str(bridge.df["n"].dtype) if bridge.df is not None else "no df")
 
 
+def test_date_conversion():
+    """Regression: categorical DD/MM/YYYY -> date lost 61% of values and
+    silently swapped month/day for day<=12 (user report 'date conversion not
+    working': transaction_date preview showed 39.0% / 58,202 of 149,116)."""
+    print("[16] Dtype date conversion: day-first (DD/MM/YYYY) columns")
+    import datetime as _dt
+    import services.transform_service as tss
+
+    # Service level: the exact user scenario (category dtype, DD/MM/YYYY)
+    s = pd.Series(["01/01/2023", "13/01/2023", "05/01/2023", "bad", None],
+                  dtype="category")
+    res = tss.preview_dtype_conversion(s, "date")
+    check("day-first categorical -> date (80% success)",
+          "error" not in res and res["pct"] == 80.0,
+          f"pct={res.get('pct')} err={res.get('error')}")
+    conv = pd.Series(res["converted"])
+    check("no month/day swap (13/01->Jan13, 05/01->Jan5)",
+          conv.iloc[0] == _dt.date(2023, 1, 1)
+          and conv.iloc[1] == _dt.date(2023, 1, 13)
+          and conv.iloc[2] == _dt.date(2023, 1, 5)
+          and pd.isna(conv.iloc[3]) and pd.isna(conv.iloc[4]),
+          repr(list(conv)))
+
+    res_dt = tss.preview_dtype_conversion(s, "datetime64[ns]")
+    conv_dt = pd.Series(res_dt["converted"])
+    check("day-first categorical -> datetime64[ns]",
+          res_dt["pct"] == 80.0 and conv_dt.iloc[1] == pd.Timestamp("2023-01-13"),
+          repr(list(conv_dt)))
+
+    # Unambiguous US month-first column must stay month-first
+    res_us = tss.preview_dtype_conversion(
+        pd.Series(["01/13/2023", "05/20/2023", "12/31/2023"]), "datetime64[ns]")
+    conv_us = pd.Series(res_us["converted"])
+    check("US month-first preserved",
+          res_us["pct"] == 100.0
+          and list(conv_us) == pd.to_datetime(
+              ["2023-01-13", "2023-05-20", "2023-12-31"]).tolist(),
+          repr(list(conv_us)))
+
+    # Mixed conventions: day>12 values recovered via explicit-format retry
+    res_mix = tss.preview_dtype_conversion(
+        pd.Series(["13/01/2023", "01/13/2023"]), "datetime64[ns]")
+    conv_mix = pd.Series(res_mix["converted"])
+    check("mixed day/month conventions both recovered",
+          res_mix["pct"] == 100.0
+          and conv_mix.iloc[0] == pd.Timestamp("2023-01-13")
+          and conv_mix.iloc[1] == pd.Timestamp("2023-01-13"),
+          repr(list(conv_mix)))
+
+    # ISO columns unaffected
+    res_iso = tss.preview_dtype_conversion(
+        pd.Series(["2024-01-05", "2024-02-10", "junk"]), "date")
+    check("ISO dates still parse (2/3 success)",
+          res_iso["pct"] == round((2 / 3) * 100, 1)
+          and pd.Series(res_iso["converted"]).iloc[0] == _dt.date(2024, 1, 5),
+          f"pct={res_iso['pct']}")
+
+    # UI level: exact user scenario through the panel
+    app()
+    from desktop.pages.dtype_transformer_panel import DtypeTransformerPanel
+    bridge = capturing_bridge()
+    p = DtypeTransformerPanel(bridge)
+    df = pd.DataFrame({
+        "transaction_date": pd.Series(
+            ["01/01/2023", "13/01/2023", "05/01/2023"], dtype="category"),
+        "qty": [1, 2, 3],
+    })
+    p.set_dataframe(df)
+    p.cmb_col.setCurrentText("transaction_date")
+    p.cmb_target_dtype.setCurrentText("date")
+    p._on_preview()
+    check("panel: day-first preview 100%",
+          "100.0% success rate" in p.lbl_preview_title.text(),
+          p.lbl_preview_title.text())
+    item = p.table_preview.item(0, 1)
+    check("panel: preview shows ISO date",
+          item is not None and item.text() == "2023-01-01",
+          item.text() if item else "no item")
+    p._on_apply()
+    if p._worker is not None:
+        p._worker.wait(10000)
+    app().processEvents()
+    check("panel: apply -> correct date objects",
+          bridge.df is not None
+          and bridge.df["transaction_date"].iloc[1] == _dt.date(2023, 1, 13)
+          and str(bridge.df["transaction_date"].dtype) == "object",
+          repr(list(bridge.df["transaction_date"]) if bridge.df is not None else None))
+
+
 def test_excel():
     print("[7] ExcelLoaderPanel merge")
     app()
@@ -867,6 +957,7 @@ def main():
     test_string_ops_full()
     test_numeric_ops_full()
     test_dtype_extra()
+    test_date_conversion()
 
     print("\n========== RESULT ==========")
     print(f"  Passed: {len(PASS)}")

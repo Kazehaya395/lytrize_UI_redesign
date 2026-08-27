@@ -21,6 +21,7 @@ import datetime
 import operator
 import re
 import unicodedata
+import warnings
 from typing import Any, Optional
 
 import numpy as np
@@ -98,13 +99,45 @@ def _safe_to_datetime(values, **kwargs) -> pd.Series:
         return pd.to_datetime(pd.Series([None] * len(values), index=getattr(values, "index", None)))
 
 
+_SLASH_DATE_RE = r"^\s*(\d{1,2})[/\-](\d{1,2})[/\-]\d{2,4}(?:\s.*)?$"
+
+
+def _detect_dayfirst(s: pd.Series) -> Optional[bool]:
+    """Infer day-first vs month-first layout from slash/dash date strings.
+
+    If any first component exceeds 12 the column must be day-first
+    (e.g. '13/01/2023' present); if only the second component ever exceeds
+    12 it must be month-first ('01/13/2023'); otherwise ambiguous (None)
+    and pandas' month-first default is kept.
+    """
+    parts = s.str.extract(_SLASH_DATE_RE, expand=True)
+    if parts.empty or parts[0].isna().all():
+        return None
+    a = pd.to_numeric(parts[0], errors="coerce")
+    b = pd.to_numeric(parts[1], errors="coerce")
+    a_gt12 = bool((a > 12).any())
+    b_gt12 = bool((b > 12).any())
+    if a_gt12 and not b_gt12:
+        return True   # day-first, e.g. transaction_date '01/01/2023'..'30/06/2023'
+    if b_gt12 and not a_gt12:
+        return False  # month-first
+    return None       # ambiguous -> pandas default (month-first)
+
+
 def _parse_datetime_robust(series: pd.Series) -> pd.Series:
     # Numeric-only columns (e.g. transaction_id) can never be dates; skip
     # parsing entirely so to_datetime never tries epoch interpretation.
     if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
         return pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
     s = series.astype(str).str.strip()
-    result = _safe_to_datetime(s, errors="coerce")
+    # Day-first detection: a bare month-first to_datetime turns every
+    # DD/MM/YYYY value with day>12 into NaT and silently month/day-swaps
+    # every day<=12 value (the "date conversion not working" bug on
+    # transaction_date: 90,914 of 149,116 values null, 39% "success").
+    dayfirst = _detect_dayfirst(s)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        result = _safe_to_datetime(s, errors="coerce", dayfirst=bool(dayfirst))
     remaining = result.isna() & series.notna()
     if not remaining.any():
         return result
@@ -117,7 +150,11 @@ def _parse_datetime_robust(series: pd.Series) -> pd.Series:
     remaining = result.isna() & series.notna()
     if not remaining.any():
         return result
-    for fmt in ("%I:%M %p", "%I:%M:%S %p", "%I:%M%p", "%I:%M:%S%p", "%I %p",
+    # Explicit-format retries: plain date formats first (order follows the
+    # detected layout), then the time-oriented formats.
+    date_fmts = ("%d/%m/%Y", "%m/%d/%Y") if dayfirst else ("%m/%d/%Y", "%d/%m/%Y")
+    for fmt in (*date_fmts,
+                "%I:%M %p", "%I:%M:%S %p", "%I:%M%p", "%I:%M:%S%p", "%I %p",
                 "%m/%d/%Y %I:%M %p", "%d/%m/%Y %I:%M %p",
                 "%m/%d/%Y %H:%M", "%d/%m/%Y %H:%M"):
         still = result.isna() & series.notna()
@@ -246,9 +283,12 @@ def preview_dtype_conversion(series: pd.Series, new_dtype: str) -> dict:
 
     try:
         if new_dtype == "datetime64[ns]":
-            converted = pd.to_datetime(series, errors="coerce")
+            # Robust parser (day-first detection + explicit-format retries):
+            # a bare pd.to_datetime month/day-swaps day<=12 values and nulls
+            # day>12 values for DD/MM/YYYY columns like transaction_date.
+            converted = _parse_datetime_robust(series)
         elif new_dtype == "date":
-            converted = pd.to_datetime(series, errors="coerce").dt.date
+            converted = _parse_datetime_robust(series).dt.date
         elif new_dtype == "time":
             src = series.astype(str).str.strip()
             parsed = pd.to_datetime("1970-01-01 " + src, errors="coerce")
