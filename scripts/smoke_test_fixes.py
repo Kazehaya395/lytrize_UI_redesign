@@ -417,6 +417,8 @@ def test_string_ops_full():
         p._on_str_preview()
         check("concat preview enables apply", p.btn_str_apply.isEnabled(),
               p.lbl_str_preview.text())
+        check("cleaner preview cells centered",
+              p.table_str_preview.item(0, 0).textAlignment() == Qt.AlignCenter)
         p._on_str_apply()
         if p._worker is not None:
             p._worker.wait(10000)
@@ -703,6 +705,26 @@ def test_dtype_extra():
     check("apply converts to float64",
           bridge.df is not None and str(bridge.df["n"].dtype) == "float64",
           str(bridge.df["n"].dtype) if bridge.df is not None else "no df")
+
+    # UI issues (user report): dtypes table must cover the whole area (no
+    # 200px cap, stretch=1 in the panel layout) and the Clear Preview
+    # control must be highlighted so it can be spotted quickly.
+    idx = p.layout().indexOf(p.table_dtypes)
+    check("dtypes table stretches to cover area",
+          p.table_dtypes.maximumHeight() >= 1000 and idx >= 0
+          and p.layout().stretch(idx) == 1,
+          f"maxH={p.table_dtypes.maximumHeight()} idx={idx}")
+    check("clear preview button highlighted",
+          "#4f46e5" in p.btn_clear_preview.styleSheet(),
+          p.btn_clear_preview.styleSheet()[:50])
+
+    # UI issue: row-index gutter must not crowd the values; cells centered.
+    check("row-index gutter roomy + cells centered",
+          p.table_preview.verticalHeader().minimumWidth() == 36
+          and p.table_dtypes.verticalHeader().minimumWidth() == 36
+          and p.table_dtypes.item(0, 0).textAlignment() == Qt.AlignCenter,
+          f"w={p.table_preview.verticalHeader().minimumWidth()} "
+          f"align={p.table_dtypes.item(0, 0).textAlignment() if p.table_dtypes.item(0, 0) else 'none'}")
 
 
 def test_date_conversion():

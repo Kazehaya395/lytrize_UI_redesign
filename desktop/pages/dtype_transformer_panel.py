@@ -17,7 +17,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QMessageBox, QFrame,
+    QMessageBox, QFrame, QSizePolicy,
 )
 
 from services.transform_service import preview_dtype_conversion, apply_dtype_conversion
@@ -63,9 +63,19 @@ class DtypeTransformerPanel(QWidget):
         self.table_dtypes.setStyleSheet(
             "QTableWidget { background: #1e293b; color: #e2e8f0; gridline-color: #334155; }"
         )
-        self.table_dtypes.setMaximumHeight(200)
-        self.table_dtypes.setMinimumHeight(80)
-        root.addWidget(self.table_dtypes)
+        # The dtypes table is this panel's main content: NO max-height cap.
+        # It takes stretch=1 below so it covers ALL leftover vertical space
+        # instead of leaving dead gaps between the tab bar, the header and
+        # the transform controls (UI issue: "table should cover the whole
+        # area" / "too width, look bad UI design"). The panel lives inside a
+        # resizable QScrollArea (upload_page), so a tall table can no longer
+        # inflate the splitter pane -- it simply scrolls.
+        self.table_dtypes.setMinimumHeight(120)
+        # Roomier, centered row-index gutter (UI issue: index numbers were
+        # cramped against the first column) and centered cell values.
+        self.table_dtypes.verticalHeader().setFixedWidth(36)
+        self.table_dtypes.verticalHeader().setDefaultAlignment(Qt.AlignCenter)
+        root.addWidget(self.table_dtypes, 1)
 
         # -- Transform controls --
         controls = QFrame()
@@ -75,6 +85,11 @@ class DtypeTransformerPanel(QWidget):
         ctrl_layout = QVBoxLayout(controls)
         ctrl_layout.setContentsMargins(12, 12, 12, 12)
         ctrl_layout.setSpacing(8)
+
+        # Keep the transform controls compact: the dtypes table above takes
+        # stretch=1, so leftover vertical space never gets smeared into
+        # inflated gaps between these rows.
+        controls.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
         ctrl_layout.addWidget(QLabel("Select column to transform:"))
         self.cmb_col = QComboBox()
@@ -107,10 +122,15 @@ class DtypeTransformerPanel(QWidget):
         # panel -- the user can dismiss the result without losing anything.
         self.btn_clear_preview = QPushButton("✖ Clear Preview")
         self.btn_clear_preview.setVisible(False)
+        # Highlighted accent style so the user can spot the dismiss control
+        # at a glance (UI issue: the old dark-grey style was nearly invisible
+        # against the panel background).
         self.btn_clear_preview.setStyleSheet(
-            "QPushButton { background: #1e293b; color: #94a3b8; border: 1px solid #334155;"
-            "  border-radius: 6px; padding: 4px 12px; font-size: 11px; }"
-            "QPushButton:hover { background: #334155; color: #e2e8f0; }"
+            "QPushButton { background: #4f46e5; color: white; border: none;"
+            "  border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; }"
+            "QPushButton:hover { background: #6366f1; }"
+            "QPushButton:pressed { background: #4338ca; }"
+            "QPushButton:disabled { background: #334155; color: #64748b; }"
         )
         preview_header_row.addWidget(self.btn_clear_preview)
         ctrl_layout.addLayout(preview_header_row)
@@ -133,6 +153,9 @@ class DtypeTransformerPanel(QWidget):
         # controls to shrink out of usability.
         self.table_preview.setMinimumHeight(80)
         self.table_preview.setMaximumHeight(180)
+        # Roomier, centered row-index gutter (was cramped against Before values)
+        self.table_preview.verticalHeader().setFixedWidth(36)
+        self.table_preview.verticalHeader().setDefaultAlignment(Qt.AlignCenter)
         self.table_preview.setVisible(False)
         ctrl_layout.addWidget(self.table_preview)
 
@@ -179,14 +202,15 @@ class DtypeTransformerPanel(QWidget):
             self.cmb_col.clear()
             return
 
-        # Populate dtype table
+        # Populate dtype table (values centered per UI feedback)
         self.table_dtypes.setRowCount(len(df.columns))
         for i, col in enumerate(df.columns):
-            self.table_dtypes.setItem(i, 0, QTableWidgetItem(col))
-            dtype_str = str(df[col].dtype)
-            self.table_dtypes.setItem(i, 1, QTableWidgetItem(dtype_str))
-            sample = str(df[col].iloc[0]) if len(df) > 0 else ""
-            self.table_dtypes.setItem(i, 2, QTableWidgetItem(sample))
+            values = (col, str(df[col].dtype),
+                      str(df[col].iloc[0]) if len(df) > 0 else "")
+            for j, val in enumerate(values):
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignCenter)
+                self.table_dtypes.setItem(i, j, item)
 
         # Populate column dropdown
         self.cmb_col.clear()
@@ -301,8 +325,11 @@ class DtypeTransformerPanel(QWidget):
             after_vals = result["sample_df"]["After"].head(10)
             self.table_preview.setRowCount(len(before_vals))
             for i in range(len(before_vals)):
-                self.table_preview.setItem(i, 0, QTableWidgetItem(str(before_vals.iloc[i])))
-                self.table_preview.setItem(i, 1, QTableWidgetItem(str(after_vals.iloc[i])))
+                for j, val in enumerate((str(before_vals.iloc[i]),
+                                         str(after_vals.iloc[i]))):
+                    item = QTableWidgetItem(val)
+                    item.setTextAlignment(Qt.AlignCenter)
+                    self.table_preview.setItem(i, j, item)
             self.table_preview.setVisible(True)
             self.btn_clear_preview.setVisible(True)
 

@@ -145,6 +145,14 @@ class DataCleanerPanel(QWidget):
 
         root.addWidget(self.tabs, stretch=1)
 
+        # Roomier, centered row-index gutters on every preview table (UI
+        # issue: index numbers were cramped against the Before column).
+        for tbl in (self.table_text_preview, self.table_find_preview,
+                    self.table_failures, self.table_str_preview,
+                    self.table_num_preview):
+            tbl.verticalHeader().setFixedWidth(36)
+            tbl.verticalHeader().setDefaultAlignment(Qt.AlignCenter)
+
     def _build_text_tab(self) -> None:
         layout = QVBoxLayout(self.tab_text)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -711,7 +719,9 @@ class DataCleanerPanel(QWidget):
             fail_rows = result.get("fail_rows", pd.DataFrame())
             self.table_failures.setRowCount(min(len(fail_rows), 20))
             for i, (idx, row) in enumerate(fail_rows.head(20).iterrows()):
-                self.table_failures.setItem(i, 0, QTableWidgetItem(str(row.iloc[0])))
+                item = QTableWidgetItem(str(row.iloc[0]))
+                item.setTextAlignment(Qt.AlignCenter)
+                self.table_failures.setItem(i, 0, item)
         except (re.error, KeyError):
             pass
 
@@ -1099,11 +1109,13 @@ class DataCleanerPanel(QWidget):
         _APPLY_STATES["numeric"] = False
 
     def _fill_preview_table(self, table: QTableWidget, before: pd.Series, after: pd.Series) -> None:
-        """Fill a preview table with before/after values."""
+        """Fill a preview table with before/after values (centered cells)."""
         table.setRowCount(min(len(before), 20))
         for i in range(min(len(before), 20)):
-            table.setItem(i, 0, QTableWidgetItem(str(before.iloc[i])))
-            table.setItem(i, 1, QTableWidgetItem(str(after.iloc[i])))
+            for j, val in enumerate((str(before.iloc[i]), str(after.iloc[i]))):
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignCenter)
+                table.setItem(i, j, item)
 
     # -- Worker helpers ------------------------------------------------------
 
