@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 from services.transform_service import (
     text_clean_preview, find_replace_preview,
     validate_column, validate_replace_failures_with_nan, validate_flag_column,
-    numeric_clean, apply_column_update,
+    numeric_clean, apply_column_update, VALIDATION_PATTERNS,
 )
 from desktop.workers import TransformWorker
 
@@ -64,6 +64,20 @@ NUMERIC_CLEAN_OP_KEYS = {
 # instead of blindly re-enabling every apply button after a worker finishes.
 _APPLY_STATES = {"text": False, "find": False, "validate": False,
                  "string": False, "numeric": False}
+
+
+def count_changed_values(before: pd.Series, after: pd.Series) -> int:
+    """Count values that genuinely differ, treating NaN == NaN as unchanged.
+
+    A naive ``(before != after).sum()`` counts NaN-vs-NaN pairs as changes
+    (NaN != NaN is True in pandas), which inflated the "N values will change"
+    labels and could enable Apply even when nothing would actually change.
+    String/NaN rendering via ``astype(str)`` plus an explicit both-null mask
+    keeps the count honest (Issue 14: reliable operation reporting).
+    """
+    differ = before.astype(str) != after.astype(str)
+    both_na = pd.isna(before) & pd.isna(after)
+    return int((differ & ~both_na).sum())
 
 
 class DataCleanerPanel(QWidget):
@@ -467,7 +481,12 @@ class DataCleanerPanel(QWidget):
     # -- Signal connections -------------------------------------------------
 
     def _connect_signals(self) -> None:
-        pass
+        # Changing the source column invalidates any previous preview in the
+        # String Ops / Numeric Clean tabs (Issue 11: a stale "N values will
+        # change" label with an enabled Apply button let users apply an
+        # operation whose parameters no longer matched the preview).
+        self.cmb_str_col.currentTextChanged.connect(self._reset_string_preview)
+        self.cmb_num_col.currentTextChanged.connect(self._reset_numeric_preview)
 
     # -- Public API ---------------------------------------------------------
 
@@ -628,7 +647,7 @@ class DataCleanerPanel(QWidget):
             return
         col = self.cmb_val_col.currentText()
         pattern_name = self.cmb_val_pattern.currentText()
-        pattern = self.txt_val_custom.text() if pattern_name == "Custom regex…" else _VALIDATION_PATTERNS.get(pattern_name, "")
+        pattern = self.txt_val_custom.text() if pattern_name == "Custom regex…" else VALIDATION_PATTERNS.get(pattern_name, "")
 
         action = "none"
         if self.rb_val_nan.isChecked():
@@ -670,7 +689,7 @@ class DataCleanerPanel(QWidget):
             return
         col = self.cmb_val_col.currentText()
         pattern_name = self.cmb_val_pattern.currentText()
-        pattern = self.txt_val_custom.text() if pattern_name == "Custom regex…" else _VALIDATION_PATTERNS.get(pattern_name, "")
+        pattern = self.txt_val_custom.text() if pattern_name == "Custom regex…" else VALIDATION_PATTERNS.get(pattern_name, "")
         if not pattern:
             return
         # Guard against the transient empty-string state QComboBox fires
@@ -704,84 +723,105 @@ class DataCleanerPanel(QWidget):
             if item.widget():
                 item.widget().deleteLater()
 
+        # Inputs changed -> any previous preview is stale. Reset the preview
+        # label/table and disable Apply so it can never act on parameters
+        # different from what the preview showed (the old Streamlit app
+        # recomputed the preview live on every widget change).
+        self._reset_string_preview()
+
         if text == OP_TRIM:
             self.str_op_length = QSpinBox()
             self.str_op_length.setRange(1, 1000)
             self.str_op_length.setValue(50)
+            self.str_op_length.valueChanged.connect(self._reset_string_preview)
             self.str_options_layout.addWidget(QLabel("Max characters:"))
             self.str_options_layout.addWidget(self.str_op_length)
 
             self.str_op_side = QComboBox()
             self.str_op_side.addItems(["Left (start)", "Right (end)"])
+            self.str_op_side.currentTextChanged.connect(self._reset_string_preview)
             self.str_options_layout.addWidget(self.str_op_side)
 
         elif text == OP_PAD:
             self.str_op_padlen = QSpinBox()
             self.str_op_padlen.setRange(1, 200)
             self.str_op_padlen.setValue(10)
+            self.str_op_padlen.valueChanged.connect(self._reset_string_preview)
             self.str_options_layout.addWidget(QLabel("Target length:"))
             self.str_options_layout.addWidget(self.str_op_padlen)
 
             self.str_op_padchar = QLineEdit()
             self.str_op_padchar.setText("0")
             self.str_op_padchar.setMaxLength(1)
+            self.str_op_padchar.textChanged.connect(self._reset_string_preview)
             self.str_options_layout.addWidget(QLabel("Pad character:"))
             self.str_options_layout.addWidget(self.str_op_padchar)
 
             self.str_op_padside = QComboBox()
             self.str_op_padside.addItems(["Left", "Right"])
+            self.str_op_padside.currentTextChanged.connect(self._reset_string_preview)
             self.str_options_layout.addWidget(self.str_op_padside)
 
         elif text == OP_SUBSTRING:
             self.str_op_start = QSpinBox()
             self.str_op_start.setRange(0, 999)
             self.str_op_start.setValue(0)
+            self.str_op_start.valueChanged.connect(self._reset_string_preview)
             self.str_options_layout.addWidget(QLabel("Start (0-based):"))
             self.str_options_layout.addWidget(self.str_op_start)
 
             self.str_op_end = QSpinBox()
             self.str_op_end.setRange(0, 999)
             self.str_op_end.setValue(0)
+            self.str_op_end.valueChanged.connect(self._reset_string_preview)
             self.str_options_layout.addWidget(QLabel("End (0 = end of string):"))
             self.str_options_layout.addWidget(self.str_op_end)
 
         elif text == OP_SPLIT:
             self.str_op_delim = QLineEdit()
             self.str_op_delim.setText(",")
+            self.str_op_delim.textChanged.connect(self._reset_string_preview)
             self.str_options_layout.addWidget(QLabel("Delimiter:"))
             self.str_options_layout.addWidget(self.str_op_delim)
 
             self.str_op_part = QComboBox()
             self.str_op_part.addItems(["First part", "Second part"])
+            self.str_op_part.currentTextChanged.connect(self._reset_string_preview)
             self.str_options_layout.addWidget(self.str_op_part)
 
             self.str_op_newcol = QLineEdit()
             self.str_op_newcol.setPlaceholderText("New column name")
+            self.str_op_newcol.textChanged.connect(self._reset_string_preview)
             self.str_options_layout.addWidget(self.str_op_newcol)
 
         elif text == OP_CONCAT:
             self.str_op_col2 = QComboBox()
             if self._df is not None and not self._df.empty:
                 self.str_op_col2.addItems(self._df.columns.tolist())
+            self.str_op_col2.currentTextChanged.connect(self._reset_string_preview)
             self.str_options_layout.addWidget(QLabel("Second column:"))
             self.str_options_layout.addWidget(self.str_op_col2)
 
             self.str_op_sep = QLineEdit()
             self.str_op_sep.setText(" ")
+            self.str_op_sep.textChanged.connect(self._reset_string_preview)
             self.str_options_layout.addWidget(QLabel("Separator:"))
             self.str_options_layout.addWidget(self.str_op_sep)
 
             self.str_op_concatcol = QLineEdit()
             self.str_op_concatcol.setPlaceholderText("New column name")
+            self.str_op_concatcol.textChanged.connect(self._reset_string_preview)
             self.str_options_layout.addWidget(self.str_op_concatcol)
 
         elif text == OP_REGEX_EXTRACT:
             self.str_op_re = QLineEdit()
             self.str_op_re.setPlaceholderText(r"e.g. (\d{4}) to extract 4-digit year")
+            self.str_op_re.textChanged.connect(self._reset_string_preview)
             self.str_options_layout.addWidget(self.str_op_re)
 
             self.str_op_recol = QLineEdit()
             self.str_op_recol.setPlaceholderText("New column name")
+            self.str_op_recol.textChanged.connect(self._reset_string_preview)
             self.str_options_layout.addWidget(self.str_op_recol)
 
     def _on_str_preview(self) -> None:
@@ -834,7 +874,7 @@ class DataCleanerPanel(QWidget):
                 new_series = series.str.extract(f"({pattern})", expand=False)
                 new_col_name = self.str_op_recol.text().strip()
 
-            n_changed = int((series != new_series).sum())
+            n_changed = count_changed_values(series, new_series)
             self.lbl_str_preview.setText(f"{n_changed:,} values will change → {new_col_name or col}")
             self._fill_preview_table(self.table_str_preview, series.head(20).astype(str), new_series.head(20).astype(str))
             self.btn_str_apply.setEnabled(n_changed > 0)
@@ -924,13 +964,19 @@ class DataCleanerPanel(QWidget):
             if item.widget():
                 item.widget().deleteLater()
 
+        # Inputs changed -> any previous preview is stale (Issue 11/14: the
+        # Apply button must never act on parameters the user never previewed).
+        self._reset_numeric_preview()
+
         if "Clamp" in text:
             self.num_min = QDoubleSpinBox()
             self.num_min.setRange(-1e9, 1e9)
+            self.num_min.valueChanged.connect(self._reset_numeric_preview)
             self.num_options_layout.addWidget(QLabel("Min:"))
             self.num_options_layout.addWidget(self.num_min)
             self.num_max = QDoubleSpinBox()
             self.num_max.setRange(-1e9, 1e9)
+            self.num_max.valueChanged.connect(self._reset_numeric_preview)
             self.num_options_layout.addWidget(QLabel("Max:"))
             self.num_options_layout.addWidget(self.num_max)
         elif "outliers" in text:
@@ -938,18 +984,21 @@ class DataCleanerPanel(QWidget):
             self.num_iqr.setRange(1.0, 3.0)
             self.num_iqr.setSingleStep(0.1)
             self.num_iqr.setValue(1.5)
+            self.num_iqr.valueChanged.connect(self._reset_numeric_preview)
             self.num_options_layout.addWidget(QLabel("IQR multiplier:"))
             self.num_options_layout.addWidget(self.num_iqr)
         elif "Round" in text:
             self.num_decimals = QSpinBox()
             self.num_decimals.setRange(0, 10)
             self.num_decimals.setValue(2)
+            self.num_decimals.valueChanged.connect(self._reset_numeric_preview)
             self.num_options_layout.addWidget(QLabel("Decimal places:"))
             self.num_options_layout.addWidget(self.num_decimals)
         elif "custom value" in text:
             self.num_fill = QDoubleSpinBox()
             self.num_fill.setRange(-1e9, 1e9)
             self.num_fill.setValue(0.0)
+            self.num_fill.valueChanged.connect(self._reset_numeric_preview)
             self.num_options_layout.addWidget(QLabel("Fill value:"))
             self.num_options_layout.addWidget(self.num_fill)
 
@@ -978,7 +1027,7 @@ class DataCleanerPanel(QWidget):
         try:
             series = pd.to_numeric(self._df[col], errors="coerce")
             result = numeric_clean(series, op_key, **kwargs)
-            n_changed = int((series.round(8) != result.round(8)).sum())
+            n_changed = count_changed_values(series.round(8), result.round(8))
             self.lbl_num_preview.setText(f"{n_changed:,} values will change")
             self._fill_preview_table(self.table_num_preview,
                                  series.head(20).astype(str),
@@ -1029,6 +1078,26 @@ class DataCleanerPanel(QWidget):
 
     # -- Helpers ------------------------------------------------------------
 
+    def _reset_string_preview(self, *_args) -> None:
+        """Clear the String-Ops preview so Apply can never run on stale inputs.
+
+        Connected to the operation combo, the source-column combo and every
+        dynamic option widget. After any input change the user must run a
+        fresh Preview, mirroring the old Streamlit live-preview behaviour
+        where the shown preview always reflected the current parameters.
+        """
+        self.lbl_str_preview.setText("")
+        self.table_str_preview.setRowCount(0)
+        self.btn_str_apply.setEnabled(False)
+        _APPLY_STATES["string"] = False
+
+    def _reset_numeric_preview(self, *_args) -> None:
+        """Clear the Numeric Clean preview (same rationale as String Ops)."""
+        self.lbl_num_preview.setText("")
+        self.table_num_preview.setRowCount(0)
+        self.btn_num_apply.setEnabled(False)
+        _APPLY_STATES["numeric"] = False
+
     def _fill_preview_table(self, table: QTableWidget, before: pd.Series, after: pd.Series) -> None:
         """Fill a preview table with before/after values."""
         table.setRowCount(min(len(before), 20))
@@ -1070,15 +1139,7 @@ class DataCleanerPanel(QWidget):
         log.error("Worker failed: %s", error)
 
 
-# Validation patterns (duplicated from original for convenience)
-_VALIDATION_PATTERNS = {
-    "Email address": r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$",
-    "Phone (intl. +XX)": r"^\+?[0-9\s\-\(\)]{7,20}$",
-    "UK postcode": r"^[A-Z]{1,2}[0-9][0-9A-Z]?\s?[0-9][A-Z]{2}$",
-    "US ZIP code": r"^\d{5}(-\d{4})?$",
-    "Integer number": r"^-?\d+$",
-    "Decimal number": r"^-?\d+(\.\d+)?$",
-    "Date (YYYY-MM-DD)": r"^\d{4}-\d{2}-\d{2}$",
-    "URL (http/https)": r"^https?://[^\s]+$",
-    "UUID": r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-}
+# Validation patterns live in services.transform_service.VALIDATION_PATTERNS
+# (single source of truth, imported at the top of this module). The panel no
+# longer keeps its own copy so a label/pattern can never drift between the UI
+# and the backend.

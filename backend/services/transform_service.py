@@ -82,9 +82,29 @@ def safe_formula_eval(df: pd.DataFrame, formula: str) -> pd.Series:
     return result
 
 
+def _safe_to_datetime(values, **kwargs) -> pd.Series:
+    """pd.to_datetime wrapper that never leaks raw pandas errors.
+
+    ``errors="coerce"`` does not protect against every internal failure:
+    on several pandas builds, array parsing of mixed/numeric-looking
+    strings can raise ``OverflowError: Overflow in int64 addition`` from
+    tslibs' overflow-safe add. Convert any such failure into all-NaT so
+    the caller's "doesn't look like a date column" validation handles it
+    with a friendly message instead.
+    """
+    try:
+        return pd.to_datetime(values, **kwargs)
+    except (OverflowError, ValueError, TypeError):
+        return pd.to_datetime(pd.Series([None] * len(values), index=getattr(values, "index", None)))
+
+
 def _parse_datetime_robust(series: pd.Series) -> pd.Series:
+    # Numeric-only columns (e.g. transaction_id) can never be dates; skip
+    # parsing entirely so to_datetime never tries epoch interpretation.
+    if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
+        return pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
     s = series.astype(str).str.strip()
-    result = pd.to_datetime(s, errors="coerce")
+    result = _safe_to_datetime(s, errors="coerce")
     remaining = result.isna() & series.notna()
     if not remaining.any():
         return result
@@ -93,7 +113,7 @@ def _parse_datetime_robust(series: pd.Series) -> pd.Series:
         .str.replace(r"([AP]M)$", r" \1", regex=True)
         .str.replace(r"\s{2,}", " ", regex=True)
     )
-    result[remaining] = pd.to_datetime("1970-01-01 " + normalised, errors="coerce")
+    result[remaining] = _safe_to_datetime("1970-01-01 " + normalised, errors="coerce")
     remaining = result.isna() & series.notna()
     if not remaining.any():
         return result

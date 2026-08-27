@@ -143,12 +143,14 @@ class DtypeTransformerPanel(QWidget):
         self.btn_preview.setStyleSheet(
             "QPushButton { background: #4f46e5; color: white; border: none;"
             "  border-radius: 6px; padding: 8px 16px; font-weight: 600; }"
+            "QPushButton:disabled { background: #334155; color: #64748b; }"
         )
         self.btn_apply = QPushButton("🔄 Apply Transformation")
         self.btn_apply.setEnabled(False)
         self.btn_apply.setStyleSheet(
             "QPushButton { background: #10b981; color: white; border: none;"
             "  border-radius: 6px; padding: 8px 16px; font-weight: 600; }"
+            "QPushButton:disabled { background: #334155; color: #64748b; }"
         )
         btn_row.addWidget(self.btn_preview)
         btn_row.addWidget(self.btn_apply)

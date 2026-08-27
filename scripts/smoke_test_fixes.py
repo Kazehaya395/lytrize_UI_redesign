@@ -12,6 +12,10 @@ Exercises every operation that changed during the fixes:
   - ExcelLoaderPanel: off-by-one merge + QGroupBox
   - ColumnClassifierPanel: real drag & drop
   - ColumnManagerPanel: formula picker rebuild
+  - Validate: every rule pos/neg + custom regex + all 3 actions (Issue 10)
+  - String Ops: all 6 ops value-checked + preview/apply + stale-state reset (11, 12)
+  - Numeric Clean: all 9 ops value-checked + op-key round-trip + reset (13, 14)
+  - Dtype: close button, bounded preview table, honest lossy preview, apply (15)
 """
 from __future__ import annotations
 
@@ -57,6 +61,17 @@ def app():
 
 def silent_bridge():
     return type("B", (), {"set_df": staticmethod(lambda df: None)})()
+
+
+def capturing_bridge():
+    """Bridge stand-in that records the last DataFrame pushed via set_df."""
+    class _Bridge:
+        def __init__(self) -> None:
+            self.df = None
+
+        def set_df(self, df) -> None:
+            self.df = df
+    return _Bridge()
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +205,249 @@ def test_string_ops():
         check("substring preview runs", False, str(exc))
 
 
+# ---------------------------------------------------------------------------
+# Issues 10-15 verification set (added 2026-08-27)
+# ---------------------------------------------------------------------------
+VALIDATE_FIXTURES = {
+    "Email address": (
+        ["a@b.co", "first.last+tag@sub.domain.org"],
+        ["no-at-sign", "a@b", "a b@c.com"],
+    ),
+    "Phone (intl. +XX)": (
+        ["+1 (555) 123-4567", "555-1234"],
+        ["12", "555-ABCD"],
+    ),
+    "UK postcode": (
+        ["SW1A 1AA", "M1 1AE"],
+        ["1A1 1AA", "sw1a 1aa"],  # leading digit / lowercase both must fail
+    ),
+    "US ZIP code": (
+        ["12345", "12345-6789"],
+        ["1234", "123456"],
+    ),
+    "Integer number": (
+        ["42", "-7"],
+        ["3.14", "abc"],
+    ),
+    "Decimal number": (
+        ["3.14", "-0.5", "100"],
+        ["1.", ".5"],
+    ),
+    "Date (YYYY-MM-DD)": (
+        ["2023-01-01", "1999-12-31"],
+        ["01/02/2023", "2023-1-1"],
+    ),
+    "URL (http/https)": (
+        ["https://example.com", "http://a.b/c?d=1"],
+        ["ftp://x.com", "example.com"],
+    ),
+    "UUID": (
+        ["123e4567-e89b-12d3-a456-426614174000"],
+        # uppercase hex fails (case=True) — identical to the old Streamlit app
+        ["123E4567-E89B-12D3-A456-426614174000", "123e4567e89b12d3a456426614174000"],
+    ),
+}
+
+
+def test_validate_all_rules(ts):
+    """Issue 10: every validation rule must be tested & verified."""
+    print("[12] Validate: every rule pos/neg + all actions (Issue 10)")
+    for rule, (pos, neg) in VALIDATE_FIXTURES.items():
+        pattern = ts.VALIDATION_PATTERNS[rule]
+        df = pd.DataFrame({"v": pos + neg + [None]})
+        res = ts.validate_column(df, "v", pattern)
+        check(f"validate '{rule}': counts",
+              res["n_pass"] == len(pos) and res["n_fail"] == len(neg)
+              and res["n_null"] == 1 and res["total"] == len(pos) + len(neg) + 1,
+              f"pass={res['n_pass']} fail={res['n_fail']} null={res['n_null']}")
+        flagged = ts.validate_flag_column(df, "v", pattern)
+        expect_flag = [True] * len(pos) + [False] * len(neg) + [False]
+        check(f"validate '{rule}': flag action",
+              list(flagged["_valid_v"]) == expect_flag,
+              repr(list(flagged["_valid_v"])))
+        nan_df = ts.validate_replace_failures_with_nan(df, "v", res["fail_index"])
+        check(f"validate '{rule}': nan action",
+              int(nan_df["v"].isna().sum()) == len(neg) + 1
+              and list(nan_df["v"].iloc[:len(pos)].astype(str)) == list(pd.Series(pos)),
+              repr(list(nan_df["v"])))
+
+    # Custom regex path (service level)
+    df = pd.DataFrame({"v": ["ABC", "ab", "ABCD", None]})
+    res = ts.validate_column(df, "v", r"^[A-Z]{3}$")
+    check("validate custom regex: counts",
+          res["n_pass"] == 1 and res["n_fail"] == 2 and res["n_null"] == 1,
+          f"pass={res['n_pass']} fail={res['n_fail']}")
+
+    # ---- UI level: combo must mirror the backend single source of truth ----
+    app()
+    from desktop.pages.data_cleaner_panel import DataCleanerPanel
+
+    p = DataCleanerPanel(silent_bridge())
+    combo = [p.cmb_val_pattern.itemText(i) for i in range(p.cmb_val_pattern.count())]
+    check("validate combo == service patterns + custom",
+          combo == list(ts.VALIDATION_PATTERNS.keys()) + ["Custom regex…"],
+          repr(combo))
+
+    p.set_dataframe(pd.DataFrame({"v": ["42", "-7", "3.14", None]}))
+    p.cmb_val_col.setCurrentText("v")
+    p.cmb_val_pattern.setCurrentText("Integer number")
+    check("validate live metrics",
+          "✅ Pass: 2" in p.lbl_pass.text() and "❌ Fail: 1" in p.lbl_fail.text()
+          and "⬜ Null: 1" in p.lbl_null.text(),
+          f"{p.lbl_pass.text()} | {p.lbl_fail.text()} | {p.lbl_null.text()}")
+    check("validate apply enabled on failures", p.btn_val_apply.isEnabled())
+
+    out_none = p._compute_validate("v", ts.VALIDATION_PATTERNS["Integer number"], "none")
+    check("validate action 'none' leaves df unchanged", out_none.equals(p._df))
+    out_nan = p._compute_validate("v", ts.VALIDATION_PATTERNS["Integer number"], "nan")
+    check("validate action 'nan' nulls failures",
+          int(out_nan["v"].isna().sum()) == 2, repr(list(out_nan["v"])))
+    out_flag = p._compute_validate("v", ts.VALIDATION_PATTERNS["Integer number"], "flag")
+    check("validate action 'flag' adds bool col",
+          "_valid_v" in out_flag.columns
+          and list(out_flag["_valid_v"]) == [True, True, False, False],
+          repr(list(out_flag["_valid_v"])))
+
+    # Custom regex through the panel
+    p.set_dataframe(pd.DataFrame({"v": ["123", "12", "abc", None]}))
+    p.cmb_val_pattern.setCurrentText("Custom regex…")
+    p.txt_val_custom.setText(r"^\d{3}$")
+    p._run_validation()
+    check("validate custom regex live metrics",
+          "✅ Pass: 1" in p.lbl_pass.text() and "❌ Fail: 2" in p.lbl_fail.text(),
+          f"{p.lbl_pass.text()} | {p.lbl_fail.text()}")
+
+
+def test_string_ops_full():
+    """Issues 11 + 12: every String Op value-checked + stale-preview reset."""
+    print("[13] String Ops: all 6 ops + apply + stale-state reset (Issues 11, 12)")
+    app()
+    from desktop.pages.data_cleaner_panel import DataCleanerPanel
+    import desktop.pages.data_cleaner_panel as dc
+
+    df = pd.DataFrame({"s": ["Alpha", "Beta", "Gamma Delta"], "t": ["x", "y", "z"]})
+    bridge = capturing_bridge()
+    p = DataCleanerPanel(bridge)
+    p.set_dataframe(df)
+
+    errors = []
+    orig_crit = QMessageBox.critical
+    QMessageBox.critical = lambda *a, **k: errors.append(a[2])
+    try:
+        p.cmb_str_col.setCurrentText("s")
+
+        # TRIM
+        p.cmb_str_op.setCurrentText(dc.OP_TRIM)
+        p.str_op_length.setValue(3)
+        p.str_op_side.setCurrentText("Left (start)")
+        p._on_str_preview()
+        check("trim left: preview count",
+              "3 values will change" in p.lbl_str_preview.text(),
+              p.lbl_str_preview.text())
+        got, _, _ = p._compute_str_op("s", dc.OP_TRIM)
+        check("trim left 3 values", list(got) == ["Alp", "Bet", "Gam"], repr(list(got)))
+        p.str_op_side.setCurrentText("Right (end)")
+        got, _, _ = p._compute_str_op("s", dc.OP_TRIM)
+        check("trim right 3 values", list(got) == ["pha", "eta", "lta"], repr(list(got)))
+
+        # PAD
+        p.cmb_str_op.setCurrentText(dc.OP_PAD)
+        p.str_op_padlen.setValue(6)
+        p.str_op_padchar.setText("*")
+        p.str_op_padside.setCurrentText("Right")
+        got, _, _ = p._compute_str_op("s", dc.OP_PAD)
+        check("pad right '*' to 6", list(got) == ["Alpha*", "Beta**", "Gamma Delta"],
+              repr(list(got)))
+        p.str_op_padchar.setText("0")
+        p.str_op_padside.setCurrentText("Left")
+        got, _, _ = p._compute_str_op("s", dc.OP_PAD)
+        check("pad left '0' to 6 (zfill branch)",
+              list(got) == ["0Alpha", "00Beta", "Gamma Delta"], repr(list(got)))
+
+        # SUBSTRING
+        p.cmb_str_op.setCurrentText(dc.OP_SUBSTRING)
+        p.str_op_start.setValue(0)
+        p.str_op_end.setValue(3)
+        got, _, _ = p._compute_str_op("s", dc.OP_SUBSTRING)
+        check("substring 0:3", list(got) == ["Alp", "Bet", "Gam"], repr(list(got)))
+        p.str_op_start.setValue(2)
+        p.str_op_end.setValue(0)  # 0 = to end of string
+        got, _, _ = p._compute_str_op("s", dc.OP_SUBSTRING)
+        check("substring 2:end", list(got) == ["pha", "ta", "mma Delta"], repr(list(got)))
+
+        # SPLIT
+        p.cmb_str_op.setCurrentText(dc.OP_SPLIT)
+        p.str_op_delim.setText(" ")
+        p.str_op_part.setCurrentText("First part")
+        p.str_op_newcol.setText("part1")
+        got, new_col, _ = p._compute_str_op("s", dc.OP_SPLIT)
+        check("split first part -> new col",
+              new_col == "part1" and list(got) == ["Alpha", "Beta", "Gamma"],
+              repr(list(got)))
+        p.str_op_part.setCurrentText("Second part")
+        got, new_col, _ = p._compute_str_op("s", dc.OP_SPLIT)
+        check("split second part (missing -> NaN)",
+              new_col == "part1" and pd.isna(got.iloc[0]) and pd.isna(got.iloc[1])
+              and got.iloc[2] == "Delta", repr(list(got)))
+
+        # CONCAT
+        p.cmb_str_op.setCurrentText(dc.OP_CONCAT)
+        p.str_op_col2.setCurrentText("t")
+        p.str_op_sep.setText("-")
+        p.str_op_concatcol.setText("joined")
+        got, new_col, _ = p._compute_str_op("s", dc.OP_CONCAT)
+        check("concat with separator",
+              new_col == "joined" and list(got) == ["Alpha-x", "Beta-y", "Gamma Delta-z"],
+              repr(list(got)))
+
+        # REGEX EXTRACT
+        p.cmb_str_op.setCurrentText(dc.OP_REGEX_EXTRACT)
+        p.str_op_re.setText(r"^[A-Z]")
+        p.str_op_recol.setText("initial")
+        got, new_col, _ = p._compute_str_op("s", dc.OP_REGEX_EXTRACT)
+        check("regex capture extract",
+              new_col == "initial" and list(got) == ["A", "B", "G"], repr(list(got)))
+
+        # Full apply path through the worker thread (QThread -> signal -> bridge)
+        p.cmb_str_op.setCurrentText(dc.OP_CONCAT)
+        p.str_op_col2.setCurrentText("t")
+        p.str_op_sep.setText(" ")
+        p.str_op_concatcol.setText("joined2")
+        p._on_str_preview()
+        check("concat preview enables apply", p.btn_str_apply.isEnabled(),
+              p.lbl_str_preview.text())
+        p._on_str_apply()
+        if p._worker is not None:
+            p._worker.wait(10000)
+        app().processEvents()
+        check("worker apply created 'joined2'",
+              bridge.df is not None and "joined2" in bridge.df.columns
+              and list(bridge.df["joined2"]) == ["Alpha x", "Beta y", "Gamma Delta z"],
+              repr(list(bridge.df["joined2"]) if bridge.df is not None else None))
+        check("apply disabled after finish", not p.btn_str_apply.isEnabled())
+
+        # Issue 11: stale preview/Apply state must reset on ANY input change
+        p._on_str_preview()
+        check("re-preview enables apply", p.btn_str_apply.isEnabled())
+        p.str_op_sep.setText(" | ")
+        check("param change disables apply (Issue 11)",
+              not p.btn_str_apply.isEnabled() and p.lbl_str_preview.text() == "",
+              f"btn={p.btn_str_apply.isEnabled()} lbl={p.lbl_str_preview.text()!r}")
+        p._on_str_preview()
+        p.cmb_str_op.setCurrentText(dc.OP_TRIM)
+        check("op change disables apply (Issue 11)",
+              not p.btn_str_apply.isEnabled() and p.lbl_str_preview.text() == "",
+              f"btn={p.btn_str_apply.isEnabled()} lbl={p.lbl_str_preview.text()!r}")
+        p._on_str_preview()
+        p.cmb_str_col.setCurrentText("t")
+        check("column change disables apply (Issue 11)",
+              not p.btn_str_apply.isEnabled() and p.lbl_str_preview.text() == "",
+              f"btn={p.btn_str_apply.isEnabled()} lbl={p.lbl_str_preview.text()!r}")
+        check("no error dialogs in string ops", not errors, repr(errors))
+    finally:
+        QMessageBox.critical = orig_crit
+
+
 def test_numeric_ui():
     app()
     from desktop.pages.data_cleaner_panel import DataCleanerPanel
@@ -204,6 +462,149 @@ def test_numeric_ui():
     check("round preview resolves+enables", p.btn_num_apply.isEnabled(),
           p.lbl_num_preview.text())
     check("op key maps", p._numeric_op_key("Round to N decimal places") == "round")
+
+
+def test_numeric_ops_full():
+    """Issues 13 + 14: all 9 numeric ops value-checked + op-key round-trip."""
+    print("[14] Numeric Clean: all 9 ops + op-key round-trip + reset (Issues 13, 14)")
+    app()
+    import services.transform_service as tss
+    from desktop.pages.data_cleaner_panel import DataCleanerPanel
+    import desktop.pages.data_cleaner_panel as dc
+
+    # count_changed_values must treat NaN == NaN as unchanged (truthful counts)
+    check("count_changed ignores NaN==NaN",
+          dc.count_changed_values(pd.Series([1.0, np.nan]),
+                                  pd.Series([1.0, np.nan])) == 0)
+    check("count_changed counts real change",
+          dc.count_changed_values(pd.Series([1.0, np.nan]),
+                                  pd.Series([1.0, 5.0])) == 1)
+
+    # Issue 13: every combo display name must map to a backend-accepted key —
+    # "Unknown numeric_clean op: ..." can never happen again.
+    for name, key in dc.NUMERIC_CLEAN_OP_KEYS.items():
+        s = pd.Series([1.0, 2.0, np.nan, 100.0])
+        kwargs = ({"min": 0.0, "max": 50.0} if key == "clamp"
+                  else {"value": 0.0} if key == "fillna_value" else {})
+        try:
+            tss.numeric_clean(s, key, **kwargs)
+            ts_ok = True
+        except ValueError as exc:
+            ts_ok = "Unknown numeric_clean op" not in str(exc)
+        check(f"op key '{key}' accepted by backend", ts_ok)
+
+    df = pd.DataFrame({"num": [1.5, 2.5, 3.5, np.nan, 100.0]})
+    bridge = capturing_bridge()
+    p = DataCleanerPanel(bridge)
+    p.set_dataframe(df)
+    base = pd.to_numeric(df["num"], errors="coerce")
+
+    errors = []
+    orig_crit = QMessageBox.critical
+    QMessageBox.critical = lambda *a, **k: errors.append(a[2])
+    try:
+        p.cmb_num_col.setCurrentText("num")
+
+        # Clamp
+        p.cmb_num_op.setCurrentText("Clamp to min/max range")
+        p.num_min.setValue(2.0)
+        p.num_max.setValue(4.0)
+        p._on_num_preview()
+        got = p._compute_numeric_clean("num", "clamp", {"min": 2.0, "max": 4.0})["num"]
+        check("clamp values + NaN preserved",
+              got.iloc[0] == 2.0 and got.iloc[2] == 3.5 and got.iloc[4] == 4.0
+              and pd.isna(got.iloc[3]), repr(list(got)))
+
+        # IQR fills (only the single 100.0 outlier is replaced)
+        for name, key, fill in [("Fill outliers (IQR) with median", "iqr_median",
+                                 base.median()),
+                                ("Fill outliers (IQR) with mean", "iqr_mean",
+                                 base.mean())]:
+            p.cmb_num_op.setCurrentText(name)
+            p._on_num_preview()
+            check(f"{name}: preview count",
+                  "1 values will change" in p.lbl_num_preview.text().replace(",", ""),
+                  p.lbl_num_preview.text())
+            got = p._compute_numeric_clean("num", key, {"iqr_multiplier": 1.5})["num"]
+            check(f"{name}: outlier replaced, rest intact",
+                  abs(got.iloc[4] - fill) < 1e-9 and got.iloc[0] == 1.5
+                  and got.iloc[2] == 3.5, repr(list(got)))
+
+        # Round: NaN-aware count must say 0 (regression for truthful labels)
+        p.cmb_num_op.setCurrentText("Round to N decimal places")
+        p.num_decimals.setValue(1)
+        p._on_num_preview()
+        got = p._compute_numeric_clean("num", "round", {"decimals": 1})["num"]
+        check("round to 1dp values", list(got.dropna()) == [1.5, 2.5, 3.5, 100.0],
+              repr(list(got)))
+        check("round preview count honest (NaN not counted)",
+              "0 values will change" in p.lbl_num_preview.text()
+              and not p.btn_num_apply.isEnabled(), p.lbl_num_preview.text())
+
+        # Min-max
+        p.cmb_num_op.setCurrentText("Scale to 0-1 (min-max)")
+        p._on_num_preview()
+        got = p._compute_numeric_clean("num", "minmax", {})["num"]
+        check("minmax range", got.iloc[0] == 0.0 and got.iloc[4] == 1.0
+              and abs(got.iloc[1] - (2.5 - 1.5) / (100.0 - 1.5)) < 1e-9,
+              repr(list(got)))
+
+        # Z-score
+        p.cmb_num_op.setCurrentText("Z-score standardisation")
+        p._on_num_preview()
+        got = p._compute_numeric_clean("num", "zscore", {})["num"]
+        exp = (base - base.mean()) / base.std()
+        check("zscore matches + mean~0",
+              np.allclose(got.dropna(), exp.dropna())
+              and abs(got.dropna().mean()) < 1e-9, repr(list(got)))
+
+        # Fill NaN variants
+        p.cmb_num_op.setCurrentText("Fill NaN with median")
+        p._on_num_preview()
+        got = p._compute_numeric_clean("num", "fillna_median", {})["num"]
+        check("fillna median", got.isna().sum() == 0 and got.iloc[3] == base.median(),
+              repr(list(got)))
+        p.cmb_num_op.setCurrentText("Fill NaN with mean")
+        p._on_num_preview()
+        got = p._compute_numeric_clean("num", "fillna_mean", {})["num"]
+        check("fillna mean", got.isna().sum() == 0
+              and abs(got.iloc[3] - base.mean()) < 1e-9, repr(list(got)))
+        p.cmb_num_op.setCurrentText("Fill NaN with custom value")
+        p.num_fill.setValue(-7.5)
+        p._on_num_preview()
+        got = p._compute_numeric_clean("num", "fillna_value", {"value": -7.5})["num"]
+        check("fillna custom value", got.isna().sum() == 0 and got.iloc[3] == -7.5,
+              repr(list(got)))
+
+        # Apply path through the worker thread
+        p.cmb_num_op.setCurrentText("Clamp to min/max range")
+        p.num_min.setValue(0.0)
+        p.num_max.setValue(10.0)
+        p._on_num_preview()
+        p._on_num_apply()
+        if p._worker is not None:
+            p._worker.wait(10000)
+        app().processEvents()
+        check("numeric worker apply",
+              bridge.df is not None and bridge.df["num"].iloc[4] == 10.0
+              and bridge.df["num"].iloc[0] == 1.5 and pd.isna(bridge.df["num"].iloc[3]),
+              repr(list(bridge.df["num"]) if bridge.df is not None else None))
+
+        # Issue 11/14: stale preview must reset on parameter / op change
+        p._on_num_preview()
+        check("numeric re-preview enables apply", p.btn_num_apply.isEnabled())
+        p.num_max.setValue(5.0)
+        check("numeric param change disables apply",
+              not p.btn_num_apply.isEnabled() and p.lbl_num_preview.text() == "",
+              f"btn={p.btn_num_apply.isEnabled()} lbl={p.lbl_num_preview.text()!r}")
+        p._on_num_preview()
+        p.cmb_num_op.setCurrentText("Round to N decimal places")
+        check("numeric op change disables apply",
+              not p.btn_num_apply.isEnabled() and p.lbl_num_preview.text() == "",
+              f"btn={p.btn_num_apply.isEnabled()} lbl={p.lbl_num_preview.text()!r}")
+        check("no error dialogs in numeric clean", not errors, repr(errors))
+    finally:
+        QMessageBox.critical = orig_crit
 
 
 def test_dtype():
@@ -242,6 +643,65 @@ def test_dtype():
     # Clear preview hides the table
     p._clear_preview()
     check("clear preview hides", not p.table_preview.isVisible())
+
+
+def test_dtype_extra():
+    """Issue 15: close button, bounded preview, honest lossy preview, apply."""
+    print("[15] Dtype Transformer: close/bounded/honest/apply (Issue 15)")
+    app()
+    from desktop.pages.dtype_transformer_panel import DtypeTransformerPanel
+
+    bridge = capturing_bridge()
+    p = DtypeTransformerPanel(bridge)
+    p.set_dataframe(pd.DataFrame({
+        "t": ["07:06:11", "08:15:00", "99:99:99"],  # object dtype, NOT temporal
+        "n": [1, 2, 3],
+    }))
+
+    # The close (Clear Preview) control demanded by Issue 15 exists
+    check("clear preview button exists", hasattr(p, "btn_clear_preview"))
+
+    # Honest preview for time-strings -> float64: no fake "100%" / fake dates
+    p.cmb_col.setCurrentText("t")
+    p.cmb_target_dtype.setCurrentText("float64")
+    p._on_preview()
+    title = p.lbl_preview_title.text()
+    check("time->float64 honest 0% (no fake success)",
+          "0.0% success rate" in title and "0 of 3" in title, title)
+    after_vals = [p.table_preview.item(i, 1).text()
+                  for i in range(p.table_preview.rowCount())]
+    check("after shows null markers, not dates",
+          all("null" in v for v in after_vals)
+          and not any(v.startswith("20") for v in after_vals), repr(after_vals))
+    check("preview visible after run",
+          not p.table_preview.isHidden() and not p.btn_clear_preview.isHidden())
+
+    # Preview table can never balloon the pane (Issue 15 "unreadable")
+    check("preview table bounded 80-180px",
+          p.table_preview.minimumHeight() >= 80
+          and p.table_preview.maximumHeight() <= 180,
+          f"min={p.table_preview.minimumHeight()} max={p.table_preview.maximumHeight()}")
+
+    # Lossy conversions warn but do not block Apply (Issue 15 "apply not working")
+    check("apply enabled after lossy preview", p.btn_apply.isEnabled())
+    p._clear_preview()
+    check("clear preview hides table + disables apply",
+          p.table_preview.isHidden() and not p.btn_apply.isEnabled())
+
+    # Valid apply round-trip through the worker
+    p.cmb_col.setCurrentText("n")
+    p.cmb_target_dtype.setCurrentText("float64")
+    p._on_preview()
+    check("n->float64 100% preview",
+          "100.0% success rate" in p.lbl_preview_title.text(),
+          p.lbl_preview_title.text())
+    p._on_apply()
+    if p._worker is not None:
+        p._worker.wait(10000)
+    app().processEvents()
+    check("apply converts to float64",
+          bridge.df is not None and str(bridge.df["n"].dtype) == "float64",
+          str(bridge.df["n"].dtype) if bridge.df is not None else "no df")
 
 
 def test_excel():
@@ -331,6 +791,65 @@ def test_column_manager():
         check("formula picker has cols", "text" in items and "num" in items, repr(items))
 
 
+def test_date_difference(ts):
+    """Regression: 'Overflow in int64 addition' when a non-date column
+    (e.g. transaction_id) is picked as a date-difference input."""
+    print("[11] Date Difference overflow guard")
+    import services.transform_service as _ts
+
+    # Exact scenario from the bug report: start = transaction_id,
+    # end = transaction_date, unit = Days, "Today's date" selected.
+    df = pd.DataFrame({
+        "transaction_id": [1000001, 1000002, 3000003],
+        "transaction_date": ["2024-01-05", "2024-02-10", "2024-03-15"],
+    })
+    try:
+        ts.date_diff_column(df, "transaction_id", None, "Days")
+        raised = None
+    except Exception as exc:  # any exception must be the *friendly* one
+        raised = str(exc)
+    check("numeric start col raises friendly error",
+          raised is not None and "doesn't look like a date column" in raised,
+          repr(raised))
+    check("no overflow in error", raised is None or "Overflow" not in raised,
+          repr(raised))
+
+    # String IDs (the pre-fix crash input) must also be refused politely.
+    df2 = pd.DataFrame({
+        "transaction_id": ["45123456789012345678", "99", "7"],
+        "transaction_date": ["2024-01-05", "2024-02-10", "2024-03-15"],
+    })
+    try:
+        ts.date_diff_column(df2, "transaction_id", "transaction_date", "Days")
+        raised2 = None
+    except Exception as exc:
+        raised2 = str(exc)
+    check("huge digit-string IDs refused politely",
+          raised2 is not None and "doesn't look like a date column" in raised2
+          and "Overflow" not in raised2, repr(raised2))
+
+    # Happy path still works, incl. mixed garbage in the date column.
+    out = ts.date_diff_column(df, "transaction_date", None, "Days")
+    check("valid date diff computes", out.notna().sum() == 3, repr(list(out)))
+
+    df3 = pd.DataFrame({"d": ["2024-01-05", "junk", "2024-03-15"]})
+    out3 = ts.date_diff_column(df3, "d", None, "Days")
+    check("mixed garbage coerces to <NA>", out3.isna().sum() == 1, repr(list(out3)))
+
+    # Parser-level guard: _parse_datetime_robust must never raise.
+    for name, s in [("numeric int64", pd.Series([1704067200000000000, 5])),
+                    ("huge digit strings", pd.Series(["9" * 30, "123"])),
+                    ("mixed date+huge", pd.Series(["2024-01-05", "9" * 25]))]:
+        try:
+            res = _ts._parse_datetime_robust(s)
+            ok = res.isna().sum() >= 1
+            detail = repr(list(res))
+        except Exception as exc:
+            ok, detail = False, f"{type(exc).__name__}: {exc}"
+        check(f"parser safe: {name}", ok, detail)
+
+
+
 def main():
     import services.transform_service as ts
     test_find_replace(ts)
@@ -343,6 +862,11 @@ def main():
     test_excel()
     test_classifier()
     test_column_manager()
+    test_date_difference(ts)
+    test_validate_all_rules(ts)
+    test_string_ops_full()
+    test_numeric_ops_full()
+    test_dtype_extra()
 
     print("\n========== RESULT ==========")
     print(f"  Passed: {len(PASS)}")
