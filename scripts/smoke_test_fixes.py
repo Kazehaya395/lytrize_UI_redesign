@@ -420,7 +420,14 @@ def test_string_ops_full():
         check("cleaner preview cells centered",
               p.table_str_preview.item(0, 0).textAlignment() == Qt.AlignCenter)
         check("static input bars width-capped",
-              p.cmb_str_op.maximumWidth() <= 480)
+              p.cmb_str_op.maximumWidth() <= 300)
+        check("preview table LEFT + controls panel RIGHT",
+              p.cmb_str_op.parentWidget().maximumWidth() <= 440
+              and p.table_str_preview.minimumHeight() >= 205
+              and p.tabs.widget(3).layout().stretch(
+                  p.tabs.widget(3).layout().indexOf(p.table_str_preview)) == 3,
+              f"side={p.cmb_str_op.parentWidget().maximumWidth()} "
+              f"minH={p.table_str_preview.minimumHeight()}")
         p._on_str_apply()
         if p._worker is not None:
             p._worker.wait(10000)
@@ -449,7 +456,7 @@ def test_string_ops_full():
               not p.btn_str_apply.isEnabled() and p.lbl_str_preview.text() == "",
               f"btn={p.btn_str_apply.isEnabled()} lbl={p.lbl_str_preview.text()!r}")
         check("dynamic option widgets width-capped",
-              p.str_op_length.maximumWidth() <= 480)
+              p.str_op_length.maximumWidth() <= 300)
         check("no error dialogs in string ops", not errors, repr(errors))
     finally:
         QMessageBox.critical = orig_crit

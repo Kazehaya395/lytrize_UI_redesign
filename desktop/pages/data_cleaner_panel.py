@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QComboBox, QLineEdit, QMessageBox,
     QTabWidget, QCheckBox, QSpinBox, QDoubleSpinBox, QRadioButton,
     QButtonGroup, QTableWidget, QTableWidgetItem, QHeaderView,
-    QProgressBar, QFrame, QGroupBox,
+    QProgressBar, QFrame, QGroupBox, QGridLayout,
 )
 
 from services.transform_service import (
@@ -83,7 +83,7 @@ def count_changed_values(before: pd.Series, after: pd.Series) -> int:
 # UI issue: input bars stretched across the full window width look bad on
 # wide monitors ('too width & long selection bar & text bar') -- cap every
 # combo / text field / spin box to a sensible width (left-aligned).
-INPUT_MAX_WIDTH = 480
+INPUT_MAX_WIDTH = 300
 
 
 def cap_input_widths(widget) -> None:
@@ -93,6 +93,38 @@ def cap_input_widths(widget) -> None:
     for cls in (QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox):
         for w in widget.findChildren(cls):
             w.setMaximumWidth(INPUT_MAX_WIDTH)
+
+SIDE_PANEL_MAX_WIDTH = 440
+# Preview tables must always show at least MIN_PREVIEW_ROWS rows and grow
+# with the available space (header ~30px + 5 rows x ~34px each).
+MIN_PREVIEW_ROWS = 5
+PREVIEW_MIN_HEIGHT = 205
+
+
+def make_side_panel():
+    """Compact right-hand controls panel, styled like the Dtype side panel."""
+    frame = QFrame()
+    frame.setStyleSheet(
+        "QFrame { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; }"
+    )
+    frame.setMaximumWidth(SIDE_PANEL_MAX_WIDTH)
+    lay = QVBoxLayout(frame)
+    lay.setContentsMargins(12, 12, 12, 12)
+    lay.setSpacing(8)
+    return frame, lay
+
+
+def make_preview_table(headers):
+    """Preview table: at least MIN_PREVIEW_ROWS visible rows, fills the space."""
+    tbl = QTableWidget()
+    tbl.setColumnCount(len(headers))
+    tbl.setHorizontalHeaderLabels(list(headers))
+    tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+    tbl.setStyleSheet(
+        "QTableWidget { background: #1e293b; color: #e2e8f0; gridline-color: #334155; }"
+    )
+    tbl.setMinimumHeight(PREVIEW_MIN_HEIGHT)
+    return tbl
 
 
 class DataCleanerPanel(QWidget):
@@ -172,22 +204,26 @@ class DataCleanerPanel(QWidget):
         cap_input_widths(self.tabs)
 
     def _build_text_tab(self) -> None:
-        layout = QVBoxLayout(self.tab_text)
+        # Body row: preview table on the LEFT (stretch=3), compact controls
+        # panel on the RIGHT -- mirrors the Dtype Transformer layout.
+        layout = QHBoxLayout(self.tab_text)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setSpacing(12)
 
-        # Column selector
-        layout.addWidget(QLabel("Column to clean:"))
+        self.table_text_preview = make_preview_table(["Before", "After"])
+        layout.addWidget(self.table_text_preview, 3)
+
+        side, side_layout = make_side_panel()
+        layout.addWidget(side)
+
+        side_layout.addWidget(QLabel("Column to clean:"))
         self.cmb_text_col = QComboBox()
-        layout.addWidget(self.cmb_text_col)
+        side_layout.addWidget(self.cmb_text_col)
 
-        # Operations
         ops_group = QGroupBox("Select operations to apply (applied in order):")
-        ops_layout = QVBoxLayout(ops_group)
-        c1 = QHBoxLayout()
-        c2 = QHBoxLayout()
-        c3 = QHBoxLayout()
-
+        ops_grid = QGridLayout(ops_group)
+        ops_grid.setHorizontalSpacing(10)
+        ops_grid.setVerticalSpacing(4)
         self.chk_strip = QCheckBox("Strip whitespace")
         self.chk_strip.setChecked(True)
         self.chk_lower = QCheckBox("Lowercase")
@@ -201,118 +237,80 @@ class DataCleanerPanel(QWidget):
         self.chk_unicode = QCheckBox("Normalise unicode")
         self.chk_rmnl = QCheckBox("Remove newlines")
         self.chk_emptyna = QCheckBox("Empty → NaN")
+        checks = [
+            self.chk_strip, self.chk_lower, self.chk_upper,
+            self.chk_title, self.chk_rmspec, self.chk_alphanum,
+            self.chk_rmdigits, self.chk_rmspaces, self.chk_rmhtml,
+            self.chk_unicode, self.chk_rmnl, self.chk_emptyna,
+        ]
+        for i, chk in enumerate(checks):
+            ops_grid.addWidget(chk, i // 2, i % 2)
+        ops_grid.setColumnStretch(0, 1)
+        ops_grid.setColumnStretch(1, 1)
+        side_layout.addWidget(ops_group)
 
-        c1.addWidget(self.chk_strip)
-        c1.addWidget(self.chk_lower)
-        c1.addWidget(self.chk_upper)
-        c2.addWidget(self.chk_title)
-        c2.addWidget(self.chk_rmspec)
-        c2.addWidget(self.chk_alphanum)
-        c3.addWidget(self.chk_rmdigits)
-        c3.addWidget(self.chk_rmspaces)
-        c3.addWidget(self.chk_rmhtml)
-        ops_layout.addLayout(c1)
-        ops_layout.addLayout(c2)
-        ops_layout.addLayout(c3)
-        c1.addWidget(self.chk_unicode)
-        c1.addWidget(self.chk_rmnl)
-        c1.addWidget(self.chk_emptyna)
-        layout.addWidget(ops_group)
-
-        # Preview
         self.lbl_text_preview = QLabel("")
         self.lbl_text_preview.setWordWrap(True)
         self.lbl_text_preview.setStyleSheet("font-size: 11px; color: #94a3b8;")
-        layout.addWidget(self.lbl_text_preview)
+        side_layout.addWidget(self.lbl_text_preview)
+        side_layout.addStretch(1)
 
-        self.table_text_preview = QTableWidget()
-        self.table_text_preview.setColumnCount(2)
-        self.table_text_preview.setHorizontalHeaderLabels(["Before", "After"])
-        self.table_text_preview.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table_text_preview.setStyleSheet(
-            "QTableWidget { background: #1e293b; color: #e2e8f0; gridline-color: #334155; }"
-        )
-        # A small explicit minimum (not a fixed height) so this table can't
-        # inflate the whole Data Cleaner tab's floor beyond what's needed --
-        # QTabWidget.minimumSizeHint() is based on the LARGEST of all its
-        # sub-tabs, so an oversized table here forces every other sub-tab
-        # (and the outer transform-tools splitter pane) to stay just as
-        # tall even when a much smaller tab is the one actually showing.
-        # The table still scrolls internally past this height, so no data
-        # becomes inaccessible -- it just stops forcing extra vertical
-        # space when the user is trying to shrink the panel.
-        self.table_text_preview.setMinimumHeight(80)
-        layout.addWidget(self.table_text_preview)
-
-        # Buttons
         btn_row = QHBoxLayout()
-        btn_row.addStretch()
         self.btn_text_preview = QPushButton("🔎 Preview")
         self.btn_text_apply = QPushButton("✅ Apply Text Clean")
         self.btn_text_apply.setEnabled(False)
         btn_row.addWidget(self.btn_text_preview)
         btn_row.addWidget(self.btn_text_apply)
-        layout.addLayout(btn_row)
+        side_layout.addLayout(btn_row)
 
         self.btn_text_preview.clicked.connect(self._on_text_preview)
         self.btn_text_apply.clicked.connect(self._on_text_apply)
 
     def _build_find_tab(self) -> None:
-        layout = QVBoxLayout(self.tab_find)
+        layout = QHBoxLayout(self.tab_find)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setSpacing(12)
 
-        layout.addWidget(QLabel("Column:"))
+        self.table_find_preview = make_preview_table(["Before", "After"])
+        layout.addWidget(self.table_find_preview, 3)
+
+        side, side_layout = make_side_panel()
+        layout.addWidget(side)
+
+        side_layout.addWidget(QLabel("Column:"))
         self.cmb_find_col = QComboBox()
-        layout.addWidget(self.cmb_find_col)
+        side_layout.addWidget(self.cmb_find_col)
 
-        find_row = QHBoxLayout()
-        find_row.addWidget(QLabel("Find:"))
+        side_layout.addWidget(QLabel("Find:"))
         self.txt_find = QLineEdit()
-        self.txt_find.setPlaceholderText("e.g. N/A  or  ^\\d+$")
-        find_row.addWidget(self.txt_find)
-        layout.addLayout(find_row)
+        self.txt_find.setPlaceholderText("e.g. N/A  or  ^\\\\d+$")
+        side_layout.addWidget(self.txt_find)
 
-        replace_row = QHBoxLayout()
-        replace_row.addWidget(QLabel("Replace with:"))
+        side_layout.addWidget(QLabel("Replace with:"))
         self.txt_replace = QLineEdit()
         self.txt_replace.setPlaceholderText("Leave blank to delete")
-        replace_row.addWidget(self.txt_replace)
-        layout.addLayout(replace_row)
+        side_layout.addWidget(self.txt_replace)
 
         opts_row = QHBoxLayout()
         self.chk_find_regex = QCheckBox("Use regex")
         self.chk_find_ci = QCheckBox("Case-insensitive")
         opts_row.addWidget(self.chk_find_regex)
         opts_row.addWidget(self.chk_find_ci)
-        layout.addLayout(opts_row)
+        side_layout.addLayout(opts_row)
 
         self.lbl_find_preview = QLabel("")
         self.lbl_find_preview.setWordWrap(True)
         self.lbl_find_preview.setStyleSheet("font-size: 11px; color: #94a3b8;")
-        layout.addWidget(self.lbl_find_preview)
-
-        self.table_find_preview = QTableWidget()
-        self.table_find_preview.setColumnCount(2)
-        self.table_find_preview.setHorizontalHeaderLabels(["Before", "After"])
-        self.table_find_preview.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table_find_preview.setStyleSheet(
-            "QTableWidget { background: #1e293b; color: #e2e8f0; gridline-color: #334155; }"
-        )
-        # Small explicit minimum, not a fixed height -- see the identical
-        # comment on table_text_preview above for why this matters (a
-        # QTabWidget's minimumSizeHint is driven by its LARGEST sub-tab).
-        self.table_find_preview.setMinimumHeight(80)
-        layout.addWidget(self.table_find_preview)
+        side_layout.addWidget(self.lbl_find_preview)
+        side_layout.addStretch(1)
 
         btn_row = QHBoxLayout()
-        btn_row.addStretch()
         self.btn_find_preview = QPushButton("🔎 Preview")
         self.btn_find_apply = QPushButton("✅ Apply Find & Replace")
         self.btn_find_apply.setEnabled(False)
         btn_row.addWidget(self.btn_find_preview)
         btn_row.addWidget(self.btn_find_apply)
-        layout.addLayout(btn_row)
+        side_layout.addLayout(btn_row)
 
         self.txt_find.textChanged.connect(
             lambda text: self.btn_find_apply.setEnabled(bool(text.strip()))
@@ -321,33 +319,38 @@ class DataCleanerPanel(QWidget):
         self.btn_find_apply.clicked.connect(self._on_find_apply)
 
     def _build_validate_tab(self) -> None:
-        layout = QVBoxLayout(self.tab_validate)
+        layout = QHBoxLayout(self.tab_validate)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setSpacing(12)
 
-        layout.addWidget(QLabel("Column to validate:"))
+        self.table_failures = make_preview_table(["Failing Values"])
+        layout.addWidget(self.table_failures, 3)
+
+        side, side_layout = make_side_panel()
+        layout.addWidget(side)
+
+        side_layout.addWidget(QLabel("Column to validate:"))
         self.cmb_val_col = QComboBox()
-        layout.addWidget(self.cmb_val_col)
+        side_layout.addWidget(self.cmb_val_col)
 
-        layout.addWidget(QLabel("Validation rule:"))
+        side_layout.addWidget(QLabel("Validation rule:"))
         self.cmb_val_pattern = QComboBox()
         self.cmb_val_pattern.addItems([
             "Email address", "Phone (intl. +XX)", "UK postcode", "US ZIP code",
             "Integer number", "Decimal number", "Date (YYYY-MM-DD)",
             "URL (http/https)", "UUID", "Custom regex…",
         ])
-        layout.addWidget(self.cmb_val_pattern)
+        side_layout.addWidget(self.cmb_val_pattern)
 
         self.txt_val_custom = QLineEdit()
-        self.txt_val_custom.setPlaceholderText(r"e.g. ^\d{4}-\d{2}-\d{2}$")
+        self.txt_val_custom.setPlaceholderText(r"e.g. ^\\d{4}-\\d{2}-\\d{2}$")
         self.txt_val_custom.setVisible(False)
-        layout.addWidget(self.txt_val_custom)
+        side_layout.addWidget(self.txt_val_custom)
 
         self.cmb_val_pattern.currentTextChanged.connect(
             lambda text: self.txt_val_custom.setVisible(text == "Custom regex…")
         )
 
-        # Metrics
         metrics_row = QHBoxLayout()
         self.lbl_pass = QLabel("✅ Pass: 0")
         self.lbl_fail = QLabel("❌ Fail: 0")
@@ -355,47 +358,40 @@ class DataCleanerPanel(QWidget):
         for lbl in (self.lbl_pass, self.lbl_fail, self.lbl_null):
             lbl.setStyleSheet("font-size: 13px; font-weight: 600; color: #e2e8f0;")
             metrics_row.addWidget(lbl)
-        layout.addLayout(metrics_row)
+        side_layout.addLayout(metrics_row)
 
-        # Failing rows table
-        self.table_failures = QTableWidget()
-        self.table_failures.setColumnCount(1)
-        self.table_failures.setHorizontalHeaderLabels(["Failing Values"])
-        self.table_failures.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table_failures.setStyleSheet(
-            "QTableWidget { background: #1e293b; color: #e2e8f0; gridline-color: #334155; }"
-        )
-        self.table_failures.setMaximumHeight(150)
-        self.table_failures.setMinimumHeight(60)
-        layout.addWidget(self.table_failures)
-
-        # Action
-        layout.addWidget(QLabel("Action on failing rows:"))
+        side_layout.addWidget(QLabel("Action on failing rows:"))
         self.rb_val_none = QRadioButton("None — just report")
         self.rb_val_none.setChecked(True)
         self.rb_val_nan = QRadioButton("Replace failing values with NaN")
-        self.rb_val_flag = QRadioButton("Flag: add boolean column '_valid_<col>'")
+        self.rb_val_flag = QRadioButton("Flag: add boolean column _valid_<col>")
         for rb in (self.rb_val_none, self.rb_val_nan, self.rb_val_flag):
             rb.setStyleSheet("color: #e2e8f0; font-size: 12px;")
-            layout.addWidget(rb)
+            side_layout.addWidget(rb)
+        side_layout.addStretch(1)
 
         btn_row = QHBoxLayout()
-        btn_row.addStretch()
         self.btn_val_apply = QPushButton("✅ Apply Validation")
         self.btn_val_apply.setEnabled(False)
         btn_row.addWidget(self.btn_val_apply)
-        layout.addLayout(btn_row)
+        side_layout.addLayout(btn_row)
 
         self.btn_val_apply.clicked.connect(self._on_val_apply)
         self.cmb_val_col.currentTextChanged.connect(self._on_validate_col_changed)
         self.cmb_val_pattern.currentTextChanged.connect(self._on_validate_pattern_changed)
 
     def _build_string_tab(self) -> None:
-        layout = QVBoxLayout(self.tab_string)
+        layout = QHBoxLayout(self.tab_string)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setSpacing(12)
 
-        layout.addWidget(QLabel("Operation:"))
+        self.table_str_preview = make_preview_table(["Before", "After"])
+        layout.addWidget(self.table_str_preview, 3)
+
+        side, side_layout = make_side_panel()
+        layout.addWidget(side)
+
+        side_layout.addWidget(QLabel("Operation:"))
         self.cmb_str_op = QComboBox()
         self.cmb_str_op.addItems([
             OP_TRIM,
@@ -405,41 +401,30 @@ class DataCleanerPanel(QWidget):
             OP_CONCAT,
             OP_REGEX_EXTRACT,
         ])
-        layout.addWidget(self.cmb_str_op)
+        side_layout.addWidget(self.cmb_str_op)
 
-        layout.addWidget(QLabel("Source column:"))
+        side_layout.addWidget(QLabel("Source column:"))
         self.cmb_str_col = QComboBox()
-        layout.addWidget(self.cmb_str_col)
+        side_layout.addWidget(self.cmb_str_col)
 
-        # Dynamic options
+        # Dynamic options (rebuilt by _on_str_op_changed)
         self.str_options = QWidget()
         self.str_options_layout = QVBoxLayout(self.str_options)
-        layout.addWidget(self.str_options)
+        side_layout.addWidget(self.str_options)
 
         self.lbl_str_preview = QLabel("")
         self.lbl_str_preview.setWordWrap(True)
         self.lbl_str_preview.setStyleSheet("font-size: 11px; color: #94a3b8;")
-        layout.addWidget(self.lbl_str_preview)
-
-        self.table_str_preview = QTableWidget()
-        self.table_str_preview.setColumnCount(2)
-        self.table_str_preview.setHorizontalHeaderLabels(["Before", "After"])
-        self.table_str_preview.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table_str_preview.setStyleSheet(
-            "QTableWidget { background: #1e293b; color: #e2e8f0; gridline-color: #334155; }"
-        )
-        # Removed fixed height to allow full resizing via splitter
-        self.table_str_preview.setMinimumHeight(80)
-        layout.addWidget(self.table_str_preview)
+        side_layout.addWidget(self.lbl_str_preview)
+        side_layout.addStretch(1)
 
         btn_row = QHBoxLayout()
-        btn_row.addStretch()
         self.btn_str_preview = QPushButton("🔎 Preview")
         self.btn_str_apply = QPushButton("✅ Apply")
         self.btn_str_apply.setEnabled(False)
         btn_row.addWidget(self.btn_str_preview)
         btn_row.addWidget(self.btn_str_apply)
-        layout.addLayout(btn_row)
+        side_layout.addLayout(btn_row)
 
         self.cmb_str_op.currentTextChanged.connect(self._on_str_op_changed)
         self.btn_str_preview.clicked.connect(self._on_str_preview)
@@ -447,15 +432,21 @@ class DataCleanerPanel(QWidget):
         self._on_str_op_changed(self.cmb_str_op.currentText())
 
     def _build_numeric_tab(self) -> None:
-        layout = QVBoxLayout(self.tab_numeric)
+        layout = QHBoxLayout(self.tab_numeric)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setSpacing(12)
 
-        layout.addWidget(QLabel("Column:"))
+        self.table_num_preview = make_preview_table(["Before", "After"])
+        layout.addWidget(self.table_num_preview, 3)
+
+        side, side_layout = make_side_panel()
+        layout.addWidget(side)
+
+        side_layout.addWidget(QLabel("Column:"))
         self.cmb_num_col = QComboBox()
-        layout.addWidget(self.cmb_num_col)
+        side_layout.addWidget(self.cmb_num_col)
 
-        layout.addWidget(QLabel("Operation:"))
+        side_layout.addWidget(QLabel("Operation:"))
         self.cmb_num_op = QComboBox()
         self.cmb_num_op.addItems([
             "Clamp to min/max range",
@@ -468,36 +459,26 @@ class DataCleanerPanel(QWidget):
             "Fill NaN with mean",
             "Fill NaN with custom value",
         ])
-        layout.addWidget(self.cmb_num_op)
+        side_layout.addWidget(self.cmb_num_op)
 
-        # Dynamic options
+        # Dynamic options (rebuilt by _on_num_op_changed)
         self.num_options = QWidget()
         self.num_options_layout = QVBoxLayout(self.num_options)
-        layout.addWidget(self.num_options)
+        side_layout.addWidget(self.num_options)
 
         self.lbl_num_preview = QLabel("")
         self.lbl_num_preview.setWordWrap(True)
         self.lbl_num_preview.setStyleSheet("font-size: 11px; color: #94a3b8;")
-        layout.addWidget(self.lbl_num_preview)
-
-        self.table_num_preview = QTableWidget()
-        self.table_num_preview.setColumnCount(2)
-        self.table_num_preview.setHorizontalHeaderLabels(["Before", "After"])
-        self.table_num_preview.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table_num_preview.setStyleSheet(
-            "QTableWidget { background: #1e293b; color: #e2e8f0; gridline-color: #334155; }"
-        )
-        self.table_num_preview.setMinimumHeight(80)
-        layout.addWidget(self.table_num_preview)
+        side_layout.addWidget(self.lbl_num_preview)
+        side_layout.addStretch(1)
 
         btn_row = QHBoxLayout()
-        btn_row.addStretch()
         self.btn_num_preview = QPushButton("🔎 Preview")
         self.btn_num_apply = QPushButton("✅ Apply Numeric Clean")
         self.btn_num_apply.setEnabled(False)
         btn_row.addWidget(self.btn_num_preview)
         btn_row.addWidget(self.btn_num_apply)
-        layout.addLayout(btn_row)
+        side_layout.addLayout(btn_row)
 
         self.cmb_num_op.currentTextChanged.connect(self._on_num_op_changed)
         self.btn_num_preview.clicked.connect(self._on_num_preview)
