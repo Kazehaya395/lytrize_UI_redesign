@@ -419,6 +419,8 @@ def test_string_ops_full():
               p.lbl_str_preview.text())
         check("cleaner preview cells centered",
               p.table_str_preview.item(0, 0).textAlignment() == Qt.AlignCenter)
+        check("static input bars width-capped",
+              p.cmb_str_op.maximumWidth() <= 480)
         p._on_str_apply()
         if p._worker is not None:
             p._worker.wait(10000)
@@ -446,6 +448,8 @@ def test_string_ops_full():
         check("column change disables apply (Issue 11)",
               not p.btn_str_apply.isEnabled() and p.lbl_str_preview.text() == "",
               f"btn={p.btn_str_apply.isEnabled()} lbl={p.lbl_str_preview.text()!r}")
+        check("dynamic option widgets width-capped",
+              p.str_op_length.maximumWidth() <= 480)
         check("no error dialogs in string ops", not errors, repr(errors))
     finally:
         QMessageBox.critical = orig_crit
@@ -709,11 +713,14 @@ def test_dtype_extra():
     # UI issues (user report): dtypes table must cover the whole area (no
     # 200px cap, stretch=1 in the panel layout) and the Clear Preview
     # control must be highlighted so it can be spotted quickly.
-    idx = p.layout().indexOf(p.table_dtypes)
+    idx = p._body_layout.indexOf(p.table_dtypes)
     check("dtypes table stretches to cover area",
           p.table_dtypes.maximumHeight() >= 1000 and idx >= 0
-          and p.layout().stretch(idx) == 1,
+          and p._body_layout.stretch(idx) == 3,
           f"maxH={p.table_dtypes.maximumHeight()} idx={idx}")
+    check("transform controls in right side panel",
+          p.cmb_col.parentWidget().maximumWidth() <= 460,
+          f"sideW={p.cmb_col.parentWidget().maximumWidth()}")
     check("clear preview button highlighted",
           "#4f46e5" in p.btn_clear_preview.styleSheet(),
           p.btn_clear_preview.styleSheet()[:50])

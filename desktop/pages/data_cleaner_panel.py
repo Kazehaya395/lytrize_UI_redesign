@@ -80,6 +80,21 @@ def count_changed_values(before: pd.Series, after: pd.Series) -> int:
     return int((differ & ~both_na).sum())
 
 
+# UI issue: input bars stretched across the full window width look bad on
+# wide monitors ('too width & long selection bar & text bar') -- cap every
+# combo / text field / spin box to a sensible width (left-aligned).
+INPUT_MAX_WIDTH = 480
+
+
+def cap_input_widths(widget) -> None:
+    """Cap the width of every combo / text field / spin box under *widget*."""
+    # PySide6 findChildren does not accept a tuple of types (PyQt-ism) --
+    # query one type at a time.
+    for cls in (QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox):
+        for w in widget.findChildren(cls):
+            w.setMaximumWidth(INPUT_MAX_WIDTH)
+
+
 class DataCleanerPanel(QWidget):
     """Data cleaning panel with 5 tabs.
 
@@ -152,6 +167,9 @@ class DataCleanerPanel(QWidget):
                     self.table_num_preview):
             tbl.verticalHeader().setFixedWidth(36)
             tbl.verticalHeader().setDefaultAlignment(Qt.AlignCenter)
+
+        # Cap input-bar widths on every static tab (see INPUT_MAX_WIDTH).
+        cap_input_widths(self.tabs)
 
     def _build_text_tab(self) -> None:
         layout = QVBoxLayout(self.tab_text)
@@ -834,6 +852,9 @@ class DataCleanerPanel(QWidget):
             self.str_op_recol.textChanged.connect(self._reset_string_preview)
             self.str_options_layout.addWidget(self.str_op_recol)
 
+        # Cap the freshly built dynamic option widgets too.
+        cap_input_widths(self.tabs)
+
     def _on_str_preview(self) -> None:
         if self._df is None:
             return
@@ -1011,6 +1032,9 @@ class DataCleanerPanel(QWidget):
             self.num_fill.valueChanged.connect(self._reset_numeric_preview)
             self.num_options_layout.addWidget(QLabel("Fill value:"))
             self.num_options_layout.addWidget(self.num_fill)
+
+        # Cap the freshly built dynamic option widgets too.
+        cap_input_widths(self.tabs)
 
     def _on_num_preview(self) -> None:
         if self._df is None:

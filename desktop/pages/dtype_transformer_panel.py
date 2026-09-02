@@ -64,42 +64,45 @@ class DtypeTransformerPanel(QWidget):
             "QTableWidget { background: #1e293b; color: #e2e8f0; gridline-color: #334155; }"
         )
         # The dtypes table is this panel's main content: NO max-height cap.
-        # It takes stretch=1 below so it covers ALL leftover vertical space
-        # instead of leaving dead gaps between the tab bar, the header and
-        # the transform controls (UI issue: "table should cover the whole
-        # area" / "too width, look bad UI design"). The panel lives inside a
-        # resizable QScrollArea (upload_page), so a tall table can no longer
-        # inflate the splitter pane -- it simply scrolls.
+        # It sits in the body row (stretch=3, below) so it covers ALL of the
+        # panel's leftover space instead of leaving dead gaps (UI issues:
+        # "table should cover the whole area" / "taking unnecessary space").
+        # The panel lives inside a resizable QScrollArea (upload_page), so a
+        # tall table can never inflate the splitter pane -- it simply scrolls.
         self.table_dtypes.setMinimumHeight(120)
         # Roomier, centered row-index gutter (UI issue: index numbers were
         # cramped against the first column) and centered cell values.
         self.table_dtypes.verticalHeader().setFixedWidth(36)
         self.table_dtypes.verticalHeader().setDefaultAlignment(Qt.AlignCenter)
-        root.addWidget(self.table_dtypes, 1)
+        # -- Body: wide dtypes table (left) + transform controls (right) --
+        # UI issue: the full-width stacked layout wasted horizontal space
+        # ("organise this section with left table & right side drop-down
+        # selections"). The table keeps most of the width; the column/
+        # target drop-downs live in a compact side panel on the right.
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        self._body_layout = body
+        body.addWidget(self.table_dtypes, 3)
 
-        # -- Transform controls --
-        controls = QFrame()
-        controls.setStyleSheet(
+        # -- Transform controls (right-hand side panel) --
+        side_frame = QFrame()
+        side_frame.setStyleSheet(
             "QFrame { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; }"
         )
-        ctrl_layout = QVBoxLayout(controls)
-        ctrl_layout.setContentsMargins(12, 12, 12, 12)
-        ctrl_layout.setSpacing(8)
+        side_layout = QVBoxLayout(side_frame)
+        side_layout.setContentsMargins(12, 12, 12, 12)
+        side_layout.setSpacing(8)
+        side_frame.setMaximumWidth(460)
 
-        # Keep the transform controls compact: the dtypes table above takes
-        # stretch=1, so leftover vertical space never gets smeared into
-        # inflated gaps between these rows.
-        controls.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-
-        ctrl_layout.addWidget(QLabel("Select column to transform:"))
+        side_layout.addWidget(QLabel("Select column to transform:"))
         self.cmb_col = QComboBox()
         self.cmb_col.setStyleSheet(
             "QComboBox { background: #1e293b; color: #e2e8f0;"
             "  border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; }"
         )
-        ctrl_layout.addWidget(self.cmb_col)
+        side_layout.addWidget(self.cmb_col)
 
-        ctrl_layout.addWidget(QLabel("Convert to:"))
+        side_layout.addWidget(QLabel("Convert to:"))
         self.cmb_target_dtype = QComboBox()
         self.cmb_target_dtype.addItems([
             "object", "string", "int64", "float64", "bool", "category",
@@ -109,7 +112,24 @@ class DtypeTransformerPanel(QWidget):
             "QComboBox { background: #1e293b; color: #e2e8f0;"
             "  border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; }"
         )
-        ctrl_layout.addWidget(self.cmb_target_dtype)
+        side_layout.addWidget(self.cmb_target_dtype)
+        side_layout.addStretch(1)
+        body.addWidget(side_frame)
+        root.addLayout(body, 1)
+
+        # -- Preview result area (spans the full width below the body) --
+        controls = QFrame()
+        controls.setStyleSheet(
+            "QFrame { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; }"
+        )
+        ctrl_layout = QVBoxLayout(controls)
+        ctrl_layout.setContentsMargins(12, 12, 12, 12)
+        ctrl_layout.setSpacing(8)
+
+        # Keep the preview area compact: the body row above takes stretch=1,
+        # so leftover vertical space never gets smeared into inflated gaps
+        # between these rows.
+        controls.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
         # Preview result area
         preview_header_row = QHBoxLayout()
