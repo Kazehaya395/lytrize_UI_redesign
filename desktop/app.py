@@ -55,8 +55,18 @@ def main() -> int:
     QApplication.setApplicationDisplayName("Lytrize")
     QApplication.setDesktopFileName("lytrize")
 
+    # High-DPI: crisp fractional geometry and high-res pixmaps at any DPI.
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
+
+    # Lytrize theme: app-wide base font (scales on HQ/high-DPI displays) and
+    # the global stylesheet (accent table headers, tinted row index, themed
+    # inputs). Apply before any window/widget is constructed.
+    from desktop.theme import apply_app_theme
+    apply_app_theme(app)
 
     icon_path = _find_icon()
     if icon_path:

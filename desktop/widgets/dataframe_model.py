@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 import pandas as pd
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
+from PySide6.QtGui import QColor, QFont
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +84,19 @@ class DataFrameModel(QAbstractTableModel):
         return None
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole) -> Any:  # noqa: N802
+        # Column headers: make them bold (brand styling also comes from the
+        # global QSS on QHeaderView::section, but the font role keeps the
+        # emphasis even if a caller overrides the QSS).
+        if role in (Qt.FontRole, Qt.ForegroundRole) and orientation == Qt.Horizontal:
+            if 0 <= section < len(self._df.columns):
+                if role == Qt.FontRole:
+                    return QFont("", 10, QFont.Weight.Bold)
+                return QColor("#e0e7ff")
+        # Row index gutter: tinted, bold, indigo numerals for quick scanning.
+        if role == Qt.ForegroundRole and orientation == Qt.Vertical:
+            return QColor("#a5b4fc")
+        if role == Qt.FontRole and orientation == Qt.Vertical:
+            return QFont("", 10, QFont.Weight.Bold)
         if role != Qt.DisplayRole:
             return None
 

@@ -102,10 +102,15 @@ PREVIEW_MIN_HEIGHT = 205
 
 
 def make_side_panel():
-    """Compact right-hand controls panel, styled like the Dtype side panel."""
+    """Compact right-hand controls panel, styled like the Dtype side panel.
+
+    Uses the Lytrize theme's card/surface colours (lighter than the page so
+    the settings read as a distinct, readable card on HQ/high-DPI monitors).
+    """
     frame = QFrame()
     frame.setStyleSheet(
-        "QFrame { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; }"
+        "QFrame { background: #111c33; border: 1px solid #334155;"
+        "  border-radius: 8px; }"
     )
     frame.setMaximumWidth(SIDE_PANEL_MAX_WIDTH)
     lay = QVBoxLayout(frame)
@@ -115,13 +120,17 @@ def make_side_panel():
 
 
 def make_preview_table(headers):
-    """Preview table: at least MIN_PREVIEW_ROWS visible rows, fills the space."""
+    """Preview table: at least MIN_PREVIEW_ROWS visible rows, fills the space.
+
+    Themed with the Lytrize accent header + tinted row-index gutter for
+    high readability on HQ / high-DPI outputs.
+    """
     tbl = QTableWidget()
     tbl.setColumnCount(len(headers))
     tbl.setHorizontalHeaderLabels(list(headers))
     tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
     tbl.setStyleSheet(
-        "QTableWidget { background: #1e293b; color: #e2e8f0; gridline-color: #334155; }"
+        _TABLE_THEME_QSS
     )
     tbl.setMinimumHeight(PREVIEW_MIN_HEIGHT)
     return tbl
@@ -335,11 +344,11 @@ class DataCleanerPanel(QWidget):
 
         side_layout.addWidget(QLabel("Validation rule:"))
         self.cmb_val_pattern = QComboBox()
-        self.cmb_val_pattern.addItems([
-            "Email address", "Phone (intl. +XX)", "UK postcode", "US ZIP code",
-            "Integer number", "Decimal number", "Date (YYYY-MM-DD)",
-            "URL (http/https)", "UUID", "Custom regex…",
-        ])
+        # Mirrors backend/services/transform_service.VALIDATION_PATTERNS
+        # (single source of truth) so new rules appear automatically.
+        self.cmb_val_pattern.addItems(
+            list(VALIDATION_PATTERNS.keys()) + ["Custom regex…"]
+        )
         side_layout.addWidget(self.cmb_val_pattern)
 
         self.txt_val_custom = QLineEdit()

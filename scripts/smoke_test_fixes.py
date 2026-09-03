@@ -238,6 +238,35 @@ VALIDATE_FIXTURES = {
         ["2023-01-01", "1999-12-31"],
         ["01/02/2023", "2023-1-1"],
     ),
+    "Date (MM/DD/YYYY) — US": (
+        ["01/15/2023", "12/31/1999"],
+        ["15/01/2023", "2023-01-15", "13/05/2023"],
+    ),
+    "Date (DD/MM/YYYY) — Europe": (
+        ["15/01/2023", "31/12/1999"],
+        ["01/15/2023", "2023-01-15", "31/13/2023"],
+    ),
+    "Date (YYYY/MM/DD) — Asian": (
+        ["2023/01/15", "1999/12/31"],
+        ["01/15/2023", "2023-01-15", "2023/13/01"],
+    ),
+    "Date (DD-MM-YYYY)": (
+        ["15-01-2023", "31-12-1999"],
+        ["01-15-2023", "2023-01-15", "15/01/2023"],
+    ),
+    "Date (MM-DD-YYYY)": (
+        ["01-15-2023", "12-31-1999"],
+        ["15-01-2023", "2023-01-15", "13-32-2023"],
+    ),
+    "Date (DD.MM.YYYY)": (
+        ["15.01.2023", "31.12.1999"],
+        ["01.15.2023", "2023.01.15", "15,01,2023"],
+    ),
+    "Date (any common format)": (
+        ["2023-01-15", "01/15/2023", "15/01/2023", "2023/01/15",
+         "15-01-2023", "01-15-2023", "15.01.2023"],
+        ["2023-1-1", "20230115", "15-01-23", "yesterday", "2023.13.01"],
+    ),
     "URL (http/https)": (
         ["https://example.com", "http://a.b/c?d=1"],
         ["ftp://x.com", "example.com"],
@@ -976,6 +1005,147 @@ def test_date_difference(ts):
 
 
 
+def test_analysis_redesign():
+    """Analysis page redesign: config rebuild never duplicates the Generate
+    button / orphaned fields, and editing prefills from the saved snapshot."""
+    from PySide6.QtWidgets import QPushButton
+    from desktop.pages.analysis_page import AnalysisPage, WIDGET_SPEC
+
+    print("[17] Analysis page: clean rebuild + edit prefill (redesign)")
+
+    # Ensure import path allows it.
+    import sys
+    if "backend" not in sys.path:
+        sys.path.insert(0, "backend")
+
+    class _Sig:
+        def connect(self, cb):
+            self._cb = cb
+
+    class _Bridge:
+        def __init__(self, df):
+            self.df = df
+            self.charts = []
+            self._store = {}
+            self.charts_changed = _Sig()
+
+        def get(self, k, d=None):
+            if k == "charts":
+                return self.charts
+            return self._store.get(k, d)
+
+        def set(self, k, v):
+            if k == "charts":
+                self.charts = v
+            else:
+                self._store[k] = v
+
+        def add_chart(self, uid, title, fig, chart_type="", meta=None, note=""):
+            self.charts = list(self.charts) + [(uid, title, fig)]
+            if chart_type:
+                self._store[f"chart_type_{uid}"] = chart_type
+            if meta:
+                self._store[f"chart_meta_{uid}"] = meta
+
+        def replace_chart(self, uid, new_fig, new_title=None):
+            for i, (c_uid, c_title, c_fig) in enumerate(self.charts):
+                if c_uid == uid:
+                    self.charts[i] = (c_uid, new_title or c_title, new_fig)
+                    break
+
+        def set_note(self, uid, text):
+            pass
+
+        def get_note(self, uid):
+            return ""
+
+        def get_chart_meta(self, uid):
+            return self._store.get(f"chart_meta_{uid}", {})
+
+        def set_chart_meta(self, uid, **kw):
+            d = dict(self.get_chart_meta(uid))
+            d.update(kw)
+            self._store[f"chart_meta_{uid}"] = d
+
+        def remove_chart(self, uid):
+            pass
+
+        def clear_charts(self):
+            self.charts = []
+
+        def save_draft(self):
+            pass
+
+    df = pd.DataFrame({"cat": ["a", "b", "c"], "num": [1.0, 2.0, 3.0],
+                       "date": ["2023-01-01", "2023-01-02", "2023-01-03"]})
+    b = _Bridge(df)
+    page = AnalysisPage(b)
+
+    # 1) Rebuild across every analysis type: config area must contain no
+    #    stray Generate buttons, and widget count matches the WIDGET_SPEC.
+    for aid in WIDGET_SPEC:
+        for i in range(page.analysis_list.count()):
+            it = page.analysis_list.item(i)
+            if it.data(Qt.UserRole) == aid:
+                page.analysis_list.setCurrentItem(it)
+                page._on_analysis_selected(it, None)
+                break
+        keys = {k for (k, _k, _kind) in WIDGET_SPEC[aid]}
+        check(f"analysis rebuild '{aid}': no stray Generate in config",
+              page.btn_generate is not None and page.btn_generate.parent() is not None,
+              "")
+        check(f"analysis rebuild '{aid}': widget count matches spec",
+              set(page._config_widgets.keys()) == keys,
+              f"{sorted(page._config_widgets)} vs {sorted(keys)}")
+        # No QPushButton should live in the rebuildable content area (the
+        # Generate/Update button is the persistent footer only).
+        stray = 0
+        for i in range(page.config_layout.count()):
+            it = page.config_layout.itemAt(i)
+            w = it.widget() if it else None
+            if isinstance(w, QPushButton):
+                stray += 1
+        check(f"analysis rebuild '{aid}': content area has no buttons",
+              stray == 0, f"stray buttons={stray}")
+
+    # 2) Edit prefill round-trip: build a pie_chart form, save those values
+    #    as the chart's meta config, then edit -> widgets should match.
+    for i in range(page.analysis_list.count()):
+        it = page.analysis_list.item(i)
+        if it.data(Qt.UserRole) == "pie_chart":
+            page.analysis_list.setCurrentItem(it)
+            break
+    # choose x=cat, y=num, agg=Sum
+    cfg = page._config_widgets
+    cfg["x"].setCurrentText("cat")
+    cfg["y"].setCurrentText("num")
+    cfg["agg"].setCurrentText("Sum")
+    page._collect_at_generate = page._collect_widget_values()
+    snap = page._collect_widget_values()
+    b.set("chart_type_c1", "pie_chart")
+    b.set_chart_meta("c1", config=snap)
+
+    page._on_edit_chart("c1")
+    page._build_config_panel("pie_chart", prefill=snap)
+    got = page._collect_widget_values()
+    check("analysis edit: enters edit mode", page._editing_uid == "c1", "")
+    check("analysis edit: prefill round-trip",
+          got.get("x") == snap.get("x") and got.get("y") == snap.get("y")
+          and got.get("agg") == snap.get("agg"),
+          f"saved={snap} got={got}")
+    check("analysis edit: update-chart chrome",
+          "Update Chart" in page.btn_generate.text()
+          and not page.btn_cancel_edit.isHidden(), page.btn_generate.text())
+
+    # 3) Cancel returns to a blank new-chart form.
+    page._on_cancel_edit()
+    check("analysis cancel: exits edit mode + fresh form",
+          page._editing_uid is None
+          and "Generate Charts" in page.btn_generate.text()
+          and not page.btn_cancel_edit.isVisible(),
+          page.btn_generate.text())
+
+
 def main():
     import services.transform_service as ts
     test_find_replace(ts)
@@ -994,6 +1164,7 @@ def main():
     test_numeric_ops_full()
     test_dtype_extra()
     test_date_conversion()
+    test_analysis_redesign()
 
     print("\n========== RESULT ==========")
     print(f"  Passed: {len(PASS)}")
