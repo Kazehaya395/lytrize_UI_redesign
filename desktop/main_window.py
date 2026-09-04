@@ -134,7 +134,7 @@ class MainWindow(QMainWindow):
             "  font-size: 13px; color: #cbd5e1;"
             "}"
             "QListWidget#nav_list::item {"
-            "  padding: 10px 12px; border-radius: 8px; margin: 2px 0;"
+            "  background: transparent; padding: 10px 12px; border-radius: 8px; margin: 2px 0;"
             "}"
             "QListWidget#nav_list::item:hover {"
             "  background: rgba(99,102,241,0.12);"
