@@ -96,8 +96,12 @@ class MainWindow(QMainWindow):
         side_layout.setContentsMargins(12, 16, 12, 16)
         side_layout.setSpacing(4)
 
-        # Logo / brand -- icon and name sit together on one row, vertically centered
-        brand_wrap = QHBoxLayout()
+        # Logo / brand -- icon and name sit together on one row, vertically centered.
+        # A QWidget container (rather than a bare sub-layout) centers reliably
+        # when added to the sidebar's vertical layout via AlignHCenter.
+        brand_container = QWidget()
+        brand_wrap = QHBoxLayout(brand_container)
+        brand_wrap.setContentsMargins(0, 0, 0, 0)
         brand_wrap.setSpacing(10)
         logo_pm = self._load_logo()
         if logo_pm is not None and not logo_pm.isNull():
@@ -109,8 +113,8 @@ class MainWindow(QMainWindow):
         brand = QLabel("Lytrize")
         brand.setObjectName("brand")
         brand.setStyleSheet("font-size: 20px; font-weight: 800; color: #a5b4fc;")
-        brand_wrap.addWidget(brand, 1, Qt.AlignVCenter)
-        side_layout.addLayout(brand_wrap)
+        brand_wrap.addWidget(brand, Qt.AlignVCenter)
+        side_layout.addWidget(brand_container, 0, Qt.AlignHCenter)
 
         # Subtitle -- bolder and its left edge flush with the logo above so it
         # reads as perfectly parallel under the logo + name row.
@@ -119,7 +123,7 @@ class MainWindow(QMainWindow):
         brand_sub.setStyleSheet(
             "font-size: 12px; font-weight: 600; color: #94a3b8; padding: 0 0 12px;"
         )
-        side_layout.addWidget(brand_sub)
+        side_layout.addWidget(brand_sub, 0, Qt.AlignHCenter)
 
         # Navigation list
         self.nav_list = QListWidget()

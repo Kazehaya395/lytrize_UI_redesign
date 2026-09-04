@@ -107,8 +107,8 @@ class HomePage(QWidget):
             "background: #0f172a; border: 1px solid #1e293b;"
             "border-radius: 8px; padding: 16px;"
         )
-        welcome.setWordWrap(True)
-        root.addWidget(welcome)
+        welcome.setWordWrap(False)
+        root.addWidget(welcome, 0, Qt.AlignLeft | Qt.AlignTop)
 
         # -- Stat cards: sessions saved, datasets analyzed, analyses run --
         stats_row = QHBoxLayout()
@@ -116,9 +116,9 @@ class HomePage(QWidget):
         self.stat_sessions = StatCard("💾", 0, "Sessions Saved")
         self.stat_datasets = StatCard("📂", 0, "Datasets Analyzed")
         self.stat_analyses = StatCard("📊", 0, "Analyses Available")
-        stats_row.addWidget(self.stat_sessions)
-        stats_row.addWidget(self.stat_datasets)
-        stats_row.addWidget(self.stat_analyses)
+        stats_row.addWidget(self.stat_sessions, 0, Qt.AlignLeft)
+        stats_row.addWidget(self.stat_datasets, 0, Qt.AlignLeft)
+        stats_row.addWidget(self.stat_analyses, 0, Qt.AlignLeft)
         stats_row.addStretch()
         root.addLayout(stats_row)
 
