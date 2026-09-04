@@ -6,6 +6,7 @@ saved sessions and provides navigation to start a new analysis.
 
 from __future__ import annotations
 
+import getpass
 import logging
 from typing import Optional
 
@@ -90,9 +91,16 @@ class HomePage(QWidget):
         root.addLayout(header)
 
         # -- Welcome banner --
+        try:
+            username = getpass.getuser().strip() or "user"
+        except Exception:
+            username = "user"
         welcome = QLabel(
-            "Welcome to Lytrize — your local-first analytics workspace.\n"
-            "Import a dataset, generate charts, and compose dashboards — all offline."
+            f"<span style='font-size:16px; font-weight:700; color:#e2e8f0;'>"
+            f"Welcome “{username}” to Lytrize — your local-first analytics workspace.</span>"
+            f"<br>"
+            f"<span style='font-size:13px; color:#94a3b8;'>"
+            f"Import a dataset, generate charts, and compose dashboards — all offline.</span>"
         )
         welcome.setStyleSheet(
             "font-size: 13px; color: #94a3b8;"

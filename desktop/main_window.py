@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSize, QTimer
-from PySide6.QtGui import QIcon, QAction
+from PySide6.QtGui import QIcon, QAction, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QStackedWidget, QFrame, QListWidget,
@@ -62,6 +62,21 @@ class MainWindow(QMainWindow):
 
     # -- UI construction ----------------------------------------------------
 
+    def _load_logo(self) -> "QPixmap | None":
+        """Return a scaled ``QPixmap`` of the app logo for the sidebar brand,
+        or ``None`` if the asset is missing."""
+        assets = Path(__file__).resolve().parent.parent / "backend" / "assets"
+        pixmap = QPixmap()
+        for name in ("lytrize.png", "Lytrize.png", "lytrize.ico", "Lytrize.ico"):
+            candidate = assets / name
+            if candidate.exists() and pixmap.load(str(candidate)):
+                return pixmap.scaled(
+                    36, 36,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+        return None
+
     def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
@@ -81,15 +96,29 @@ class MainWindow(QMainWindow):
         side_layout.setContentsMargins(12, 16, 12, 16)
         side_layout.setSpacing(4)
 
-        # Logo / brand
+        # Logo / brand -- icon and name sit together on one row, vertically centered
+        brand_wrap = QHBoxLayout()
+        brand_wrap.setSpacing(10)
+        logo_pm = self._load_logo()
+        if logo_pm is not None and not logo_pm.isNull():
+            logo_lbl = QLabel()
+            logo_lbl.setPixmap(logo_pm)
+            logo_lbl.setFixedSize(36, 36)
+            logo_lbl.setScaledContents(True)
+            brand_wrap.addWidget(logo_lbl, 0, Qt.AlignVCenter)
         brand = QLabel("Lytrize")
         brand.setObjectName("brand")
-        brand.setStyleSheet("font-size: 20px; font-weight: 800; color: #a5b4fc; padding: 8px 12px;")
-        side_layout.addWidget(brand)
+        brand.setStyleSheet("font-size: 20px; font-weight: 800; color: #a5b4fc;")
+        brand_wrap.addWidget(brand, 1, Qt.AlignVCenter)
+        side_layout.addLayout(brand_wrap)
 
+        # Subtitle -- bolder and its left edge flush with the logo above so it
+        # reads as perfectly parallel under the logo + name row.
         brand_sub = QLabel("Analytics Desktop")
         brand_sub.setObjectName("brand_sub")
-        brand_sub.setStyleSheet("font-size: 11px; color: #64748b; padding: 0 12px 12px;")
+        brand_sub.setStyleSheet(
+            "font-size: 12px; font-weight: 600; color: #94a3b8; padding: 0 0 12px;"
+        )
         side_layout.addWidget(brand_sub)
 
         # Navigation list

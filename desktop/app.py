@@ -62,12 +62,6 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
 
-    # Lytrize theme: app-wide base font (scales on HQ/high-DPI displays) and
-    # the global stylesheet (accent table headers, tinted row index, themed
-    # inputs). Apply before any window/widget is constructed.
-    from desktop.theme import apply_app_theme
-    apply_app_theme(app)
-
     icon_path = _find_icon()
     if icon_path:
         app.setWindowIcon(QIcon(icon_path))

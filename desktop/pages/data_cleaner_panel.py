@@ -100,6 +100,14 @@ SIDE_PANEL_MAX_WIDTH = 440
 MIN_PREVIEW_ROWS = 5
 PREVIEW_MIN_HEIGHT = 205
 
+# Shared stylesheet for the Data Cleaner preview tables. `make_preview_table`
+# references this named constant so all five tabs stay visually consistent.
+# Value matches the Lytrize dark surface these tables used before the
+# left/right layout split -- intentionally unchanged to preserve the design.
+_TABLE_THEME_QSS = (
+    "QTableWidget { background: #1e293b; color: #e2e8f0; gridline-color: #334155; }"
+)
+
 
 def make_side_panel():
     """Compact right-hand controls panel, styled like the Dtype side panel.
