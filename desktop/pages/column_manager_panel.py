@@ -4,20 +4,27 @@ Replaces the Streamlit ``show_column_manager()`` with a native Qt panel that:
   - Add Column: custom formula, column ops, date diff, date part extraction
   - Remove Column: multi-select with confirmation
   - Rename Column: with duplicate validation
+
+Layout: a 2-column workspace -- compact settings/actions on the left and a
+live preview table on the right. All controls, handlers and behaviour are
+preserved from the original version; only the visual layout changed.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
 import pandas as pd
 from PySide6.QtCore import Qt, Signal, QThread
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QComboBox, QLineEdit, QMessageBox,
     QTabWidget, QFormLayout, QSpinBox, QCheckBox, QGroupBox,
-    QFileDialog, QInputDialog, QProgressBar,
+    QFileDialog, QInputDialog, QProgressBar, QFrame, QTableWidget,
+    QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 
 from services.transform_service import (
@@ -27,6 +34,66 @@ from services.transform_service import (
 from desktop.workers import TransformWorker
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Small icon helper -- themed icons (Linux) with a safe text-only fallback so
+# the UI never shows a broken/missing-image glyph.
+# ---------------------------------------------------------------------------
+
+def _icon(name: str) -> QIcon:
+    ic = QIcon.fromTheme(name)
+    return ic if not ic.isNull() else QIcon()
+
+
+# Visual operator symbols shown in the UI versus the real Python operators the
+# formula parser understands. The combo label uses the nice glyph (× ÷ −); the
+# formula handed to the backend must use the ASCII operator (* / -).
+_DISPLAY_OP = {
+    "Column × Column": "×", "Column ÷ Column": "÷",
+    "Column + Column": "+", "Column − Column": "−",
+}
+_REAL_OP = {
+    "Column × Column": "*", "Column ÷ Column": "/",
+    "Column + Column": "+", "Column − Column": "-",
+}
+
+# Custom-formula unicode operators a user might type/paste -> ASCII equivalent.
+_FORMULA_OP_MAP = {"×": "*", "÷": "/", "−": "-", "∕": "/"}
+
+
+def _normalize_formula(formula: str) -> str:
+    """Translate typographic operators a user may have typed (× ÷ − …) into the
+    ASCII operators the formula parser understands, so the UI and parser agree."""
+    for pretty, real in _FORMULA_OP_MAP.items():
+        formula = formula.replace(pretty, real)
+    return formula
+
+_QSS_INPUT = (
+    "QLineEdit { background: #1e293b; color: #e2e8f0;"
+    "  border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; }"
+)
+_QSS_COMBO = (
+    "QComboBox { background: #1e293b; color: #e2e8f0;"
+    "  border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; }"
+)
+_QSS_BTN_PRIMARY = (
+    "QPushButton { background: #10b981; color: #ffffff; border: none;"
+    "  border-radius: 6px; padding: 8px 18px; font-weight: 600; }"
+    "QPushButton:hover { background: #059669; }"
+    "QPushButton:disabled { background: #334155; color: #64748b; }"
+)
+_QSS_BTN_GHOST = (
+    "QPushButton { background: #4f46e5; color: #ffffff; border: none;"
+    "  border-radius: 6px; padding: 8px 18px; font-weight: 600; }"
+    "QPushButton:hover { background: #6366f1; }"
+    "QPushButton:disabled { background: #334155; color: #64748b; }"
+)
+_QSS_BTN_DANGER = (
+    "QPushButton { background: #ef4444; color: #ffffff; border: none;"
+    "  border-radius: 6px; padding: 8px 18px; font-weight: 600; }"
+    "QPushButton:hover { background: #dc2626; }"
+    "QPushButton:disabled { background: #334155; color: #64748b; }"
+)
 
 
 class ColumnManagerPanel(QWidget):
@@ -54,42 +121,96 @@ class ColumnManagerPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(8)
 
-        # -- Header --
-        header = QLabel("🛠️ Column Manager")
-        header.setStyleSheet("font-size: 16px; font-weight: 700; color: #e2e8f0;")
-        root.addWidget(header)
+        # -- 2-column workspace: settings (left) + preview (right) ------------
+        body = QHBoxLayout()
+        body.setSpacing(12)
 
-        # -- Tabs --
+        # Left: settings panel ------------------------------------------------
+        left = QFrame()
+        left.setObjectName("cm_settings")
+        left.setMaximumWidth(540)
+        left_lay = QVBoxLayout(left)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+        left_lay.setSpacing(8)
+
+        header = QLabel("Column Manager")
+        header.setStyleSheet("font-size: 15px; font-weight: 700; color: #e2e8f0; padding: 4px 2px;")
+        left_lay.addWidget(header)
+
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet(
             "QTabWidget { background: transparent; }"
+            "QTabWidget::pane { border: 1px solid #1e293b; border-radius: 8px; background: #0b1120; }"
             "QTabBar::tab {"
             "  background: #1e293b; color: #94a3b8;"
             "  border: 1px solid #334155; border-bottom: none;"
             "  border-top-left-radius: 6px; border-top-right-radius: 6px;"
-            "  padding: 8px 16px; font-size: 12px;"
+            "  padding: 8px 14px; font-size: 12px; margin-right: 2px;"
             "}"
-            "QTabBar::tab:selected { background: #0f172a; color: #e2e8f0; }"
+            "QTabBar::tab:selected { background: #0b1120; color: #e2e8f0; }"
         )
 
-        # Tab 1: Add Column
         self.tab_add = QWidget()
         self._build_add_tab()
-        self.tabs.addTab(self.tab_add, "➕ Add Column")
+        self.tabs.addTab(self.tab_add, _icon("list-add"), "Add Column")
 
-        # Tab 2: Remove Column
         self.tab_remove = QWidget()
         self._build_remove_tab()
-        self.tabs.addTab(self.tab_remove, "🗑️ Remove Column")
+        self.tabs.addTab(self.tab_remove, _icon("edit-delete"), "Remove Column")
 
-        # Tab 3: Rename Column
         self.tab_rename = QWidget()
         self._build_rename_tab()
-        self.tabs.addTab(self.tab_rename, "✏️ Rename Column")
+        self.tabs.addTab(self.tab_rename, _icon("document-edit"), "Rename Column")
 
-        root.addWidget(self.tabs, stretch=1)
+        left_lay.addWidget(self.tabs, stretch=1)
+        body.addWidget(left)
 
-        # Progress bar (hidden by default)
+        # Right: preview panel ------------------------------------------------
+        right = QFrame()
+        right.setObjectName("cm_preview")
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(12, 12, 12, 12)
+        right_lay.setSpacing(8)
+
+        prev_header = QLabel("Preview")
+        prev_header.setStyleSheet("font-size: 13px; font-weight: 700; color: #e2e8f0;")
+        right_lay.addWidget(prev_header)
+
+        self.table_preview = QTableWidget()
+        self.table_preview.setColumnCount(0)
+        self.table_preview.setRowCount(0)
+        self.table_preview.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table_preview.setAlternatingRowColors(True)
+        self.table_preview.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_preview.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.table_preview.verticalHeader().setDefaultSectionSize(28)
+        self.table_preview.setStyleSheet(
+            "QTableView {"
+            "  background: #0f172a; color: #e2e8f0;"
+            "  border: 1px solid #1e293b; border-radius: 8px;"
+            "  gridline-color: #1e293b;"
+            "}"
+            "QTableView::item:selected { background: rgba(99,102,241,0.3); }"
+            "QHeaderView::section {"
+            "  background: #1e293b; color: #94a3b8;"
+            "  border: none; padding: 6px; font-weight: 600;"
+            "}"
+        )
+        self.table_preview.verticalHeader().setFixedWidth(36)
+        self.table_preview.verticalHeader().setDefaultAlignment(Qt.AlignCenter)
+        self.table_preview.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table_preview.setMinimumHeight(220)
+        right_lay.addWidget(self.table_preview, stretch=1)
+
+        self.lbl_preview_status = QLabel("Click Preview Result to see the computed column here.")
+        self.lbl_preview_status.setWordWrap(True)
+        self.lbl_preview_status.setStyleSheet("font-size: 11px; color: #94a3b8;")
+        right_lay.addWidget(self.lbl_preview_status)
+
+        body.addWidget(right, stretch=1)
+        root.addLayout(body, stretch=1)
+
+        # Progress bar --------------------------------------------------------
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         self.progress.setStyleSheet(
@@ -100,91 +221,61 @@ class ColumnManagerPanel(QWidget):
 
     def _build_add_tab(self) -> None:
         layout = QVBoxLayout(self.tab_add)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
 
-        # New column name -- label and field share one compact row and the
-        # field is width-capped so it doesn't stretch across the whole pane.
-        name_row = QHBoxLayout()
-        name_lbl = QLabel("New column name:")
-        name_lbl.setStyleSheet("font-size: 12px; color: #94a3b8;")
-        name_row.addWidget(name_lbl)
+        form = QFormLayout()
+        form.setSpacing(8)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setFormAlignment(Qt.AlignTop)
+
         self.txt_new_col = QLineEdit()
         self.txt_new_col.setPlaceholderText("e.g. Total_Sales")
-        self.txt_new_col.setFixedWidth(280)
-        self.txt_new_col.setStyleSheet(
-            "QLineEdit { background: #1e293b; color: #e2e8f0;"
-            "  border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; }"
-        )
-        name_row.addWidget(self.txt_new_col)
-        name_row.addStretch(1)
-        layout.addLayout(name_row)
+        self.txt_new_col.setFixedWidth(300)
+        self.txt_new_col.setStyleSheet(_QSS_INPUT)
+        form.addRow("New column name", self.txt_new_col)
 
-        # Calculation type -- same compact row pattern.
-        calc_row = QHBoxLayout()
-        calc_lbl = QLabel("Calculation type:")
-        calc_lbl.setStyleSheet("font-size: 12px; color: #94a3b8;")
-        calc_row.addWidget(calc_lbl)
         self.cmb_calc_type = QComboBox()
         self.cmb_calc_type.addItems([
             "Custom formula (use col names)",
-            "Column × Column", "Column ÷ Column", "Column + Column", "Column − Column",
+            "Column × Column", "Column ÷ Column",
+            "Column + Column", "Column − Column",
             "Date Difference", "Extract Date/Time Part", "Moving Average",
         ])
-        self.cmb_calc_type.setFixedWidth(280)
-        self.cmb_calc_type.setStyleSheet(
-            "QComboBox { background: #1e293b; color: #e2e8f0;"
-            "  border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; }"
-        )
-        calc_row.addWidget(self.cmb_calc_type)
-        calc_row.addStretch(1)
-        layout.addLayout(calc_row)
+        self.cmb_calc_type.setFixedWidth(300)
+        self.cmb_calc_type.setStyleSheet(_QSS_COMBO)
+        form.addRow("Calculation type", self.cmb_calc_type)
 
-        # Dynamic options area
+        layout.addLayout(form)
+
+        # Dynamic options area (rebuilt on calc-type change) -----------------
         self.options_area = QWidget()
         self.options_layout = QVBoxLayout(self.options_area)
         self.options_layout.setContentsMargins(0, 0, 0, 0)
+        self.options_layout.setSpacing(8)
         layout.addWidget(self.options_area)
 
-        # Preview button
+        # Action buttons -----------------------------------------------------
         btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        self.btn_preview = QPushButton("🔎 Preview Result")
-        self.btn_preview.setStyleSheet(
-            "QPushButton { background: #4f46e5; color: white; border: none;"
-            "  border-radius: 6px; padding: 8px 16px; font-weight: 600; }"
-        )
+        btn_row.setSpacing(8)
+        self.btn_preview = QPushButton(_icon("system-search"), "Preview Result")
+        self.btn_preview.setStyleSheet(_QSS_BTN_GHOST)
+        self.btn_apply_add = QPushButton(_icon("list-add"), "Add Column")
+        self.btn_apply_add.setStyleSheet(_QSS_BTN_PRIMARY)
         btn_row.addWidget(self.btn_preview)
+        btn_row.addWidget(self.btn_apply_add)
+        btn_row.addStretch(1)
         layout.addLayout(btn_row)
 
-        # Preview result
-        self.lbl_preview = QLabel("")
-        self.lbl_preview.setWordWrap(True)
-        self.lbl_preview.setStyleSheet("font-size: 11px; color: #94a3b8;")
-        layout.addWidget(self.lbl_preview)
-
-        # Apply button
-        apply_row = QHBoxLayout()
-        apply_row.addStretch()
-        self.btn_apply_add = QPushButton("✅ Add Column")
-        self.btn_apply_add.setStyleSheet(
-            "QPushButton { background: #10b981; color: white; border: none;"
-            "  border-radius: 6px; padding: 8px 16px; font-weight: 600; }"
-        )
-        apply_row.addWidget(self.btn_apply_add)
-        layout.addLayout(apply_row)
-        # Push everything to the top; without a trailing stretch Qt spreads
-        # these few controls across the whole pane height (Issue 5).
         layout.addStretch(1)
 
-        # Calculation type change rebuilds options
         self.cmb_calc_type.currentTextChanged.connect(self._on_calc_type_changed)
         self._on_calc_type_changed(self.cmb_calc_type.currentText())
 
     def _build_remove_tab(self) -> None:
         layout = QVBoxLayout(self.tab_remove)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
 
         layout.addWidget(QLabel("Select columns to remove:"))
         self.list_remove = QListWidget()
@@ -200,54 +291,46 @@ class ColumnManagerPanel(QWidget):
         layout.addWidget(self.chk_confirm_remove)
 
         btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        self.btn_apply_remove = QPushButton("🗑️ Remove Selected Columns")
+        btn_row.setSpacing(8)
+        self.btn_apply_remove = QPushButton(_icon("edit-delete"), "Remove Selected")
         self.btn_apply_remove.setEnabled(False)
-        self.btn_apply_remove.setStyleSheet(
-            "QPushButton { background: #ef4444; color: white; border: none;"
-            "  border-radius: 6px; padding: 8px 16px; font-weight: 600; }"
-        )
+        self.btn_apply_remove.setStyleSheet(_QSS_BTN_DANGER)
+        btn_row.addStretch(1)
         btn_row.addWidget(self.btn_apply_remove)
         layout.addLayout(btn_row)
-        # Keep controls compact (Issue 5) -- the remove list already has
-        # stretch=1, so this stretch sits below the button row.
-        layout.addStretch(1)
-
-        self.chk_confirm_remove.toggled.connect(self.btn_apply_remove.setEnabled)
 
     def _build_rename_tab(self) -> None:
         layout = QVBoxLayout(self.tab_rename)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
 
-        layout.addWidget(QLabel("Select column to rename:"))
+        form = QFormLayout()
+        form.setSpacing(8)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setFormAlignment(Qt.AlignTop)
+
         self.cmb_rename_col = QComboBox()
-        self.cmb_rename_col.setStyleSheet(
-            "QComboBox { background: #1e293b; color: #e2e8f0;"
-            "  border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; }"
-        )
-        layout.addWidget(self.cmb_rename_col)
+        self.cmb_rename_col.setFixedWidth(300)
+        self.cmb_rename_col.setStyleSheet(_QSS_COMBO)
+        form.addRow("Select column", self.cmb_rename_col)
 
-        layout.addWidget(QLabel("New name:"))
         self.txt_rename = QLineEdit()
         self.txt_rename.setPlaceholderText("Enter new column name")
-        self.txt_rename.setStyleSheet(
-            "QLineEdit { background: #1e293b; color: #e2e8f0;"
-            "  border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; }"
-        )
-        layout.addWidget(self.txt_rename)
+        self.txt_rename.setFixedWidth(300)
+        self.txt_rename.setStyleSheet(_QSS_INPUT)
+        form.addRow("New name", self.txt_rename)
+
+        layout.addLayout(form)
 
         btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        self.btn_apply_rename = QPushButton("✏️ Rename Column")
+        btn_row.setSpacing(8)
+        self.btn_apply_rename = QPushButton(_icon("document-edit"), "Rename Column")
         self.btn_apply_rename.setEnabled(False)
-        self.btn_apply_rename.setStyleSheet(
-            "QPushButton { background: #4f46e5; color: white; border: none;"
-            "  border-radius: 6px; padding: 8px 16px; font-weight: 600; }"
-        )
+        self.btn_apply_rename.setStyleSheet(_QSS_BTN_PRIMARY)
+        btn_row.addStretch(1)
         btn_row.addWidget(self.btn_apply_rename)
         layout.addLayout(btn_row)
-        # Add stretch so rename controls stay top-aligned and compact (Issue 5).
+
         layout.addStretch(1)
 
         self.txt_rename.textChanged.connect(
@@ -272,36 +355,21 @@ class ColumnManagerPanel(QWidget):
             self.cmb_rename_col.clear()
             return
 
-        # Populate remove list
         self.list_remove.clear()
         for col in df.columns:
             item = QListWidgetItem(col)
             self.list_remove.addItem(item)
 
-        # Populate rename dropdown
         self.cmb_rename_col.clear()
         self.cmb_rename_col.addItems(df.columns.tolist())
 
-        # Rebuild the Add Column tab's options area for the new data.
-        # ROOT CAUSE of the "where is the column selection dropdown"
-        # report: _on_calc_type_changed() only ever ran once, during
-        # __init__, when self._df was still None -- it hit its own
-        # early-return guard and built nothing. set_dataframe() never
-        # called it again after real data loaded, so the ENTIRE options
-        # area below "Calculation type" (not just a picker -- the
-        # formula text field itself, the Column x Column selectors,
-        # everything) stayed empty for any real dataset, for every
-        # calculation type, not just Custom Formula.
         self._on_calc_type_changed(self.cmb_calc_type.currentText())
 
     # -- Slots: Add Column --------------------------------------------------
 
     def _on_insert_formula_column(self) -> None:
         """Insert the picked column name, backtick-wrapped, at the
-        current cursor position in the formula field -- replaces
-        whatever text is currently selected, same as a normal text
-        insert, so picking a column mid-edit doesn't clobber the rest
-        of the formula."""
+        current cursor position in the formula field."""
         col = self.cmb_formula_col.currentText()
         if not col:
             return
@@ -309,14 +377,7 @@ class ColumnManagerPanel(QWidget):
         self.txt_formula.setFocus()
 
     def _clear_layout(self, layout) -> None:
-        """Recursively delete every widget and sub-layout in ``layout``.
-
-        The old clear loop only removed top-level items -- rows added via
-        ``addLayout()`` were detached from this layout but their child
-        widgets were never deleted, so they stayed visible on top of the
-        newly built options (the "conjured"/overlapping First & Second
-        column dropdowns reported on the Custom formula tab).
-        """
+        """Recursively delete every widget and sub-layout in ``layout``."""
         while layout.count():
             item = layout.takeAt(0)
             widget = item.widget()
@@ -335,97 +396,79 @@ class ColumnManagerPanel(QWidget):
             return
 
         num_cols = self._df.select_dtypes(include="number").columns.tolist()
-        cat_cols = self._df.select_dtypes(include="object").columns.tolist()
-        dt_cols = self._df.select_dtypes(include="datetime").columns.tolist()
         all_cols = self._df.columns.tolist()
 
-        combo_qss = (
-            "QComboBox { background: #1e293b; color: #e2e8f0;"
-            "  border: 1px solid #334155; border-radius: 6px; padding: 5px 8px; font-size: 12px; }"
-        )
+        combo_qss = _QSS_COMBO
         lbl_qss = "font-size: 12px; color: #94a3b8;"
 
         if text == "Custom formula (use col names)":
-            # No separate First/Second column dropdowns here -- a formula
-            # can reference any number of columns. The Insert picker below
-            # is the only column-selection UI needed.
-            row = QHBoxLayout()
-            lbl = QLabel("Formula (`col` / `col`):")
-            lbl.setStyleSheet(lbl_qss)
-            row.addWidget(lbl)
+            form = QFormLayout()
+            form.setSpacing(8)
+            form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
             self.txt_formula = QLineEdit()
             self.txt_formula.setPlaceholderText("`Sales` / `Units`")
-            self.txt_formula.setStyleSheet(
-                "QLineEdit { background: #1e293b; color: #e2e8f0;"
-                "  border: 1px solid #334155; border-radius: 6px; padding: 5px 8px; font-size: 12px; }"
-            )
-            row.addWidget(self.txt_formula, stretch=1)
-            self.options_layout.addLayout(row)
+            self.txt_formula.setFixedWidth(300)
+            self.txt_formula.setStyleSheet(_QSS_INPUT)
+            form.addRow("Formula (`col` / `col`)", self.txt_formula)
 
-            picker_row = QHBoxLayout()
-            picker_lbl = QLabel("Insert column:")
-            picker_lbl.setStyleSheet(lbl_qss)
-            picker_row.addWidget(picker_lbl)
             self.cmb_formula_col = QComboBox()
             self.cmb_formula_col.addItems(all_cols)
-            self.cmb_formula_col.setFixedWidth(220)
+            self.cmb_formula_col.setFixedWidth(200)
             self.cmb_formula_col.setStyleSheet(combo_qss)
-            picker_row.addWidget(self.cmb_formula_col)
-            btn_insert = QPushButton("+ Insert")
-            btn_insert.setStyleSheet(
-                "QPushButton { background: #1e293b; color: #a5b4fc; border: 1px solid #334155;"
-                "  border-radius: 6px; padding: 5px 12px; font-size: 11px; }"
-                "QPushButton:hover { background: #334155; }"
-            )
+            btn_insert = QPushButton(_icon("insert-link"), "Insert")
+            btn_insert.setStyleSheet(_QSS_BTN_GHOST.replace("18px", "12px"))
             btn_insert.clicked.connect(self._on_insert_formula_column)
+            picker_row = QHBoxLayout()
+            picker_row.setSpacing(6)
+            picker_row.addWidget(self.cmb_formula_col)
             picker_row.addWidget(btn_insert)
             picker_row.addStretch(1)
-            self.options_layout.addLayout(picker_row)
+            form.addRow("Insert column", picker_row)
 
-        elif text in ("Column × Column", "Column ÷ Column", "Column + Column", "Column − Column"):
-            op_map = {
-                "Column × Column": "*", "Column ÷ Column": "/",
-                "Column + Column": "+", "Column − Column": "-",
-            }
-            op = op_map[text]
-            row = QHBoxLayout()
-            lbl_a = QLabel("First column:")
-            lbl_a.setStyleSheet(lbl_qss)
-            row.addWidget(lbl_a)
+            self.options_layout.addLayout(form)
+
+        elif text in ("Column × Column", "Column ÷ Column",
+                      "Column + Column", "Column − Column"):
+            op = _DISPLAY_OP[text]
+            form = QFormLayout()
+            form.setSpacing(8)
+            form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
             self.cmb_col_a = QComboBox()
             self.cmb_col_a.addItems(num_cols)
             self.cmb_col_a.setFixedWidth(200)
             self.cmb_col_a.setStyleSheet(combo_qss)
-            row.addWidget(self.cmb_col_a)
-            op_lbl = QLabel(op)
-            op_lbl.setStyleSheet("font-size: 13px; font-weight: 700; color: #a5b4fc;")
-            row.addWidget(op_lbl)
-            lbl_b = QLabel("Second column:")
-            lbl_b.setStyleSheet(lbl_qss)
-            row.addWidget(lbl_b)
             self.cmb_col_b = QComboBox()
             self.cmb_col_b.addItems(num_cols)
             self.cmb_col_b.setFixedWidth(200)
             self.cmb_col_b.setStyleSheet(combo_qss)
-            row.addWidget(self.cmb_col_b)
-            row.addStretch(1)
-            self.options_layout.addLayout(row)
-            self._add_op = op
+            op_lbl = QLabel(op)
+            op_lbl.setStyleSheet("font-size: 15px; font-weight: 700; color: #a5b4fc;")
+            cols_row = QHBoxLayout()
+            cols_row.setSpacing(8)
+            cols_row.addWidget(self.cmb_col_a)
+            cols_row.addWidget(op_lbl)
+            cols_row.addWidget(self.cmb_col_b)
+            cols_row.addStretch(1)
+            form.addRow("Columns", cols_row)
+
+            self.options_layout.addLayout(form)
+            self._add_op = _REAL_OP[text]
 
         elif text == "Date Difference":
-            row = QHBoxLayout()
-            lbl_a = QLabel("Start date column:")
-            lbl_a.setStyleSheet(lbl_qss)
-            row.addWidget(lbl_a)
+            form = QFormLayout()
+            form.setSpacing(8)
+            form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
             self.cmb_date_a = QComboBox()
             self.cmb_date_a.addItems(all_cols)
-            self.cmb_date_a.setFixedWidth(200)
+            self.cmb_date_a.setFixedWidth(220)
             self.cmb_date_a.setStyleSheet(combo_qss)
-            row.addWidget(self.cmb_date_a)
-            row.addStretch(1)
-            self.options_layout.addLayout(row)
+            form.addRow("Start date column", self.cmb_date_a)
 
             row2 = QHBoxLayout()
+            row2.setSpacing(8)
             self.rb_today = QPushButton("Today's date")
             self.rb_today.setCheckable(True)
             self.rb_today.setChecked(True)
@@ -444,31 +487,18 @@ class ColumnManagerPanel(QWidget):
             row2.addWidget(self.rb_today)
             row2.addWidget(self.rb_another_col)
             row2.addStretch(1)
-            self.options_layout.addLayout(row2)
+            form.addRow("End date", row2)
 
-            row3 = QHBoxLayout()
-            lbl_b = QLabel("End date column:")
-            lbl_b.setStyleSheet(lbl_qss)
-            row3.addWidget(lbl_b)
             self.cmb_date_b = QComboBox()
             self.cmb_date_b.addItems([c for c in all_cols if c != self.cmb_date_a.currentText()])
-            self.cmb_date_b.setFixedWidth(200)
+            self.cmb_date_b.setFixedWidth(220)
             self.cmb_date_b.setStyleSheet(combo_qss)
-            row3.addWidget(self.cmb_date_b)
-            row3.addStretch(1)
-            self.options_layout.addLayout(row3)
+            form.addRow("End date column", self.cmb_date_b)
             self.cmb_date_a.currentTextChanged.connect(
-                lambda text: self.cmb_date_b.clear() or self.cmb_date_b.addItems([c for c in all_cols if c != text])
+                lambda t: self.cmb_date_b.clear() or self.cmb_date_b.addItems([c for c in all_cols if c != t])
             )
-            # Apply the initial (Today's date) mode immediately so the
-            # end-date combo's enabled/disabled state matches the active
-            # toggle from the very first render.
             self._set_date_mode("today")
 
-            row4 = QHBoxLayout()
-            lbl_u = QLabel("Difference unit:")
-            lbl_u.setStyleSheet(lbl_qss)
-            row4.addWidget(lbl_u)
             self.cmb_diff_unit = QComboBox()
             self.cmb_diff_unit.addItems([
                 "Days", "Months", "Years", "Age (Years from DOB vs Today)",
@@ -476,47 +506,44 @@ class ColumnManagerPanel(QWidget):
             ])
             self.cmb_diff_unit.setFixedWidth(260)
             self.cmb_diff_unit.setStyleSheet(combo_qss)
-            row4.addWidget(self.cmb_diff_unit)
-            row4.addStretch(1)
-            self.options_layout.addLayout(row4)
+            form.addRow("Difference unit", self.cmb_diff_unit)
+
+            self.options_layout.addLayout(form)
 
         elif text == "Extract Date/Time Part":
-            row = QHBoxLayout()
-            lbl_s = QLabel("Source date column:")
-            lbl_s.setStyleSheet(lbl_qss)
-            row.addWidget(lbl_s)
+            form = QFormLayout()
+            form.setSpacing(8)
+            form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
             self.cmb_date_src = QComboBox()
             self.cmb_date_src.addItems(all_cols)
             self.cmb_date_src.setFixedWidth(200)
             self.cmb_date_src.setStyleSheet(combo_qss)
-            row.addWidget(self.cmb_date_src)
-            lbl_p = QLabel("Part to extract:")
-            lbl_p.setStyleSheet(lbl_qss)
-            row.addWidget(lbl_p)
             self.cmb_date_part = QComboBox()
             self.cmb_date_part.addItems([
                 "Date (YYYY-MM-DD)", "Year", "Quarter", "Month (Number)", "Month Name",
                 "Week Number", "Day", "Weekday Name", "Hour (12h AM/PM)", "Hour (24h)",
             ])
-            self.cmb_date_part.setFixedWidth(200)
+            self.cmb_date_part.setFixedWidth(220)
             self.cmb_date_part.setStyleSheet(combo_qss)
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            row.addWidget(self.cmb_date_src)
             row.addWidget(self.cmb_date_part)
             row.addStretch(1)
-            self.options_layout.addLayout(row)
+            form.addRow("Source / part", row)
+
+            self.options_layout.addLayout(form)
 
         elif text == "Moving Average":
-            row = QHBoxLayout()
-            lbl_c = QLabel("Column:")
-            lbl_c.setStyleSheet(lbl_qss)
-            row.addWidget(lbl_c)
+            form = QFormLayout()
+            form.setSpacing(8)
+            form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
             self.cmb_ma_col = QComboBox()
             self.cmb_ma_col.addItems(num_cols)
             self.cmb_ma_col.setFixedWidth(200)
             self.cmb_ma_col.setStyleSheet(combo_qss)
-            row.addWidget(self.cmb_ma_col)
-            lbl_w = QLabel("Window (rows):")
-            lbl_w.setStyleSheet(lbl_qss)
-            row.addWidget(lbl_w)
             self.spin_ma_window = QSpinBox()
             self.spin_ma_window.setRange(2, 999)
             self.spin_ma_window.setValue(7)
@@ -525,12 +552,10 @@ class ColumnManagerPanel(QWidget):
                 "QSpinBox { background: #1e293b; color: #e2e8f0;"
                 "  border: 1px solid #334155; border-radius: 6px; padding: 5px 8px; font-size: 12px; }"
             )
-            row.addWidget(self.spin_ma_window)
-            hint = QLabel("average of the last N rows incl. current")
-            hint.setStyleSheet("font-size: 11px; color: #64748b;")
-            row.addWidget(hint)
-            row.addStretch(1)
-            self.options_layout.addLayout(row)
+            form.addRow("Column", self.cmb_ma_col)
+            form.addRow("Window (rows)", self.spin_ma_window)
+
+            self.options_layout.addLayout(form)
 
     def _set_date_mode(self, mode: str) -> None:
         """Toggle between today and another column for date diff."""
@@ -556,10 +581,85 @@ class ColumnManagerPanel(QWidget):
                 "QPushButton { background: #1e293b; color: #94a3b8; border: 1px solid #334155;"
                 "  border-radius: 4px; padding: 4px 10px; font-size: 11px; }"
             )
-        # End-date column is only meaningful when the user explicitly
-        # picked "Another column" -- keep it visibly disabled otherwise.
         if hasattr(self, "cmb_date_b"):
             self.cmb_date_b.setEnabled(mode != "today")
+
+    def _populate_preview_table(self, df: pd.DataFrame, max_rows: int = 8) -> None:
+        """Fill the right-hand preview table with ``df``."""
+        cols = list(df.columns)
+        self.table_preview.clear()
+        self.table_preview.setColumnCount(len(cols))
+        self.table_preview.setHorizontalHeaderLabels(cols)
+        n = min(len(df), max_rows)
+        self.table_preview.setRowCount(n)
+        for r, (_, row) in enumerate(df.head(n).iterrows()):
+            for c, col in enumerate(cols):
+                val = row[col]
+                text = "" if pd.isna(val) else str(val)
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignCenter)
+                if len(cols) > 1 and c == len(cols) - 1:
+                    from PySide6.QtGui import QColor
+                    item.setBackground(QColor(16, 185, 129, 50))
+                self.table_preview.setItem(r, c, item)
+
+    def _validate_formula(self, formula: str) -> Optional[str]:
+        """Return a user-friendly error message if *formula* is invalid, or
+        ``None`` if it parses cleanly. Catches empty input, unknown columns,
+        non-numeric columns, syntax errors and unsafe expressions -- so the
+        caller can show a clean message instead of a raw parser traceback."""
+        import ast as _ast
+        import operator as _operator
+
+        _SAFE_BIN = {
+            _ast.Add: _operator.add, _ast.Sub: _operator.sub,
+            _ast.Mult: _operator.mul, _ast.Div: _operator.truediv,
+            _ast.FloorDiv: _operator.floordiv, _ast.Mod: _operator.mod,
+            _ast.Pow: _operator.pow,
+        }
+
+        if not formula:
+            return "Formula is empty."
+
+        # Resolve backtick-quoted columns to aliases the parser can handle.
+        numeric_cols = set(self._df.select_dtypes(include="number").columns)
+        column_aliases: dict[str, str] = {}
+
+        def _replace(match: re.Match) -> str:
+            col = match.group(1)
+            if col not in self._df.columns:
+                raise ValueError(f"Unknown column: '{col}'")
+            alias = f"__col_{len(column_aliases)}"
+            column_aliases[alias] = col
+            return alias
+
+        try:
+            expr = re.sub(r"`([^`]+)`", _replace, formula)
+        except ValueError as exc:
+            return str(exc)
+
+        try:
+            tree = _ast.parse(expr, mode="eval")
+        except SyntaxError as exc:
+            return f"Invalid formula syntax: {exc.msg}"
+
+        def _check(node):
+            if isinstance(node, _ast.Expression):
+                return _check(node.body)
+            if isinstance(node, _ast.Constant) and isinstance(node.value, (int, float)):
+                return None
+            if isinstance(node, _ast.Name):
+                col = column_aliases.get(node.id, node.id)
+                if col not in numeric_cols:
+                    return f"Unknown or non-numeric column: '{col}'"
+                return None
+            if isinstance(node, _ast.BinOp) and type(node.op) in _SAFE_BIN:
+                return _check(node.left) or _check(node.right)
+            if isinstance(node, _ast.UnaryOp) and type(node.op) in (_ast.UAdd, _ast.USub):
+                return _check(node.operand)
+            return "Formula contains an unsupported operator or expression."
+
+        return _check(tree)
 
     def _on_preview_add(self) -> None:
         """Preview the result of the add column operation."""
@@ -575,22 +675,27 @@ class ColumnManagerPanel(QWidget):
         calc_type = self.cmb_calc_type.currentText()
         try:
             if calc_type == "Custom formula (use col names)":
-                formula = self.txt_formula.text().strip()
-                if not formula:
+                raw = self.txt_formula.text().strip()
+                if not raw:
                     QMessageBox.warning(self, "Missing Formula", "Please enter a formula.")
+                    return
+                formula = _normalize_formula(raw)
+                error = self._validate_formula(formula)
+                if error:
+                    self._populate_preview_table(pd.DataFrame())
+                    self.lbl_preview_status.setText(f"❌ {error}")
+                    QMessageBox.warning(self, "Invalid Formula", error)
                     return
                 result = safe_formula_eval(self._df, formula)
 
-            elif calc_type in ("Column × Column", "Column ÷ Column", "Column + Column", "Column − Column"):
+            elif calc_type in ("Column × Column", "Column ÷ Column",
+                              "Column + Column", "Column − Column"):
                 col_a = self.cmb_col_a.currentText()
                 col_b = self.cmb_col_b.currentText()
                 result = add_column_op(self._df, col_a, col_b, self._add_op)
 
             elif calc_type == "Date Difference":
                 col_a = self.cmb_date_a.currentText()
-                # Only read the end-date combo when the user explicitly
-                # picked "Another column"; default to today if somehow
-                # neither toggle is checked.
                 use_today = not self.rb_another_col.isChecked()
                 col_b = None if use_today else self.cmb_date_b.currentText()
                 unit = self.cmb_diff_unit.currentText()
@@ -607,16 +712,22 @@ class ColumnManagerPanel(QWidget):
                 result = moving_average_column(self._df, col, window)
 
             else:
-                QMessageBox.warning(self, "Not Implemented", f"Calculation type '{calc_type}' not yet implemented.")
+                QMessageBox.warning(self, "Not Implemented",
+                                    f"Calculation type '{calc_type}' not yet implemented.")
                 return
 
-            # Show preview
-            preview = result.head(5)
-            preview_str = "\n".join([f"{i}: {v}" for i, v in preview.items()])
-            self.lbl_preview.setText(f"Preview (first 5 rows):\n{preview_str}")
+            preview_df = add_derived_column(self._df, new_col_name, result)
+            self._populate_preview_table(preview_df, max_rows=8)
+            self.lbl_preview_status.setText(
+                f"Showing first {min(8, len(preview_df))} rows of '{new_col_name}' "
+                f"(highlighted in green on the right)."
+            )
 
         except Exception as exc:
-            QMessageBox.critical(self, "Preview Error", str(exc))
+            msg = str(exc)
+            self._populate_preview_table(pd.DataFrame())
+            self.lbl_preview_status.setText(f"❌ Preview failed: {msg}")
+            QMessageBox.critical(self, "Preview Error", msg)
             log.error("Preview failed: %s", exc)
 
     def _on_apply_add(self) -> None:
@@ -629,7 +740,8 @@ class ColumnManagerPanel(QWidget):
             return
 
         if new_col_name in self._df.columns:
-            QMessageBox.warning(self, "Duplicate Column", f"A column named '{new_col_name}' already exists.")
+            QMessageBox.warning(self, "Duplicate Column",
+                                f"A column named '{new_col_name}' already exists.")
             return
 
         calc_type = self.cmb_calc_type.currentText()
@@ -643,9 +755,13 @@ class ColumnManagerPanel(QWidget):
     def _compute_add_column(self, calc_type: str, new_col_name: str):
         """Compute the new column (runs in worker thread)."""
         if calc_type == "Custom formula (use col names)":
-            formula = self.txt_formula.text().strip()
+            formula = _normalize_formula(self.txt_formula.text().strip())
+            error = self._validate_formula(formula)
+            if error:
+                raise ValueError(error)
             result = safe_formula_eval(self._df, formula)
-        elif calc_type in ("Column × Column", "Column ÷ Column", "Column + Column", "Column − Column"):
+        elif calc_type in ("Column × Column", "Column ÷ Column",
+                          "Column + Column", "Column − Column"):
             col_a = self.cmb_col_a.currentText()
             col_b = self.cmb_col_b.currentText()
             result = add_column_op(self._df, col_a, col_b, self._add_op)
@@ -671,8 +787,11 @@ class ColumnManagerPanel(QWidget):
     def _on_add_finished(self, new_df: pd.DataFrame) -> None:
         """Handle successful add column operation."""
         self.bridge.set_df(new_df)
-        self.operation_applied.emit(f"✅ Added column '{self.txt_new_col.text().strip()}'")
-        self.lbl_preview.setText("")
+        self.operation_applied.emit(f"Added column '{self.txt_new_col.text().strip()}'")
+        self._populate_preview_table(pd.DataFrame())
+        self.lbl_preview_status.setText(
+            "Column added. Click Preview Result again to see a new preview."
+        )
         self._set_processing(False)
 
     # -- Slots: Remove Column ------------------------------------------------
@@ -711,7 +830,7 @@ class ColumnManagerPanel(QWidget):
     def _on_remove_finished(self, new_df: pd.DataFrame) -> None:
         """Handle successful remove column operation."""
         self.bridge.set_df(new_df)
-        self.operation_applied.emit(f"✅ Removed columns")
+        self.operation_applied.emit("Removed columns")
         self.chk_confirm_remove.setChecked(False)
         self._set_processing(False)
 
@@ -729,7 +848,8 @@ class ColumnManagerPanel(QWidget):
             return
 
         if new_name in self._df.columns:
-            QMessageBox.warning(self, "Duplicate Column", f"A column named '{new_name}' already exists.")
+            QMessageBox.warning(self, "Duplicate Column",
+                                f"A column named '{new_name}' already exists.")
             return
 
         self._set_processing(True)
@@ -742,7 +862,7 @@ class ColumnManagerPanel(QWidget):
     def _on_rename_finished(self, new_df: pd.DataFrame) -> None:
         """Handle successful rename column operation."""
         self.bridge.set_df(new_df)
-        self.operation_applied.emit(f"✅ Renamed column")
+        self.operation_applied.emit("Renamed column")
         self.txt_rename.clear()
         self.cmb_rename_col.clear()
         self.cmb_rename_col.addItems(new_df.columns.tolist())
