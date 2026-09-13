@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QFrame, QGroupBox, QFormLayout,
 )
 
+from desktop.theme import PAGE_MARGINS
 from desktop.session_bridge import SessionBridge
 from services.database_service import (
     get_or_create_guest_user, export_sessions_to_dict,
@@ -43,13 +44,13 @@ class ProfilePage(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 24, 24, 24)
+        root.setContentsMargins(*PAGE_MARGINS)
         root.setSpacing(12)
 
         # -- Header --
         header = QHBoxLayout()
         title = QLabel("👤 Profile")
-        title.setStyleSheet("font-size: 20px; font-weight: 700; color: #e2e8f0;")
+        title.setProperty("class", "pageTitle")
         header.addWidget(title)
         header.addStretch()
         root.addLayout(header)
@@ -57,36 +58,24 @@ class ProfilePage(QWidget):
         # -- User info card --
         user_card = QFrame()
         user_card.setObjectName("user_card")
-        user_card.setStyleSheet(
-            "QFrame#user_card {"
-            "  background: #0f172a; border: 1px solid #1e293b;"
-            "  border-radius: 10px;"
-            "}"
-        )
+        # (background themed by global QSS via objectName "user_card")
         user_layout = QVBoxLayout(user_card)
         user_layout.setContentsMargins(16, 16, 16, 16)
         user_layout.setSpacing(8)
 
         self.lbl_username = QLabel("")
-        self.lbl_username.setStyleSheet("font-size: 16px; font-weight: 700; color: #e2e8f0;")
+        self.lbl_username.setProperty("class", "cardTitle"); self.lbl_username.setStyleSheet("font-size: 16px; font-weight: 700;")
         user_layout.addWidget(self.lbl_username)
 
         self.lbl_session_count = QLabel("")
-        self.lbl_session_count.setStyleSheet("font-size: 12px; color: #64748b;")
+        self.lbl_session_count.setProperty("class", "faint"); self.lbl_session_count.setStyleSheet("font-size: 12px;")
         user_layout.addWidget(self.lbl_session_count)
 
         root.addWidget(user_card)
 
         # -- Backup / Restore section --
         backup_group = QGroupBox("💾 Backup & Restore")
-        backup_group.setStyleSheet(
-            "QGroupBox {"
-            "  color: #cbd5e1; font-size: 13px; font-weight: 600;"
-            "  border: 1px solid #1e293b; border-radius: 8px;"
-            "  margin-top: 8px; padding-top: 8px;"
-            "}"
-            "QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; }"
-        )
+        # (GroupBox themed globally via QSS)
         backup_layout = QVBoxLayout(backup_group)
         backup_layout.setContentsMargins(16, 12, 16, 16)
         backup_layout.setSpacing(8)
@@ -95,7 +84,7 @@ class ProfilePage(QWidget):
             "Export all your saved sessions to a JSON backup file, or restore "
             "from a previously created backup."
         )
-        backup_desc.setStyleSheet("font-size: 12px; color: #94a3b8;")
+        backup_desc.setProperty("class", "muted"); backup_desc.setStyleSheet("font-size: 12px;")
         backup_desc.setWordWrap(True)
         backup_layout.addWidget(backup_desc)
 
@@ -103,46 +92,34 @@ class ProfilePage(QWidget):
         btn_row.setSpacing(8)
 
         self.btn_backup = QPushButton("⬇️ Export Backup")
-        self.btn_backup.setStyleSheet(
-            "QPushButton { background: #4f46e5; color: white; border: none;"
-            "  border-radius: 8px; padding: 8px 16px; font-weight: 600; }"
-            "QPushButton:hover { background: #6366f1; }"
-        )
+        self.btn_backup.setProperty("kind", "primary")
         btn_row.addWidget(self.btn_backup)
 
         self.btn_restore = QPushButton("⬆️ Restore Backup")
-        self.btn_restore.setStyleSheet(
-            "QPushButton { background: #1e293b; color: #94a3b8; border: 1px solid #334155;"
-            "  border-radius: 8px; padding: 8px 16px; font-weight: 600; }"
-            "QPushButton:hover { background: #334155; color: #e2e8f0; }"
-        )
+        self.btn_restore.setProperty("kind", "ghost")
         btn_row.addWidget(self.btn_restore)
+        # Buttons collapse to their content size; the row's right side stays
+        # empty on purpose (UI feedback: half-page-wide buttons looked bloated).
+        btn_row.addStretch(1)
 
         backup_layout.addLayout(btn_row)
         root.addWidget(backup_group)
 
         # -- Data location info --
         data_group = QGroupBox("📁 Data Location")
-        data_group.setStyleSheet(
-            "QGroupBox {"
-            "  color: #cbd5e1; font-size: 13px; font-weight: 600;"
-            "  border: 1px solid #1e293b; border-radius: 8px;"
-            "  margin-top: 8px; padding-top: 8px;"
-            "}"
-            "QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; }"
-        )
+        # (GroupBox themed globally via QSS)
         data_layout = QVBoxLayout(data_group)
         data_layout.setContentsMargins(16, 12, 16, 16)
 
         data_desc = QLabel(
             "All data is stored locally on this device. No data is sent to any server."
         )
-        data_desc.setStyleSheet("font-size: 12px; color: #94a3b8;")
+        data_desc.setProperty("class", "muted"); data_desc.setStyleSheet("font-size: 12px;")
         data_desc.setWordWrap(True)
         data_layout.addWidget(data_desc)
 
         self.lbl_db_path = QLabel("")
-        self.lbl_db_path.setStyleSheet("font-size: 11px; color: #64748b;")
+        self.lbl_db_path.setProperty("class", "faint"); self.lbl_db_path.setStyleSheet("font-size: 11px;")
         self.lbl_db_path.setWordWrap(True)
         data_layout.addWidget(self.lbl_db_path)
 

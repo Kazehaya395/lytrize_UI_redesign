@@ -52,7 +52,7 @@ class ExcelLoaderPanel(QWidget):
 
         # -- Header --
         header = QLabel("📑 Excel Workbook Browser")
-        header.setStyleSheet("font-size: 16px; font-weight: 700; color: #e2e8f0;")
+        header.setProperty("class", "sectionTitle")
         root.addWidget(header)
 
         # -- Sheet list --
@@ -65,12 +65,7 @@ class ExcelLoaderPanel(QWidget):
         # controls below (the actual interactive workflow) get the
         # extra room instead.
         self.list_sheets = QListWidget()
-        self.list_sheets.setStyleSheet(
-            "QListWidget { background: #1e293b; color: #e2e8f0;"
-            "  border: 1px solid #334155; border-radius: 8px; font-size: 12px; }"
-            "QListWidget::item { padding: 8px 10px; border-bottom: 1px solid #334155; }"
-            "QListWidget::item:selected { background: rgba(99,102,241,0.3); }"
-        )
+        # List styling handled by global _lists_qss
         self.list_sheets.setMaximumHeight(180)
         root.addWidget(self.list_sheets)
 
@@ -81,9 +76,9 @@ class ExcelLoaderPanel(QWidget):
 
         self.rb_single = QRadioButton("📋 Use a single sheet for analysis")
         self.rb_single.setChecked(True)
-        self.rb_single.setStyleSheet("color: #e2e8f0; font-size: 12px; font-weight: 600;")
+        pass  # Radio styling handled by global QSS
         self.rb_unified = QRadioButton("🔗 Model multiple sheets (Table Join)")
-        self.rb_unified.setStyleSheet("color: #e2e8f0; font-size: 12px; font-weight: 600;")
+        pass  # Radio styling handled by global QSS
 
         mode_layout.addWidget(self.rb_single)
         mode_layout.addWidget(self.rb_unified)
@@ -96,22 +91,16 @@ class ExcelLoaderPanel(QWidget):
 
         single_layout.addWidget(QLabel("Select a sheet to analyse:"))
         self.cmb_single_sheet = QComboBox()
-        self.cmb_single_sheet.setStyleSheet(
-            "QComboBox { background: #1e293b; color: #e2e8f0;"
-            "  border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; }"
-        )
         single_layout.addWidget(self.cmb_single_sheet)
 
         self.lbl_sheet_info = QLabel("")
         self.lbl_sheet_info.setWordWrap(True)
-        self.lbl_sheet_info.setStyleSheet("font-size: 11px; color: #94a3b8;")
+        self.lbl_sheet_info.setProperty("class", "faint")
+        self.lbl_sheet_info.setStyleSheet("font-size: 11px;")
         single_layout.addWidget(self.lbl_sheet_info)
 
         self.btn_use_sheet = QPushButton("✅ Use This Sheet →")
-        self.btn_use_sheet.setStyleSheet(
-            "QPushButton { background: #10b981; color: white; border: none;"
-            "  border-radius: 6px; padding: 8px 16px; font-weight: 600; }"
-        )
+        self.btn_use_sheet.setProperty("kind", "success")
         single_layout.addWidget(self.btn_use_sheet)
         root.addWidget(self.single_controls)
 
@@ -143,10 +132,7 @@ class ExcelLoaderPanel(QWidget):
 
         # Build button
         self.btn_build_merged = QPushButton("🔗 Build Merged Table →")
-        self.btn_build_merged.setStyleSheet(
-            "QPushButton { background: #4f46e5; color: white; border: none;"
-            "  border-radius: 6px; padding: 10px 20px; font-weight: 600; }"
-        )
+        self.btn_build_merged.setProperty("kind", "primary")
         unified_layout.addWidget(self.btn_build_merged)
         root.addWidget(self.unified_controls)
 

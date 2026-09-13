@@ -303,7 +303,12 @@ def preview_dtype_conversion(series: pd.Series, new_dtype: str) -> dict:
                         break
                     parsed[remaining] = pd.to_datetime(
                         "1970-01-01 " + src[remaining], format=f"1970-01-01 {fmt}", errors="coerce")
-            converted = parsed.dt.strftime("%H:%M:%S").where(parsed.notna(), other=None)
+            # Real datetime.time objects (not strftime strings): 'time' must
+            # be a usable time type downstream -- Analysis time filters and
+            # classify_columns() both key off datetime.time instances. A
+            # strftime result is just object-dtype text and silently demotes
+            # the column back to the text family.
+            converted = parsed.dt.time.where(parsed.notna(), other=None)
         elif new_dtype == "timedelta64[ns]":
             src = series
             if total > 0 and isinstance(series.iloc[0], datetime.time):
@@ -366,13 +371,42 @@ def apply_dtype_conversion(df: pd.DataFrame, col: str, new_dtype: str) -> pd.Dat
 
 
 def classify_columns(df: pd.DataFrame) -> dict:
-    """Auto-classify columns into numeric / categorical / datetime."""
+    """Auto-classify columns into numeric / categorical / datetime.
+
+    Object columns holding python ``datetime.date``/``datetime.time`` (or
+    parseable date strings) count as datetime-family: after a Dtype
+    Transformer conversion to 'date'/'time' the stored pandas dtype is
+    ``object``, and a row-0-only probe misses columns whose first value is
+    NaN or an outlier -- so probe up to 20 non-null values per column.
+    """
     all_cols = df.columns.tolist()
-    auto_dt = df.select_dtypes(include=["datetime", "datetimetz", "timedelta"]).columns.tolist()
+    auto_dt = df.select_dtypes(
+        include=["datetime", "datetimetz", "timedelta"]
+    ).columns.tolist()
+
+    def _looks_temporal(series: pd.Series) -> bool:
+        """True if most non-null values in *series* are date/time-like."""
+        non_null = series.dropna()
+        if len(non_null) == 0:
+            return False
+        sample = non_null.iloc[:20]
+        hits = sum(
+            1 for v in sample
+            if isinstance(v, (datetime.date, datetime.time, pd.Timestamp))
+        )
+        if hits / len(sample) >= 0.5:
+            return True
+        # Fall back to a strict parse probe on strings: only trust it when
+        # EVERY probed value parses (avoids false-positives on free text).
+        if sample.map(type).eq(str).all():
+            parsed = pd.to_datetime(sample, errors="coerce", format="%Y-%m-%d")
+            return parsed.notna().all()
+        return False
+
     for col in df.select_dtypes(include=["object"]):
-        if len(df) > 0 and isinstance(df[col].iloc[0], (datetime.date, datetime.time)):
-            if col not in auto_dt:
-                auto_dt.append(col)
+        if col not in auto_dt and _looks_temporal(df[col]):
+            auto_dt.append(col)
+
     auto_num = [c for c in df.select_dtypes(include=[np.number]).columns if c not in auto_dt]
     auto_cat = [c for c in all_cols if c not in auto_num and c not in auto_dt]
     return {"numeric": auto_num, "categorical": auto_cat, "datetime": auto_dt}

@@ -100,13 +100,7 @@ SIDE_PANEL_MAX_WIDTH = 440
 MIN_PREVIEW_ROWS = 5
 PREVIEW_MIN_HEIGHT = 205
 
-# Shared stylesheet for the Data Cleaner preview tables. `make_preview_table`
-# references this named constant so all five tabs stay visually consistent.
-# Value matches the Lytrize dark surface these tables used before the
-# left/right layout split -- intentionally unchanged to preserve the design.
-_TABLE_THEME_QSS = (
-    "QTableWidget { background: #1e293b; color: #e2e8f0; gridline-color: #334155; }"
-)
+# Table styling handled by global _tables_qss
 
 
 def make_side_panel():
@@ -116,10 +110,7 @@ def make_side_panel():
     the settings read as a distinct, readable card on HQ/high-DPI monitors).
     """
     frame = QFrame()
-    frame.setStyleSheet(
-        "QFrame { background: #111c33; border: 1px solid #334155;"
-        "  border-radius: 8px; }"
-    )
+    frame.setObjectName("config_panel")
     frame.setMaximumWidth(SIDE_PANEL_MAX_WIDTH)
     lay = QVBoxLayout(frame)
     lay.setContentsMargins(12, 12, 12, 12)
@@ -137,9 +128,6 @@ def make_preview_table(headers):
     tbl.setColumnCount(len(headers))
     tbl.setHorizontalHeaderLabels(list(headers))
     tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-    tbl.setStyleSheet(
-        _TABLE_THEME_QSS
-    )
     tbl.setMinimumHeight(PREVIEW_MIN_HEIGHT)
     return tbl
 
@@ -171,21 +159,12 @@ class DataCleanerPanel(QWidget):
 
         # -- Header --
         header = QLabel("🧹 Data Cleaning & Validation")
-        header.setStyleSheet("font-size: 16px; font-weight: 700; color: #e2e8f0;")
+        header.setProperty("class", "sectionTitle")
         root.addWidget(header)
 
         # -- Tabs --
         self.tabs = QTabWidget()
-        self.tabs.setStyleSheet(
-            "QTabWidget { background: transparent; }"
-            "QTabBar::tab {"
-            "  background: #1e293b; color: #94a3b8;"
-            "  border: 1px solid #334155; border-bottom: none;"
-            "  border-top-left-radius: 6px; border-top-right-radius: 6px;"
-            "  padding: 8px 16px; font-size: 12px;"
-            "}"
-            "QTabBar::tab:selected { background: #0f172a; color: #e2e8f0; }"
-        )
+        # Tab styling handled by global _tabs_qss
 
         self.tab_text = QWidget()
         self._build_text_tab()
@@ -268,7 +247,7 @@ class DataCleanerPanel(QWidget):
 
         self.lbl_text_preview = QLabel("")
         self.lbl_text_preview.setWordWrap(True)
-        self.lbl_text_preview.setStyleSheet("font-size: 11px; color: #94a3b8;")
+        self.lbl_text_preview.setProperty("class", "muted")
         side_layout.addWidget(self.lbl_text_preview)
         side_layout.addStretch(1)
 
@@ -317,7 +296,7 @@ class DataCleanerPanel(QWidget):
 
         self.lbl_find_preview = QLabel("")
         self.lbl_find_preview.setWordWrap(True)
-        self.lbl_find_preview.setStyleSheet("font-size: 11px; color: #94a3b8;")
+        self.lbl_find_preview.setProperty("class", "muted")
         side_layout.addWidget(self.lbl_find_preview)
         side_layout.addStretch(1)
 
@@ -373,7 +352,7 @@ class DataCleanerPanel(QWidget):
         self.lbl_fail = QLabel("❌ Fail: 0")
         self.lbl_null = QLabel("⬜ Null: 0")
         for lbl in (self.lbl_pass, self.lbl_fail, self.lbl_null):
-            lbl.setStyleSheet("font-size: 13px; font-weight: 600; color: #e2e8f0;")
+            lbl.setProperty("class", "cardSub")
             metrics_row.addWidget(lbl)
         side_layout.addLayout(metrics_row)
 
@@ -383,7 +362,7 @@ class DataCleanerPanel(QWidget):
         self.rb_val_nan = QRadioButton("Replace failing values with NaN")
         self.rb_val_flag = QRadioButton("Flag: add boolean column _valid_<col>")
         for rb in (self.rb_val_none, self.rb_val_nan, self.rb_val_flag):
-            rb.setStyleSheet("color: #e2e8f0; font-size: 12px;")
+            # Radio styling handled by global QSS
             side_layout.addWidget(rb)
         side_layout.addStretch(1)
 
@@ -431,7 +410,7 @@ class DataCleanerPanel(QWidget):
 
         self.lbl_str_preview = QLabel("")
         self.lbl_str_preview.setWordWrap(True)
-        self.lbl_str_preview.setStyleSheet("font-size: 11px; color: #94a3b8;")
+        self.lbl_str_preview.setProperty("class", "muted")
         side_layout.addWidget(self.lbl_str_preview)
         side_layout.addStretch(1)
 
@@ -485,7 +464,7 @@ class DataCleanerPanel(QWidget):
 
         self.lbl_num_preview = QLabel("")
         self.lbl_num_preview.setWordWrap(True)
-        self.lbl_num_preview.setStyleSheet("font-size: 11px; color: #94a3b8;")
+        self.lbl_num_preview.setProperty("class", "muted")
         side_layout.addWidget(self.lbl_num_preview)
         side_layout.addStretch(1)
 

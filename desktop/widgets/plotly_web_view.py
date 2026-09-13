@@ -34,6 +34,8 @@ from PySide6.QtCore import Qt, QUrl, QObject, Signal, Slot
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
 from PySide6.QtGui import QPixmap
 
+from desktop import theme as _theme_mod
+
 log = logging.getLogger(__name__)
 
 
@@ -178,7 +180,7 @@ class PlotlyWebView(QWidget):
             log.info("QWebEngine not available, using static PNG fallback")
             self._fallback_label = QLabel()
             self._fallback_label.setAlignment(Qt.AlignCenter)
-            self._fallback_label.setStyleSheet("background: #1e293b;")
+            self._fallback_label.setStyleSheet("background: %s;" % _theme_mod.resolve_color("border_subtle"))
             self._layout.addWidget(self._fallback_label)
 
     # -- Internal --------------------------------------------------------

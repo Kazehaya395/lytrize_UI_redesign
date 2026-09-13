@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QStackedWidget, QSizePolicy, QTabWidget,
 )
 
+from desktop.theme import PAGE_MARGINS
 from desktop.session_bridge import SessionBridge
 from desktop.widgets.chart_card import ChartCard
 from desktop.workers import ChartGenerationWorker
@@ -38,23 +39,6 @@ log = logging.getLogger(__name__)
 _ANALYSIS_TYPE_NAMES = {opt["id"]: opt["name"] for opt in ANALYSIS_OPTIONS}
 
 # ── Shared design tokens (one source for the compact, modern form) ─────
-_STYLE_INPUT = (
-    "QComboBox, QSpinBox, QLineEdit {"
-    "  background: #1e293b; color: #e2e8f0;"
-    "  border: 1px solid #334155; border-radius: 6px;"
-    "  padding: 4px 10px; font-size: 12px;"
-    "}"
-    "QComboBox:hover, QSpinBox:hover, QLineEdit:hover { border-color: #4f46e5; }"
-    "QComboBox::drop-down { border: none; width: 22px; }"
-    "QComboBox QAbstractItemView {"
-    "  background: #1e293b; color: #e2e8f0;"
-    "  border: 1px solid #334155;"
-    "  selection-background-color: #4f46e5; selection-color: #fff;"
-    "}"
-)
-_STYLE_LABEL = "font-size: 12px; font-weight: 500; color: #cbd5e1;"
-_STYLE_GROUP = "font-size: 11px; font-weight: 700; color: #818cf8; letter-spacing: 0.6px;"
-_STYLE_HR = "color: #1e293b;"
 
 # Field grouping for a consistent element order across every chart type:
 # Data → Options → Appearance.
@@ -108,31 +92,22 @@ class AnalysisPage(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 24, 24, 24)
+        root.setContentsMargins(*PAGE_MARGINS)
         root.setSpacing(12)
 
         # -- Header --
         header = QHBoxLayout()
         title = QLabel("📊 Analysis")
-        title.setStyleSheet("font-size: 20px; font-weight: 700; color: #e2e8f0;")
+        title.setProperty("class", "pageTitle")
         header.addWidget(title)
         header.addStretch()
 
         self.btn_clear = QPushButton("🗑 Clear All")
-        self.btn_clear.setStyleSheet(
-            "QPushButton { background: rgba(239,68,68,0.1); color: #f87171;"
-            "  border: 1px solid rgba(239,68,68,0.3); border-radius: 8px;"
-            "  padding: 8px 16px; font-weight: 600; }"
-            "QPushButton:hover { background: rgba(239,68,68,0.2); }"
-        )
+        self.btn_clear.setProperty("kind", "danger")
         header.addWidget(self.btn_clear)
 
         self.btn_dashboard = QPushButton("🎯 Proceed to Dashboard →")
-        self.btn_dashboard.setStyleSheet(
-            "QPushButton { background: #10b981; color: white; border: none;"
-            "  border-radius: 8px; padding: 8px 16px; font-weight: 600; }"
-            "QPushButton:hover { background: #34d399; }"
-        )
+        self.btn_dashboard.setProperty("kind", "success")
         header.addWidget(self.btn_dashboard)
         root.addLayout(header)
 
@@ -144,10 +119,7 @@ class AnalysisPage(QWidget):
         # pages' clean colored-bar handles.
         splitter = QSplitter(Qt.Horizontal)
         splitter.setHandleWidth(6)
-        splitter.setStyleSheet(
-            "QSplitter::handle { background: #1e293b; }"
-            "QSplitter::handle:hover { background: #334155; }"
-        )
+
         root.addWidget(splitter, stretch=1)
 
         # -- Left: analysis type list --
@@ -157,20 +129,11 @@ class AnalysisPage(QWidget):
         left_layout.setSpacing(4)
 
         left_title = QLabel("🔬 Select Analysis Type")
-        left_title.setStyleSheet("font-size: 13px; font-weight: 600; color: #cbd5e1;")
+        left_title.setProperty("class", "muted"); left_title.setStyleSheet("font-size: 13px; font-weight: 600;")
         left_layout.addWidget(left_title)
 
         self.analysis_list = QListWidget()
-        self.analysis_list.setStyleSheet(
-            "QListWidget {"
-            "  background: #0f172a; color: #e2e8f0;"
-            "  border: 1px solid #1e293b; border-radius: 8px;"
-            "  font-size: 12px;"
-            "}"
-            "QListWidget::item { padding: 8px 10px; border-bottom: 1px solid #1e293b; }"
-            "QListWidget::item:hover { background: rgba(99,102,241,0.1); }"
-            "QListWidget::item:selected { background: rgba(99,102,241,0.2); }"
-        )
+        self.analysis_list.setStyleSheet("font-size: 12px;")
         for opt in ANALYSIS_OPTIONS:
             item = QListWidgetItem(f"{opt['icon']}  {opt['name']}")
             item.setData(Qt.UserRole, opt["id"])
@@ -193,12 +156,7 @@ class AnalysisPage(QWidget):
         # fields above it are swapped out for a different analysis type.
         self.config_panel = QFrame()
         self.config_panel.setObjectName("config_panel")
-        self.config_panel.setStyleSheet(
-            "QFrame#config_panel {"
-            "  background: #0f172a; border: 1px solid #1e293b;"
-            "  border-radius: 8px;"
-            "}"
-        )
+        # (QFrame#config_panel themed globally via QSS)
         config_outer = QVBoxLayout(self.config_panel)
         config_outer.setContentsMargins(12, 12, 12, 12)
         config_outer.setSpacing(8)
@@ -215,20 +173,11 @@ class AnalysisPage(QWidget):
         footer_lay.setSpacing(8)
         self.btn_cancel_edit = QPushButton("✕ Cancel")
         self.btn_cancel_edit.setVisible(False)
-        self.btn_cancel_edit.setStyleSheet(
-            "QPushButton { background: rgba(148,163,184,0.12); color: #cbd5e1;"
-            "  border: 1px solid #334155; border-radius: 8px; padding: 8px 16px;"
-            "  font-weight: 600; }"
-            "QPushButton:hover { background: rgba(148,163,184,0.25); }"
-        )
+        self.btn_cancel_edit.setProperty("kind", "ghost")
         footer_lay.addWidget(self.btn_cancel_edit)
         footer_lay.addStretch()
         self.btn_generate = QPushButton("▶ Generate Charts")
-        self.btn_generate.setStyleSheet(
-            "QPushButton { background: #4f46e5; color: white; border: none;"
-            "  border-radius: 8px; padding: 8px 20px; font-weight: 600; }"
-            "QPushButton:hover { background: #6366f1; }"
-        )
+        self.btn_generate.setProperty("kind", "primary")
         footer_lay.addWidget(self.btn_generate)
         config_outer.addWidget(self.config_footer)
 
@@ -239,13 +188,10 @@ class AnalysisPage(QWidget):
         charts_header = QHBoxLayout()
         charts_header.setSpacing(8)
         self.lbl_charts_header = QLabel("📈 Generated Charts (0)")
-        self.lbl_charts_header.setStyleSheet(
-            "font-size: 14px; font-weight: 700; color: #e2e8f0;"
-        )
+        self.lbl_charts_header.setProperty("class", "cardTitle")
         charts_header.addWidget(self.lbl_charts_header)
         header_hr = QFrame()
         header_hr.setFrameShape(QFrame.HLine)
-        header_hr.setStyleSheet(_STYLE_HR)
         charts_header.addWidget(header_hr, stretch=1)
         right_layout.addLayout(charts_header)
 
@@ -255,23 +201,7 @@ class AnalysisPage(QWidget):
         # simple vertical stack of cards before; a stack of 5+ full-size
         # charts meant a lot of scrolling to compare or find one.
         self.charts_tabs = QTabWidget()
-        self.charts_tabs.setStyleSheet(
-            "QTabWidget::pane { border: 1px solid #1e293b; border-radius: 6px;"
-            "  background: #0f172a; top: -1px; }"
-            "QTabBar::tab {"
-            "  background: #1e293b; color: #94a3b8;"
-            "  border: 1px solid #334155; border-bottom: none;"
-            "  border-top-left-radius: 6px; border-top-right-radius: 6px;"
-            "  padding: 6px 14px; font-size: 12px; margin-right: 2px;"
-            "}"
-            "QTabBar::tab:selected { background: #0f172a; color: #e2e8f0;"
-            "  border-top: 2px solid #4f46e5; }"
-            "QTabBar::tab:hover { color: #e2e8f0; }"
-            "QTabBar::close-button { subcontrol-position: right;"
-            "  image: none; width: 14px; height: 14px; margin: 0 2px 0 8px;"
-            "  border-radius: 3px; }"
-            "QTabBar::close-button:hover { background: #334155; }"
-        )
+        # (QTabWidget themed globally via QSS)
         # Many charts -> a clean tab/selector system that scrolls instead of
         # overcrowding. Tabs are closable (wired to delete below) and movable
         # so users can order them without opening each chart's card controls.
@@ -282,7 +212,7 @@ class AnalysisPage(QWidget):
 
         self.lbl_no_charts = QLabel("No charts yet. Configure an analysis and click Generate.")
         self.lbl_no_charts.setAlignment(Qt.AlignCenter)
-        self.lbl_no_charts.setStyleSheet("font-size: 13px; color: #64748b; padding: 40px;")
+        self.lbl_no_charts.setProperty("class", "faint"); self.lbl_no_charts.setStyleSheet("font-size: 13px; padding: 40px;")
         right_layout.addWidget(self.lbl_no_charts)
 
         splitter.addWidget(right_panel)
@@ -336,7 +266,6 @@ class AnalysisPage(QWidget):
     def _styled_combo(self, items) -> QComboBox:
         combo = QComboBox()
         combo.addItems(items)
-        combo.setStyleSheet(_STYLE_INPUT)
         combo.setMinimumHeight(30)
         return combo
 
@@ -386,9 +315,7 @@ class AnalysisPage(QWidget):
     def _add_group_header(self, name: str) -> None:
         hr = QFrame()
         hr.setFrameShape(QFrame.HLine)
-        hr.setStyleSheet(_STYLE_HR)
         lab = QLabel(name.upper())
-        lab.setStyleSheet(_STYLE_GROUP)
         lay = QHBoxLayout()
         lay.setSpacing(8)
         lay.addWidget(lab)
@@ -400,7 +327,6 @@ class AnalysisPage(QWidget):
         row = QHBoxLayout()
         row.setSpacing(8)
         lbl = QLabel(label_text)
-        lbl.setStyleSheet(_STYLE_LABEL)
         lbl.setMinimumWidth(130)
         row.addWidget(lbl)
         row.addWidget(widget, stretch=1)
@@ -457,12 +383,12 @@ class AnalysisPage(QWidget):
         name = opt["name"] if opt else aid
         if self._editing_uid:
             title = QLabel("\u270f\ufe0f  Edit \u2014 " + name)
-            title.setStyleSheet("font-size: 14px; font-weight: 700; color: #818cf8;")
+            title.setStyleSheet("font-size: 14px; font-weight: 700;")
             self.btn_generate.setText("\U0001f4be Update Chart")
             self.btn_cancel_edit.setVisible(True)
         else:
             title = QLabel("\u2699\ufe0f  Configure \u2014 " + name)
-            title.setStyleSheet("font-size: 14px; font-weight: 700; color: #e2e8f0;")
+            title.setStyleSheet("font-size: 14px; font-weight: 700;")
             self.btn_generate.setText("\u25b6 Generate Charts")
             self.btn_cancel_edit.setVisible(False)
         self.config_layout.addWidget(title)
@@ -490,14 +416,7 @@ class AnalysisPage(QWidget):
                 lw.setSelectionMode(QListWidget.MultiSelection)
                 lw.setMinimumHeight(110)
                 lw.setMaximumHeight(150)
-                lw.setStyleSheet(
-                    "QListWidget { background: #1e293b; color: #e2e8f0;"
-                    "  border: 1px solid #334155; border-radius: 6px;"
-                    "  font-size: 12px; padding: 2px; }"
-                    "QListWidget::item { padding: 4px 8px; border-radius: 4px; }"
-                    "QListWidget::item:hover { background: #334155; }"
-                    "QListWidget::item:selected { background: #4f46e5; color: white; }"
-                )
+                lw.setStyleSheet("font-size: 12px; padding: 2px;")
                 for col in pool:
                     item = QListWidgetItem(str(col))
                     item.setData(Qt.UserRole, col)
@@ -507,7 +426,6 @@ class AnalysisPage(QWidget):
                 list_col = QVBoxLayout()
                 list_col.setSpacing(4)
                 lab = QLabel(label_text)
-                lab.setStyleSheet(_STYLE_LABEL)
                 list_col.addWidget(lab)
                 list_col.addWidget(lw)
                 self.config_layout.addLayout(list_col)
@@ -516,14 +434,13 @@ class AnalysisPage(QWidget):
                 spin = QSpinBox()
                 spin.setRange(0, 500)
                 spin.setValue(0)
-                spin.setStyleSheet(_STYLE_INPUT)
                 spin.setMinimumHeight(30)
                 self._config_widgets[widget_key] = spin
                 self._add_field_row(label_text, spin)
 
             elif kind == "bool":
                 chk = QCheckBox()
-                chk.setStyleSheet("color: #e2e8f0; font-size: 12px;")
+                chk.setStyleSheet("font-size: 12px;")
                 self._config_widgets[widget_key] = chk
                 self._add_field_row(label_text, chk)
 

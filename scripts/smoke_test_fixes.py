@@ -758,8 +758,8 @@ def test_dtype_extra():
           p.cmb_col.parentWidget().maximumWidth() <= 460,
           f"sideW={p.cmb_col.parentWidget().maximumWidth()}")
     check("clear preview button highlighted",
-          "#4f46e5" in p.btn_clear_preview.styleSheet(),
-          p.btn_clear_preview.styleSheet()[:50])
+          p.btn_clear_preview.property("kind") == "primary",
+          str(p.btn_clear_preview.property("kind")))
 
     # UI issue: row-index gutter must not crowd the values; cells centered.
     check("row-index gutter roomy + cells centered",

@@ -68,32 +68,7 @@ def _normalize_formula(formula: str) -> str:
         formula = formula.replace(pretty, real)
     return formula
 
-_QSS_INPUT = (
-    "QLineEdit { background: #1e293b; color: #e2e8f0;"
-    "  border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; }"
-)
-_QSS_COMBO = (
-    "QComboBox { background: #1e293b; color: #e2e8f0;"
-    "  border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; }"
-)
-_QSS_BTN_PRIMARY = (
-    "QPushButton { background: #10b981; color: #ffffff; border: none;"
-    "  border-radius: 6px; padding: 8px 18px; font-weight: 600; }"
-    "QPushButton:hover { background: #059669; }"
-    "QPushButton:disabled { background: #334155; color: #64748b; }"
-)
-_QSS_BTN_GHOST = (
-    "QPushButton { background: #4f46e5; color: #ffffff; border: none;"
-    "  border-radius: 6px; padding: 8px 18px; font-weight: 600; }"
-    "QPushButton:hover { background: #6366f1; }"
-    "QPushButton:disabled { background: #334155; color: #64748b; }"
-)
-_QSS_BTN_DANGER = (
-    "QPushButton { background: #ef4444; color: #ffffff; border: none;"
-    "  border-radius: 6px; padding: 8px 18px; font-weight: 600; }"
-    "QPushButton:hover { background: #dc2626; }"
-    "QPushButton:disabled { background: #334155; color: #64748b; }"
-)
+
 
 
 class ColumnManagerPanel(QWidget):
@@ -134,21 +109,11 @@ class ColumnManagerPanel(QWidget):
         left_lay.setSpacing(8)
 
         header = QLabel("Column Manager")
-        header.setStyleSheet("font-size: 15px; font-weight: 700; color: #e2e8f0; padding: 4px 2px;")
+        header.setProperty("class", "sectionTitle")
         left_lay.addWidget(header)
 
         self.tabs = QTabWidget()
-        self.tabs.setStyleSheet(
-            "QTabWidget { background: transparent; }"
-            "QTabWidget::pane { border: 1px solid #1e293b; border-radius: 8px; background: #0b1120; }"
-            "QTabBar::tab {"
-            "  background: #1e293b; color: #94a3b8;"
-            "  border: 1px solid #334155; border-bottom: none;"
-            "  border-top-left-radius: 6px; border-top-right-radius: 6px;"
-            "  padding: 8px 14px; font-size: 12px; margin-right: 2px;"
-            "}"
-            "QTabBar::tab:selected { background: #0b1120; color: #e2e8f0; }"
-        )
+        # Tab styling handled by global _tabs_qss
 
         self.tab_add = QWidget()
         self._build_add_tab()
@@ -173,7 +138,7 @@ class ColumnManagerPanel(QWidget):
         right_lay.setSpacing(8)
 
         prev_header = QLabel("Preview")
-        prev_header.setStyleSheet("font-size: 13px; font-weight: 700; color: #e2e8f0;")
+        prev_header.setProperty("class", "cardSub")
         right_lay.addWidget(prev_header)
 
         self.table_preview = QTableWidget()
@@ -184,18 +149,7 @@ class ColumnManagerPanel(QWidget):
         self.table_preview.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table_preview.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.table_preview.verticalHeader().setDefaultSectionSize(28)
-        self.table_preview.setStyleSheet(
-            "QTableView {"
-            "  background: #0f172a; color: #e2e8f0;"
-            "  border: 1px solid #1e293b; border-radius: 8px;"
-            "  gridline-color: #1e293b;"
-            "}"
-            "QTableView::item:selected { background: rgba(99,102,241,0.3); }"
-            "QHeaderView::section {"
-            "  background: #1e293b; color: #94a3b8;"
-            "  border: none; padding: 6px; font-weight: 600;"
-            "}"
-        )
+        # Table styling handled by global _tables_qss
         self.table_preview.verticalHeader().setFixedWidth(36)
         self.table_preview.verticalHeader().setDefaultAlignment(Qt.AlignCenter)
         self.table_preview.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -204,7 +158,7 @@ class ColumnManagerPanel(QWidget):
 
         self.lbl_preview_status = QLabel("Click Preview Result to see the computed column here.")
         self.lbl_preview_status.setWordWrap(True)
-        self.lbl_preview_status.setStyleSheet("font-size: 11px; color: #94a3b8;")
+        self.lbl_preview_status.setProperty("class", "muted")
         right_lay.addWidget(self.lbl_preview_status)
 
         body.addWidget(right, stretch=1)
@@ -213,10 +167,6 @@ class ColumnManagerPanel(QWidget):
         # Progress bar --------------------------------------------------------
         self.progress = QProgressBar()
         self.progress.setVisible(False)
-        self.progress.setStyleSheet(
-            "QProgressBar { background: #1e293b; border: none; height: 4px; }"
-            "QProgressBar::chunk { background: #4f46e5; }"
-        )
         root.addWidget(self.progress)
 
     def _build_add_tab(self) -> None:
@@ -232,7 +182,7 @@ class ColumnManagerPanel(QWidget):
         self.txt_new_col = QLineEdit()
         self.txt_new_col.setPlaceholderText("e.g. Total_Sales")
         self.txt_new_col.setFixedWidth(300)
-        self.txt_new_col.setStyleSheet(_QSS_INPUT)
+        self.txt_new_col
         form.addRow("New column name", self.txt_new_col)
 
         self.cmb_calc_type = QComboBox()
@@ -243,7 +193,7 @@ class ColumnManagerPanel(QWidget):
             "Date Difference", "Extract Date/Time Part", "Moving Average",
         ])
         self.cmb_calc_type.setFixedWidth(300)
-        self.cmb_calc_type.setStyleSheet(_QSS_COMBO)
+        self.cmb_calc_type
         form.addRow("Calculation type", self.cmb_calc_type)
 
         layout.addLayout(form)
@@ -259,9 +209,9 @@ class ColumnManagerPanel(QWidget):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
         self.btn_preview = QPushButton(_icon("system-search"), "Preview Result")
-        self.btn_preview.setStyleSheet(_QSS_BTN_GHOST)
+        self.btn_preview.setProperty("kind", "primary")
         self.btn_apply_add = QPushButton(_icon("list-add"), "Add Column")
-        self.btn_apply_add.setStyleSheet(_QSS_BTN_PRIMARY)
+        self.btn_apply_add.setProperty("kind", "success")
         btn_row.addWidget(self.btn_preview)
         btn_row.addWidget(self.btn_apply_add)
         btn_row.addStretch(1)
@@ -280,21 +230,18 @@ class ColumnManagerPanel(QWidget):
         layout.addWidget(QLabel("Select columns to remove:"))
         self.list_remove = QListWidget()
         self.list_remove.setSelectionMode(QListWidget.MultiSelection)
-        self.list_remove.setStyleSheet(
-            "QListWidget { background: #1e293b; color: #e2e8f0;"
-            "  border: 1px solid #334155; border-radius: 6px; font-size: 12px; }"
-        )
+        # List styling handled by global _lists_qss
         layout.addWidget(self.list_remove, stretch=1)
 
         self.chk_confirm_remove = QCheckBox("I confirm removal of selected columns")
-        self.chk_confirm_remove.setStyleSheet("color: #e2e8f0; font-size: 12px;")
+        # Checkbox styling handled by global QSS
         layout.addWidget(self.chk_confirm_remove)
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
         self.btn_apply_remove = QPushButton(_icon("edit-delete"), "Remove Selected")
         self.btn_apply_remove.setEnabled(False)
-        self.btn_apply_remove.setStyleSheet(_QSS_BTN_DANGER)
+        self.btn_apply_remove.setProperty("kind", "danger")
         btn_row.addStretch(1)
         btn_row.addWidget(self.btn_apply_remove)
         layout.addLayout(btn_row)
@@ -311,13 +258,13 @@ class ColumnManagerPanel(QWidget):
 
         self.cmb_rename_col = QComboBox()
         self.cmb_rename_col.setFixedWidth(300)
-        self.cmb_rename_col.setStyleSheet(_QSS_COMBO)
+        self.cmb_rename_col
         form.addRow("Select column", self.cmb_rename_col)
 
         self.txt_rename = QLineEdit()
         self.txt_rename.setPlaceholderText("Enter new column name")
         self.txt_rename.setFixedWidth(300)
-        self.txt_rename.setStyleSheet(_QSS_INPUT)
+        self.txt_rename
         form.addRow("New name", self.txt_rename)
 
         layout.addLayout(form)
@@ -326,7 +273,7 @@ class ColumnManagerPanel(QWidget):
         btn_row.setSpacing(8)
         self.btn_apply_rename = QPushButton(_icon("document-edit"), "Rename Column")
         self.btn_apply_rename.setEnabled(False)
-        self.btn_apply_rename.setStyleSheet(_QSS_BTN_PRIMARY)
+        self.btn_apply_rename.setProperty("kind", "success")
         btn_row.addStretch(1)
         btn_row.addWidget(self.btn_apply_rename)
         layout.addLayout(btn_row)
@@ -398,8 +345,7 @@ class ColumnManagerPanel(QWidget):
         num_cols = self._df.select_dtypes(include="number").columns.tolist()
         all_cols = self._df.columns.tolist()
 
-        combo_qss = _QSS_COMBO
-        lbl_qss = "font-size: 12px; color: #94a3b8;"
+        pass  # combo styling handled by global QSS
 
         if text == "Custom formula (use col names)":
             form = QFormLayout()
@@ -409,15 +355,14 @@ class ColumnManagerPanel(QWidget):
             self.txt_formula = QLineEdit()
             self.txt_formula.setPlaceholderText("`Sales` / `Units`")
             self.txt_formula.setFixedWidth(300)
-            self.txt_formula.setStyleSheet(_QSS_INPUT)
+            self.txt_formula
             form.addRow("Formula (`col` / `col`)", self.txt_formula)
 
             self.cmb_formula_col = QComboBox()
             self.cmb_formula_col.addItems(all_cols)
             self.cmb_formula_col.setFixedWidth(200)
-            self.cmb_formula_col.setStyleSheet(combo_qss)
             btn_insert = QPushButton(_icon("insert-link"), "Insert")
-            btn_insert.setStyleSheet(_QSS_BTN_GHOST.replace("18px", "12px"))
+            btn_insert.setProperty("kind", "primary")
             btn_insert.clicked.connect(self._on_insert_formula_column)
             picker_row = QHBoxLayout()
             picker_row.setSpacing(6)
@@ -438,13 +383,13 @@ class ColumnManagerPanel(QWidget):
             self.cmb_col_a = QComboBox()
             self.cmb_col_a.addItems(num_cols)
             self.cmb_col_a.setFixedWidth(200)
-            self.cmb_col_a.setStyleSheet(combo_qss)
+            self.cmb_col_a
             self.cmb_col_b = QComboBox()
             self.cmb_col_b.addItems(num_cols)
             self.cmb_col_b.setFixedWidth(200)
-            self.cmb_col_b.setStyleSheet(combo_qss)
+            self.cmb_col_b
             op_lbl = QLabel(op)
-            op_lbl.setStyleSheet("font-size: 15px; font-weight: 700; color: #a5b4fc;")
+            op_lbl.setProperty("class", "cardSub")
             cols_row = QHBoxLayout()
             cols_row.setSpacing(8)
             cols_row.addWidget(self.cmb_col_a)
@@ -464,7 +409,7 @@ class ColumnManagerPanel(QWidget):
             self.cmb_date_a = QComboBox()
             self.cmb_date_a.addItems(all_cols)
             self.cmb_date_a.setFixedWidth(220)
-            self.cmb_date_a.setStyleSheet(combo_qss)
+            self.cmb_date_a
             form.addRow("Start date column", self.cmb_date_a)
 
             row2 = QHBoxLayout()
@@ -472,16 +417,10 @@ class ColumnManagerPanel(QWidget):
             self.rb_today = QPushButton("Today's date")
             self.rb_today.setCheckable(True)
             self.rb_today.setChecked(True)
-            self.rb_today.setStyleSheet(
-                "QPushButton { background: #4f46e5; color: white; border: none;"
-                "  border-radius: 4px; padding: 4px 10px; font-size: 11px; }"
-            )
+            self.rb_today.setProperty("kind", "primary")
             self.rb_another_col = QPushButton("Another column")
             self.rb_another_col.setCheckable(True)
-            self.rb_another_col.setStyleSheet(
-                "QPushButton { background: #1e293b; color: #94a3b8; border: 1px solid #334155;"
-                "  border-radius: 4px; padding: 4px 10px; font-size: 11px; }"
-            )
+            self.rb_another_col.setProperty("kind", "ghost")
             self.rb_today.clicked.connect(lambda: self._set_date_mode("today"))
             self.rb_another_col.clicked.connect(lambda: self._set_date_mode("column"))
             row2.addWidget(self.rb_today)
@@ -492,7 +431,7 @@ class ColumnManagerPanel(QWidget):
             self.cmb_date_b = QComboBox()
             self.cmb_date_b.addItems([c for c in all_cols if c != self.cmb_date_a.currentText()])
             self.cmb_date_b.setFixedWidth(220)
-            self.cmb_date_b.setStyleSheet(combo_qss)
+            self.cmb_date_b
             form.addRow("End date column", self.cmb_date_b)
             self.cmb_date_a.currentTextChanged.connect(
                 lambda t: self.cmb_date_b.clear() or self.cmb_date_b.addItems([c for c in all_cols if c != t])
@@ -505,7 +444,7 @@ class ColumnManagerPanel(QWidget):
                 "Previous Year (subtract 1 year)", "Previous Month (subtract 1 month)",
             ])
             self.cmb_diff_unit.setFixedWidth(260)
-            self.cmb_diff_unit.setStyleSheet(combo_qss)
+            self.cmb_diff_unit
             form.addRow("Difference unit", self.cmb_diff_unit)
 
             self.options_layout.addLayout(form)
@@ -518,14 +457,14 @@ class ColumnManagerPanel(QWidget):
             self.cmb_date_src = QComboBox()
             self.cmb_date_src.addItems(all_cols)
             self.cmb_date_src.setFixedWidth(200)
-            self.cmb_date_src.setStyleSheet(combo_qss)
+            self.cmb_date_src
             self.cmb_date_part = QComboBox()
             self.cmb_date_part.addItems([
                 "Date (YYYY-MM-DD)", "Year", "Quarter", "Month (Number)", "Month Name",
                 "Week Number", "Day", "Weekday Name", "Hour (12h AM/PM)", "Hour (24h)",
             ])
             self.cmb_date_part.setFixedWidth(220)
-            self.cmb_date_part.setStyleSheet(combo_qss)
+            self.cmb_date_part
             row = QHBoxLayout()
             row.setSpacing(8)
             row.addWidget(self.cmb_date_src)
@@ -543,15 +482,12 @@ class ColumnManagerPanel(QWidget):
             self.cmb_ma_col = QComboBox()
             self.cmb_ma_col.addItems(num_cols)
             self.cmb_ma_col.setFixedWidth(200)
-            self.cmb_ma_col.setStyleSheet(combo_qss)
+            self.cmb_ma_col
             self.spin_ma_window = QSpinBox()
             self.spin_ma_window.setRange(2, 999)
             self.spin_ma_window.setValue(7)
             self.spin_ma_window.setFixedWidth(80)
-            self.spin_ma_window.setStyleSheet(
-                "QSpinBox { background: #1e293b; color: #e2e8f0;"
-                "  border: 1px solid #334155; border-radius: 6px; padding: 5px 8px; font-size: 12px; }"
-            )
+            
             form.addRow("Column", self.cmb_ma_col)
             form.addRow("Window (rows)", self.spin_ma_window)
 
@@ -561,26 +497,14 @@ class ColumnManagerPanel(QWidget):
         """Toggle between today and another column for date diff."""
         if mode == "today":
             self.rb_today.setChecked(True)
-            self.rb_today.setStyleSheet(
-                "QPushButton { background: #4f46e5; color: white; border: none;"
-                "  border-radius: 4px; padding: 4px 10px; font-size: 11px; }"
-            )
+            self.rb_today.setProperty("kind", "primary")
             self.rb_another_col.setChecked(False)
-            self.rb_another_col.setStyleSheet(
-                "QPushButton { background: #1e293b; color: #94a3b8; border: 1px solid #334155;"
-                "  border-radius: 4px; padding: 4px 10px; font-size: 11px; }"
-            )
+            self.rb_another_col.setProperty("kind", "ghost")
         else:
             self.rb_another_col.setChecked(True)
-            self.rb_another_col.setStyleSheet(
-                "QPushButton { background: #4f46e5; color: white; border: none;"
-                "  border-radius: 4px; padding: 4px 10px; font-size: 11px; }"
-            )
+            self.rb_another_col.setProperty("kind", "ghost")
             self.rb_today.setChecked(False)
-            self.rb_today.setStyleSheet(
-                "QPushButton { background: #1e293b; color: #94a3b8; border: 1px solid #334155;"
-                "  border-radius: 4px; padding: 4px 10px; font-size: 11px; }"
-            )
+            self.rb_today.setProperty("kind", "primary")
         if hasattr(self, "cmb_date_b"):
             self.cmb_date_b.setEnabled(mode != "today")
 

@@ -27,6 +27,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
+from desktop import theme
 from desktop.main_window import MainWindow
 from desktop.session_bridge import SessionBridge
 
@@ -66,8 +67,15 @@ def main() -> int:
     if icon_path:
         app.setWindowIcon(QIcon(icon_path))
 
+    # Apply the saved (or default) theme (dark/light) BEFORE the window
+    # is created so the whole UI starts in the right palette.
+    theme.apply_theme(app, theme.load_saved_mode())
+
     # Create the session bridge (headless SessionManager + Qt signals)
     bridge = SessionBridge()
+    # Mirror the current theme into session state so any page/widget that
+    # wants to react (e.g. re-theme an embedded Plotly chart) can read it.
+    bridge.set("theme_mode", theme.current_mode())
 
     # Create and show the main window
     window = MainWindow(bridge)

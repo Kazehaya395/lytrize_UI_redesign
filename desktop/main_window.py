@@ -13,15 +13,16 @@ is NOT used by this shell.  This is the primary runtime for the native app.
 from __future__ import annotations
 
 import logging
+import math
 import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSize, QTimer
-from PySide6.QtGui import QIcon, QAction, QPixmap
+from PySide6.QtGui import QIcon, QAction, QPixmap, QPainter, QPen, QColor, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QStackedWidget, QFrame, QListWidget,
-    QListWidgetItem, QStatusBar, QToolBar, QSizePolicy,
+    QListWidgetItem, QStatusBar, QToolBar, QToolButton, QSizePolicy,
 )
 
 from desktop.session_bridge import SessionBridge
@@ -46,6 +47,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1024, 700)
         self.resize(1280, 800)
 
+        self._theme_icon_cache: dict[str, QIcon] = {}
         self._build_ui()
         self._build_statusbar()
         self._build_nav()
@@ -89,9 +91,6 @@ class MainWindow(QMainWindow):
         self.sidebar = QFrame()
         self.sidebar.setObjectName("sidebar")
         self.sidebar.setFixedWidth(220)
-        self.sidebar.setStyleSheet(
-            "QFrame#sidebar { background: #0f172a; border-right: 1px solid #1e293b; }"
-        )
         side_layout = QVBoxLayout(self.sidebar)
         side_layout.setContentsMargins(12, 16, 12, 16)
         side_layout.setSpacing(4)
@@ -112,7 +111,6 @@ class MainWindow(QMainWindow):
             brand_wrap.addWidget(logo_lbl, 0, Qt.AlignVCenter)
         brand = QLabel("Lytrize")
         brand.setObjectName("brand")
-        brand.setStyleSheet("font-size: 20px; font-weight: 800; color: #a5b4fc;")
         brand_wrap.addWidget(brand, Qt.AlignVCenter)
         side_layout.addWidget(brand_container, 0, Qt.AlignHCenter)
 
@@ -120,29 +118,11 @@ class MainWindow(QMainWindow):
         # reads as perfectly parallel under the logo + name row.
         brand_sub = QLabel("Analytics Desktop")
         brand_sub.setObjectName("brand_sub")
-        brand_sub.setStyleSheet(
-            "font-size: 12px; font-weight: 600; color: #94a3b8; padding: 0 0 12px;"
-        )
         side_layout.addWidget(brand_sub, 0, Qt.AlignHCenter)
 
         # Navigation list
         self.nav_list = QListWidget()
         self.nav_list.setObjectName("nav_list")
-        self.nav_list.setStyleSheet(
-            "QListWidget#nav_list {"
-            "  background: transparent; border: none;"
-            "  font-size: 13px; color: #cbd5e1;"
-            "}"
-            "QListWidget#nav_list::item {"
-            "  background: transparent; padding: 10px 12px; border-radius: 8px; margin: 2px 0;"
-            "}"
-            "QListWidget#nav_list::item:hover {"
-            "  background: rgba(99,102,241,0.12);"
-            "}"
-            "QListWidget#nav_list::item:selected {"
-            "  background: rgba(99,102,241,0.20); color: #a5b4fc;"
-            "}"
-        )
         self.nav_items = [
             ("home",      "🏠  Home"),
             ("upload",    "📂  Upload"),
@@ -159,7 +139,6 @@ class MainWindow(QMainWindow):
         # Version footer
         version = QLabel("v1.0 · local-first")
         version.setObjectName("version")
-        version.setStyleSheet("font-size: 10px; color: #475569; padding: 8px 12px;")
         side_layout.addWidget(version)
 
         root.addWidget(self.sidebar)
@@ -170,9 +149,6 @@ class MainWindow(QMainWindow):
         # -- Main content area --
         self.stack = QStackedWidget()
         self.stack.setObjectName("stack")
-        self.stack.setStyleSheet(
-            "QStackedWidget#stack { background: #0b1120; }"
-        )
         root.addWidget(self.stack, stretch=1)
 
         # Add pages
@@ -213,25 +189,21 @@ class MainWindow(QMainWindow):
         self.nav_list.setCurrentRow(0)
 
     def _build_toolbar(self) -> None:
-        """Build the top toolbar with hamburger menu button."""
+        """Build the top toolbar: hamburger (left), theme toggle (right)."""
         toolbar = QToolBar("Main Toolbar")
         toolbar.setMovable(False)
         toolbar.setIconSize(QSize(20, 20))
-        toolbar.setStyleSheet(
-            "QToolBar { background: #0f172a; border: none; spacing: 8px; padding: 4px 8px; }"
-        )
+        # Compact shell: Fusion adds ~8px of internal chrome on top of the
+        # children, inflating the bar to 56px. 44px logical still fits the
+        # 36px hamburger and 40px theme toggle and scales with HiDPI (all
+        # sizes here are logical pixels, Qt scales them together).
+        toolbar.setFixedHeight(44)
         self.addToolBar(toolbar)
 
         # Hamburger menu button
         self.btn_hamburger = QPushButton("☰")
+        self.btn_hamburger.setObjectName("btn_hamburger")
         self.btn_hamburger.setFixedSize(36, 36)
-        self.btn_hamburger.setStyleSheet(
-            "QPushButton {"
-            "  background: transparent; color: #e2e8f0; border: none;"
-            "  font-size: 18px; font-weight: bold; border-radius: 6px;"
-            "}"
-            "QPushButton:hover { background: rgba(99,102,241,0.15); }"
-        )
         self.btn_hamburger.setToolTip("Toggle sidebar")
         self.btn_hamburger.clicked.connect(self._toggle_sidebar)
         toolbar.addWidget(self.btn_hamburger)
@@ -240,6 +212,117 @@ class MainWindow(QMainWindow):
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         toolbar.addWidget(spacer)
+
+        # Dark / light theme toggle (sun/moon glyphs reflect current mode).
+        from desktop import theme as _theme_mod
+        _cur = _theme_mod.current_mode()
+        self.btn_theme = QToolButton()
+        self.btn_theme.setObjectName("btn_theme")
+        self.btn_theme.setFixedSize(40, 40)
+        self.btn_theme.setIconSize(QSize(32, 32))
+        self.btn_theme.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self.btn_theme.setIcon(self._icon_for_current())
+        self.btn_theme.setToolTip(
+            "Switch to light mode (Ctrl+T)" if _cur == "dark"
+            else "Switch to dark mode (Ctrl+T)"
+        )
+        self.btn_theme.clicked.connect(self.toggle_theme)
+        toolbar.addWidget(self.btn_theme)
+
+        # Ctrl+T toggles the theme app-wide.
+        self._theme_shortcut = QShortcut(QKeySequence("Ctrl+T"), self)
+        self._theme_shortcut.activated.connect(self.toggle_theme)
+
+    def _theme_icon(self, target_mode: str) -> QIcon:
+        """Paint the glyph for the mode we'd switch TO: a crescent moon
+        when the target is dark, an amber sun when the target is light.
+        (Convention: the button shows the action, not the current state.)
+        Painted at the button's 32px icon size -- vector shapes, so it
+        stays crisp at HiDPI scales too."""
+        size = 32
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        if target_mode == "dark":
+            # Slate crescent moon (offers dark mode)
+            painter.setBrush(QColor("#94a3b8"))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(5, 5, 22, 22)
+            painter.setCompositionMode(QPainter.CompositionMode_Clear)
+            painter.drawEllipse(11, 3, 19, 22)
+        else:
+            # Amber sun: disc + rays (offers light mode)
+            painter.setBrush(QColor("#f59e0b"))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(6, 6, 19, 19)
+            painter.setPen(QPen(QColor("#fbbf24"), 2.5))
+            for angle in range(0, 360, 45):
+                rad = math.radians(angle)
+                x1 = int(16 + 11 * math.cos(rad))
+                y1 = int(16 + 11 * math.sin(rad))
+                x2 = int(16 + 15 * math.cos(rad))
+                y2 = int(16 + 15 * math.sin(rad))
+                painter.drawLine(x1, y1, x2, y2)
+
+        painter.end()
+        return QIcon(pixmap)
+
+    def _get_theme_icon(self, mode: str) -> QIcon:
+        """Return a cached sun/moon icon for *mode* (built once per mode)."""
+        if mode not in self._theme_icon_cache:
+            self._theme_icon_cache[mode] = self._theme_icon(mode)
+        return self._theme_icon_cache[mode]
+
+    def _icon_for_current(self) -> QIcon:
+        """Icon showing the mode we'd switch to from the CURRENT theme."""
+        from desktop import theme as theme_mod
+        cur = theme_mod.current_mode()
+        return self._get_theme_icon("light" if cur == "dark" else "dark")
+
+    def toggle_theme(self) -> None:
+        """Switch the whole app between dark and light and persist the choice.
+
+        The heavy work (repolishing the full widget tree) is deferred to the
+        next event-loop iteration so the button icon + status message update
+        within one frame -- the UI never appears frozen even on large tables.
+        """
+        from PySide6.QtWidgets import QApplication
+        from desktop import theme as theme_mod
+        from PySide6.QtCore import QTimer
+
+        next_mode = "light" if theme_mod.current_mode() == "dark" else "dark"
+
+        # Instant feedback: swap glyph + status now (one frame, no repolish).
+        # The glyph always shows the mode we'd switch to FROM the resulting
+        # state, so it stays consistent with the actual theme afterwards.
+        self.btn_theme.setIcon(
+            self._get_theme_icon("dark" if next_mode == "light" else "light")
+        )
+        self.btn_theme.setToolTip(
+            "Switch to light mode (Ctrl+T)" if next_mode == "dark"
+            else "Switch to dark mode (Ctrl+T)"
+        )
+        self.status.showMessage(f"Theme: {next_mode.title()}", 2000)
+
+        # Defer the expensive repolish so the icon swap paints first.
+        def _apply():
+            app = QApplication.instance()
+            if app is None:
+                return
+            # Suspend repaints/layout across the whole tree during the switch
+            # so Qt resolves the new stylesheet once, not per-widget.
+            self.setUpdatesEnabled(False)
+            try:
+                theme_mod.apply_theme(app, next_mode)
+                theme_mod.save_mode(next_mode)
+                self.bridge.set("theme_mode", next_mode)
+                self.bridge.theme_changed.emit(next_mode)
+            finally:
+                self.setUpdatesEnabled(True)
+
+        QTimer.singleShot(0, _apply)
 
     def _toggle_sidebar(self) -> None:
         """Toggle sidebar visibility."""

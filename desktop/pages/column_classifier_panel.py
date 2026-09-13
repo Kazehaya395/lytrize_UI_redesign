@@ -120,9 +120,7 @@ class ColumnClassifierPanel(QWidget):
 
         # -- Header --
         header = QLabel("🏷️ Column Classification")
-        header.setStyleSheet(
-            "font-size: 16px; font-weight: 700; color: #e2e8f0;"
-        )
+        header.setProperty("class", "sectionTitle")
         root.addWidget(header)
 
         desc = QLabel(
@@ -131,30 +129,26 @@ class ColumnClassifierPanel(QWidget):
             "more columns and use the buttons below to move them."
         )
         desc.setWordWrap(True)
-        desc.setStyleSheet("font-size: 12px; color: #94a3b8;")
+        desc.setProperty("class", "muted")
         root.addWidget(desc)
 
         # -- Move-to-category buttons (fallback to drag & drop) --
         move_row = QHBoxLayout()
         move_row.setSpacing(8)
         move_row.addWidget(QLabel("Move selected to:"))
-        btn_style = (
-            "QPushButton { background: #1e293b; color: #a5b4fc; border: 1px solid #334155;"
-            "  border-radius: 6px; padding: 4px 12px; font-size: 12px; }"
-            "QPushButton:hover { background: #334155; }"
-        )
+        # Button styling handled by global QSS kind=ghost
         self.btn_move_num = QPushButton("📊 Numeric")
-        self.btn_move_num.setStyleSheet(btn_style)
+        self.btn_move_num.setProperty("kind", "ghost")
         self.btn_move_num.clicked.connect(lambda: self._move_selected_to("numeric"))
         move_row.addWidget(self.btn_move_num)
 
         self.btn_move_cat = QPushButton("🏷️ Categorical")
-        self.btn_move_cat.setStyleSheet(btn_style)
+        self.btn_move_cat.setProperty("kind", "ghost")
         self.btn_move_cat.clicked.connect(lambda: self._move_selected_to("categorical"))
         move_row.addWidget(self.btn_move_cat)
 
         self.btn_move_dt = QPushButton("📅 Date/Time")
-        self.btn_move_dt.setStyleSheet(btn_style)
+        self.btn_move_dt.setProperty("kind", "ghost")
         self.btn_move_dt.clicked.connect(lambda: self._move_selected_to("datetime"))
         move_row.addWidget(self.btn_move_dt)
         move_row.addStretch()
@@ -166,61 +160,40 @@ class ColumnClassifierPanel(QWidget):
 
         # Numeric
         num_group = QFrame()
-        num_group.setStyleSheet(
-            "QFrame { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; }"
-        )
+        num_group.setObjectName("config_panel")
         num_layout = QVBoxLayout(num_group)
         num_layout.setContentsMargins(8, 8, 8, 8)
         num_layout.setSpacing(4)
         num_header = QLabel("📊 Metrics Columns (Numeric)")
-        num_header.setStyleSheet("font-size: 12px; font-weight: 600; color: #a5b4fc;")
+        num_header.setProperty("class", "cardSub")
         num_layout.addWidget(num_header)
         self.list_num = _ClassifyList(self)
-        self.list_num.setStyleSheet(
-            "QListWidget { background: #1e293b; color: #e2e8f0; border: none; font-size: 12px; }"
-            "QListWidget::item { padding: 4px 6px; border-radius: 4px; }"
-            "QListWidget::item:selected { background: rgba(99,102,241,0.3); }"
-        )
         num_layout.addWidget(self.list_num)
         lists_row.addWidget(num_group, stretch=1)
 
         # Categorical
         cat_group = QFrame()
-        cat_group.setStyleSheet(
-            "QFrame { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; }"
-        )
+        cat_group.setObjectName("config_panel")
         cat_layout = QVBoxLayout(cat_group)
         cat_layout.setContentsMargins(8, 8, 8, 8)
         cat_layout.setSpacing(4)
         cat_header = QLabel("🏷️ Dimension Columns (Categorical)")
-        cat_header.setStyleSheet("font-size: 12px; font-weight: 600; color: #a5b4fc;")
+        cat_header.setProperty("class", "cardSub")
         cat_layout.addWidget(cat_header)
         self.list_cat = _ClassifyList(self)
-        self.list_cat.setStyleSheet(
-            "QListWidget { background: #1e293b; color: #e2e8f0; border: none; font-size: 12px; }"
-            "QListWidget::item { padding: 4px 6px; border-radius: 4px; }"
-            "QListWidget::item:selected { background: rgba(99,102,241,0.3); }"
-        )
         cat_layout.addWidget(self.list_cat)
         lists_row.addWidget(cat_group, stretch=1)
 
         # Datetime
         dt_group = QFrame()
-        dt_group.setStyleSheet(
-            "QFrame { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; }"
-        )
+        dt_group.setObjectName("config_panel")
         dt_layout = QVBoxLayout(dt_group)
         dt_layout.setContentsMargins(8, 8, 8, 8)
         dt_layout.setSpacing(4)
         dt_header = QLabel("📅 Date/Time Columns")
-        dt_header.setStyleSheet("font-size: 12px; font-weight: 600; color: #a5b4fc;")
+        dt_header.setProperty("class", "cardSub")
         dt_layout.addWidget(dt_header)
         self.list_dt = _ClassifyList(self)
-        self.list_dt.setStyleSheet(
-            "QListWidget { background: #1e293b; color: #e2e8f0; border: none; font-size: 12px; }"
-            "QListWidget::item { padding: 4px 6px; border-radius: 4px; }"
-            "QListWidget::item:selected { background: rgba(99,102,241,0.3); }"
-        )
         dt_layout.addWidget(self.list_dt)
         lists_row.addWidget(dt_group, stretch=1)
 
@@ -228,11 +201,7 @@ class ColumnClassifierPanel(QWidget):
 
         # -- Overlap warning --
         self.lbl_warning = QLabel("")
-        self.lbl_warning.setStyleSheet(
-            "font-size: 12px; color: #f59e0b; font-weight: 600;"
-            "background: rgba(245,158,11,0.1); border: 1px solid rgba(245,158,11,0.3);"
-            "border-radius: 6px; padding: 8px;"
-        )
+        self.lbl_warning.setProperty("class", "warning")
         self.lbl_warning.setWordWrap(True)
         self.lbl_warning.setVisible(False)
         root.addWidget(self.lbl_warning)
@@ -241,15 +210,7 @@ class ColumnClassifierPanel(QWidget):
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         self.btn_confirm = QPushButton("✅ Confirm & Proceed to Analysis →")
-        self.btn_confirm.setStyleSheet(
-            "QPushButton {"
-            "  background: #10b981; color: white; border: none;"
-            "  border-radius: 8px; padding: 10px 20px; font-weight: 600;"
-            "  font-size: 13px;"
-            "}"
-            "QPushButton:hover { background: #34d399; }"
-            "QPushButton:disabled { background: #1e293b; color: #475569; }"
-        )
+        self.btn_confirm.setProperty("kind", "success")
         self.btn_confirm.setEnabled(False)
         btn_row.addWidget(self.btn_confirm)
         root.addLayout(btn_row)

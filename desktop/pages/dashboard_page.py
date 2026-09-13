@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox,
 )
 
+from desktop import theme as _theme_mod
+from desktop.theme import PAGE_MARGINS
 from desktop.session_bridge import SessionBridge
 from desktop.widgets.chart_card import ChartCard
 from desktop.widgets.kpi_card import KpiCard
@@ -78,46 +80,30 @@ class DashboardPage(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 24, 24, 24)
+        root.setContentsMargins(*PAGE_MARGINS)
         root.setSpacing(12)
 
         # -- Header --
         header = QHBoxLayout()
         title = QLabel("📈 Dashboard")
-        title.setStyleSheet("font-size: 20px; font-weight: 700; color: #e2e8f0;")
+        title.setProperty("class", "pageTitle")
         header.addWidget(title)
         header.addStretch()
 
         self.btn_back = QPushButton("← Back")
-        self.btn_back.setStyleSheet(
-            "QPushButton { background: #1e293b; color: #94a3b8; border: none;"
-            "  border-radius: 8px; padding: 8px 16px; font-weight: 600; }"
-            "QPushButton:hover { background: #334155; color: #e2e8f0; }"
-        )
+        self.btn_back.setProperty("kind", "ghost")
         header.addWidget(self.btn_back)
 
         self.btn_export = QPushButton("⬇️ Export HTML")
-        self.btn_export.setStyleSheet(
-            "QPushButton { background: #4f46e5; color: white; border: none;"
-            "  border-radius: 8px; padding: 8px 16px; font-weight: 600; }"
-            "QPushButton:hover { background: #6366f1; }"
-        )
+        self.btn_export.setProperty("kind", "primary")
         header.addWidget(self.btn_export)
 
         self.btn_export_png = QPushButton("📷 Export PNG")
-        self.btn_export_png.setStyleSheet(
-            "QPushButton { background: #1e293b; color: #cbd5e1; border: 1px solid #334155;"
-            "  border-radius: 8px; padding: 8px 16px; font-weight: 600; }"
-            "QPushButton:hover { background: #334155; }"
-        )
+        self.btn_export_png.setProperty("kind", "ghost")
         header.addWidget(self.btn_export_png)
 
         self.btn_save = QPushButton("💾 Save Session")
-        self.btn_save.setStyleSheet(
-            "QPushButton { background: #10b981; color: white; border: none;"
-            "  border-radius: 8px; padding: 8px 16px; font-weight: 600; }"
-            "QPushButton:hover { background: #34d399; }"
-        )
+        self.btn_save.setProperty("kind", "success")
         header.addWidget(self.btn_save)
         root.addLayout(header)
 
@@ -128,10 +114,6 @@ class DashboardPage(QWidget):
         #    separate "preview vs real" rendering path to keep in sync.
         splitter = QSplitter(Qt.Horizontal)
         splitter.setHandleWidth(6)
-        splitter.setStyleSheet(
-            "QSplitter::handle { background: #1e293b; }"
-            "QSplitter::handle:hover { background: #334155; }"
-        )
 
         left_panel = self._build_left_panel()
         splitter.addWidget(left_panel)
@@ -150,9 +132,6 @@ class DashboardPage(QWidget):
 
         self.charts_scroll = QScrollArea()
         self.charts_scroll.setWidgetResizable(True)
-        self.charts_scroll.setStyleSheet(
-            "QScrollArea { background: transparent; border: none; }"
-        )
         self.charts_container = QWidget()
         self.charts_layout = QGridLayout(self.charts_container)
         self.charts_layout.setContentsMargins(0, 0, 0, 0)
@@ -161,7 +140,8 @@ class DashboardPage(QWidget):
         right_layout.addWidget(self.charts_scroll, stretch=1)
 
         self.lbl_empty = QLabel("No charts yet. Go to Analysis to generate some!")
-        self.lbl_empty.setStyleSheet("font-size: 13px; color: #64748b; padding: 20px;")
+        self.lbl_empty.setProperty("class", "faint")
+        self.lbl_empty.setStyleSheet("font-size: 13px; padding: 20px;")
         self.lbl_empty.setAlignment(Qt.AlignCenter)
         right_layout.addWidget(self.lbl_empty)
 
@@ -177,7 +157,6 @@ class DashboardPage(QWidget):
         previously only consumed at export time with no UI to set them."""
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         scroll.setMinimumWidth(260)
         scroll.setMaximumWidth(420)
 
@@ -188,24 +167,20 @@ class DashboardPage(QWidget):
 
         # -- Session / title / layout --
         meta_group = QGroupBox("📝 Dashboard Info")
-        meta_group.setStyleSheet(self._group_box_style())
         meta_form = QFormLayout(meta_group)
         meta_form.setContentsMargins(12, 14, 12, 12)
         meta_form.setSpacing(8)
 
         self.session_name = QLineEdit()
         self.session_name.setPlaceholderText("Session name")
-        self.session_name.setStyleSheet(self._input_style())
         meta_form.addRow(self._form_label("Session"), self.session_name)
 
         self.dash_title = QLineEdit()
         self.dash_title.setPlaceholderText("e.g. Q1 2025 Sales Dashboard")
-        self.dash_title.setStyleSheet(self._input_style())
         meta_form.addRow(self._form_label("Title"), self.dash_title)
 
         self.layout_mode = QComboBox()
         self.layout_mode.addItems(["Portrait", "Landscape"])
-        self.layout_mode.setStyleSheet(self._input_style())
         meta_form.addRow(self._form_label("Layout"), self.layout_mode)
 
         # Grid columns -- old codebase's grid_cols_n (2 or 3 per row),
@@ -217,7 +192,6 @@ class DashboardPage(QWidget):
         self.grid_cols_combo.addItems(["2 Columns", "3 Columns"])
         current_cols = int(self.bridge.get("grid_cols_n", 2))
         self.grid_cols_combo.setCurrentIndex(0 if current_cols == 2 else 1)
-        self.grid_cols_combo.setStyleSheet(self._input_style())
         self.grid_cols_combo.currentIndexChanged.connect(self._on_grid_cols_changed)
         meta_form.addRow(self._form_label("Grid columns"), self.grid_cols_combo)
 
@@ -225,23 +199,17 @@ class DashboardPage(QWidget):
 
         # -- KPIs --
         kpi_group = QGroupBox("📊 KPI Cards")
-        kpi_group.setStyleSheet(self._group_box_style())
         kpi_layout = QVBoxLayout(kpi_group)
         kpi_layout.setContentsMargins(12, 14, 12, 12)
 
         self.btn_add_kpi = QPushButton("+ Add KPI")
-        self.btn_add_kpi.setStyleSheet(
-            "QPushButton { background: #1e293b; color: #a5b4fc; border: 1px solid #334155;"
-            "  border-radius: 6px; padding: 6px 12px; font-weight: 600; }"
-            "QPushButton:hover { background: #334155; }"
-        )
+        self.btn_add_kpi.setProperty("kind", "ghost")
         self.btn_add_kpi.clicked.connect(self._on_add_kpi)
         kpi_layout.addWidget(self.btn_add_kpi)
         layout.addWidget(kpi_group)
 
         # -- Canvas colors --
         canvas_group = QGroupBox("🎨 Canvas Colors")
-        canvas_group.setStyleSheet(self._group_box_style())
         canvas_form = QFormLayout(canvas_group)
         canvas_form.setContentsMargins(12, 14, 12, 12)
         canvas_form.setSpacing(6)
@@ -252,7 +220,6 @@ class DashboardPage(QWidget):
 
         # -- Text & accent --
         text_group = QGroupBox("🔤 Text & Accent")
-        text_group.setStyleSheet(self._group_box_style())
         text_form = QFormLayout(text_group)
         text_form.setContentsMargins(12, 14, 12, 12)
         text_form.setSpacing(6)
@@ -262,7 +229,6 @@ class DashboardPage(QWidget):
 
         # -- Notes styling --
         notes_group = QGroupBox("🗒️ Notes Styling")
-        notes_group.setStyleSheet(self._group_box_style())
         notes_form = QFormLayout(notes_group)
         notes_form.setContentsMargins(12, 14, 12, 12)
         notes_form.setSpacing(6)
@@ -272,7 +238,6 @@ class DashboardPage(QWidget):
 
         # -- Layout density / sizing --
         density_group = QGroupBox("📐 Layout")
-        density_group.setStyleSheet(self._group_box_style())
         density_form = QFormLayout(density_group)
         density_form.setContentsMargins(12, 14, 12, 12)
         density_form.setSpacing(6)
@@ -280,14 +245,12 @@ class DashboardPage(QWidget):
         self.ex_density = QComboBox()
         self.ex_density.addItems(["Comfortable", "Compact"])
         self.ex_density.setCurrentText(self.bridge.get("ex_density", _STYLE_DEFAULTS["ex_density"]))
-        self.ex_density.setStyleSheet(self._input_style())
         self.ex_density.currentTextChanged.connect(lambda v: self._on_field_changed("ex_density", v))
         density_form.addRow(self._form_label("Density"), self.ex_density)
 
         self.ex_radius = QSpinBox()
         self.ex_radius.setRange(0, 32)
         self.ex_radius.setValue(int(self.bridge.get("ex_radius", _STYLE_DEFAULTS["ex_radius"])))
-        self.ex_radius.setStyleSheet(self._input_style())
         self.ex_radius.valueChanged.connect(lambda v: self._on_field_changed("ex_radius", v))
         density_form.addRow(self._form_label("Corner radius"), self.ex_radius)
 
@@ -295,20 +258,18 @@ class DashboardPage(QWidget):
         self.ex_chart_h.setRange(200, 900)
         self.ex_chart_h.setSingleStep(20)
         self.ex_chart_h.setValue(int(self.bridge.get("ex_chart_h", _STYLE_DEFAULTS["ex_chart_h"])))
-        self.ex_chart_h.setStyleSheet(self._input_style())
         self.ex_chart_h.valueChanged.connect(lambda v: self._on_field_changed("ex_chart_h", v))
         density_form.addRow(self._form_label("Chart height"), self.ex_chart_h)
 
         self.ex_width = QComboBox()
         self.ex_width.addItems(["Auto", "Fixed"])
         self.ex_width.setCurrentText(self.bridge.get("ex_width", _STYLE_DEFAULTS["ex_width"]))
-        self.ex_width.setStyleSheet(self._input_style())
         self.ex_width.currentTextChanged.connect(lambda v: self._on_field_changed("ex_width", v))
         density_form.addRow(self._form_label("Width"), self.ex_width)
 
         self.ex_meta = QCheckBox("Show chart metadata")
         self.ex_meta.setChecked(bool(self.bridge.get("ex_meta", _STYLE_DEFAULTS["ex_meta"])))
-        self.ex_meta.setStyleSheet("color: #cbd5e1; font-size: 12px;")
+        self.ex_meta.setStyleSheet("font-size: 12px;")
         self.ex_meta.toggled.connect(lambda v: self._on_field_changed("ex_meta", v))
         density_form.addRow(self.ex_meta)
 
@@ -316,7 +277,6 @@ class DashboardPage(QWidget):
 
         # -- KPI text --
         kpi_text_group = QGroupBox("🔢 KPI Text")
-        kpi_text_group.setStyleSheet(self._group_box_style())
         kpi_text_form = QFormLayout(kpi_text_group)
         kpi_text_form.setContentsMargins(12, 14, 12, 12)
         kpi_text_form.setSpacing(6)
@@ -325,7 +285,6 @@ class DashboardPage(QWidget):
         self.ex_kpi_val_size = QSpinBox()
         self.ex_kpi_val_size.setRange(10, 48)
         self.ex_kpi_val_size.setValue(int(self.bridge.get("ex_kpi_val_size", _STYLE_DEFAULTS["ex_kpi_val_size"])))
-        self.ex_kpi_val_size.setStyleSheet(self._input_style())
         self.ex_kpi_val_size.valueChanged.connect(lambda v: self._on_field_changed("ex_kpi_val_size", v))
         kpi_text_form.addRow(self._form_label("Value size"), self.ex_kpi_val_size)
         layout.addWidget(kpi_text_group)
@@ -348,7 +307,6 @@ class DashboardPage(QWidget):
         """Shared 4-field pattern (font, style, size, color) used for both
         title and notes typography -- avoids writing the same block twice."""
         group = QGroupBox(title)
-        group.setStyleSheet(self._group_box_style())
         form = QFormLayout(group)
         form.setContentsMargins(12, 14, 12, 12)
         form.setSpacing(6)
@@ -356,7 +314,6 @@ class DashboardPage(QWidget):
         font_key = f"{prefix}_font"
         font_combo = QFontComboBox()
         font_combo.setCurrentFont(QFont(self.bridge.get(font_key, _STYLE_DEFAULTS[font_key])))
-        font_combo.setStyleSheet(self._input_style())
         font_combo.currentFontChanged.connect(
             lambda f, k=font_key: self._on_field_changed(k, f.family())
         )
@@ -367,7 +324,6 @@ class DashboardPage(QWidget):
         style_combo = QComboBox()
         style_combo.addItems(["Normal", "Italic", "Bold"])
         style_combo.setCurrentText(self.bridge.get(style_key, _STYLE_DEFAULTS[style_key]))
-        style_combo.setStyleSheet(self._input_style())
         style_combo.currentTextChanged.connect(
             lambda v, k=style_key: self._on_field_changed(k, v)
         )
@@ -378,7 +334,6 @@ class DashboardPage(QWidget):
         size_spin = QSpinBox()
         size_spin.setRange(8, 72)
         size_spin.setValue(int(self.bridge.get(size_key, _STYLE_DEFAULTS[size_key])))
-        size_spin.setStyleSheet(self._input_style())
         size_spin.valueChanged.connect(
             lambda v, k=size_key: self._on_field_changed(k, v)
         )
@@ -410,7 +365,7 @@ class DashboardPage(QWidget):
         for key, swatch in self._color_swatches.items():
             color = style.get(key, _STYLE_DEFAULTS.get(key, "#000000"))
             swatch.setStyleSheet(
-                f"background:{color}; border:1px solid #334155; border-radius:4px;"
+                f"background:{color}; border:1px solid palette(mid); border-radius:4px;"
             )
 
         self.ex_density.setCurrentText(style.get("ex_density", "Comfortable"))
@@ -443,7 +398,7 @@ class DashboardPage(QWidget):
         swatch.setFixedSize(32, 22)
         swatch.setCursor(Qt.PointingHandCursor)
         swatch.setStyleSheet(
-            f"background:{current}; border:1px solid #334155; border-radius:4px;"
+            f"background:{current}; border:1px solid palette(mid); border-radius:4px;"
         )
 
         def pick():
@@ -451,7 +406,7 @@ class DashboardPage(QWidget):
             if color.isValid():
                 hexval = color.name()
                 swatch.setStyleSheet(
-                    f"background:{hexval}; border:1px solid #334155; border-radius:4px;"
+                    f"background:{hexval}; border:1px solid palette(mid); border-radius:4px;"
                 )
                 self._on_field_changed(key, hexval)
 
@@ -462,29 +417,17 @@ class DashboardPage(QWidget):
     @staticmethod
     def _form_label(text: str) -> QLabel:
         lbl = QLabel(text)
-        lbl.setStyleSheet("font-size: 12px; color: #94a3b8;")
+        lbl.setProperty("class", "muted")
+        lbl.setStyleSheet("font-size: 12px;")
         return lbl
 
     @staticmethod
     def _group_box_style() -> str:
-        return (
-            "QGroupBox {"
-            "  color: #cbd5e1; font-size: 12px; font-weight: 600;"
-            "  border: 1px solid #1e293b; border-radius: 8px;"
-            "  margin-top: 8px; padding-top: 4px;"
-            "}"
-            "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }"
-        )
+        return "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }"
 
     @staticmethod
     def _input_style() -> str:
-        return (
-            "QLineEdit, QComboBox, QSpinBox, QFontComboBox {"
-            "  background: #1e293b; color: #e2e8f0;"
-            "  border: 1px solid #334155; border-radius: 6px;"
-            "  padding: 4px 8px; font-size: 12px;"
-            "}"
-        )
+        return _theme_mod.input_style()
 
     # -- Signal connections -------------------------------------------------
 
@@ -574,30 +517,24 @@ class DashboardPage(QWidget):
         df = self.bridge.df
         if df is None or df.empty:
             QMessageBox.warning(self, "No Data", "Load a dataset before adding KPIs.")
-            return
 
         cols = num_cols(df)
         if not cols:
             QMessageBox.warning(self, "No Numeric Columns", "No numeric columns available to aggregate.")
-            return
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Add KPI")
-        dialog.setStyleSheet("QDialog { background: #0f172a; color: #e2e8f0; }")
         form = QFormLayout(dialog)
 
         label_edit = QLineEdit()
-        label_edit.setStyleSheet(self._input_style())
         form.addRow(self._form_label("Label"), label_edit)
 
         col_combo = QComboBox()
         col_combo.addItems(cols)
-        col_combo.setStyleSheet(self._input_style())
         form.addRow(self._form_label("Column"), col_combo)
 
         agg_combo = QComboBox()
         agg_combo.addItems(["Sum", "Average", "Count", "Min", "Max"])
-        agg_combo.setStyleSheet(self._input_style())
         form.addRow(self._form_label("Aggregation"), agg_combo)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -627,7 +564,6 @@ class DashboardPage(QWidget):
             value_str = f"{value:,.2f}" if isinstance(value, float) else f"{value:,}"
         except Exception as exc:
             QMessageBox.critical(self, "KPI Error", f"Could not compute KPI: {exc}")
-            return
 
         kpis = list(self.bridge.get("kpis", []))
         kpis.append({"label": label, "value": value_str})
@@ -671,7 +607,6 @@ class DashboardPage(QWidget):
         charts = self.bridge.get("charts", [])
         if not charts:
             QMessageBox.warning(self, "No Charts", "No charts to export.")
-            return
 
         session_name = self.session_name.text().strip() or "Lytrize Report"
         dash_title = self.dash_title.text().strip() or session_name
@@ -735,7 +670,6 @@ class DashboardPage(QWidget):
         charts = self.bridge.get("charts", [])
         if not charts:
             QMessageBox.warning(self, "No Charts", "No charts to export.")
-            return
 
         session_name = self.session_name.text().strip() or "Lytrize Report"
         dash_title = self.dash_title.text().strip() or session_name
@@ -768,7 +702,6 @@ class DashboardPage(QWidget):
         export button was clicked."""
         if getattr(self, "_export_format", "html") == "png":
             self._render_html_to_png(html, safe_file)
-            return
 
         self.btn_export.setEnabled(True)
         self.btn_export.setText("⬇️ Export HTML")
@@ -811,7 +744,6 @@ class DashboardPage(QWidget):
             QMessageBox.critical(self, "PNG Export Unavailable",
                                  "QtWebEngine is not available in this build, "
                                  "so PNG rendering can't run. HTML export still works.")
-            return
 
         width_map = {"Auto": 1200, "Narrow": 1000, "Wide": 1500, "Full": 1200}
         render_width = width_map.get(self._current_style_dict().get("ex_width", "Auto"), 1200)
@@ -840,7 +772,6 @@ class DashboardPage(QWidget):
         def on_load_finished(ok: bool) -> None:
             if not ok:
                 self._finish_png_export(None, safe_file)
-                return
 
             def on_height(height):
                 try:
@@ -875,7 +806,6 @@ class DashboardPage(QWidget):
             QMessageBox.critical(self, "PNG Export Failed",
                                  "Could not render the dashboard to an image.")
             self._png_render_view = None
-            return
 
         file_path, _ = QFileDialog.getSaveFileName(
             self, "Save Dashboard as Image", str(Path.home() / f"{safe_file}.png"),
@@ -904,12 +834,10 @@ class DashboardPage(QWidget):
         charts = self.bridge.get("charts", [])
         if not charts:
             QMessageBox.warning(self, "No Charts", "No charts to save.")
-            return
 
         user_id = self.bridge.get("user_id")
         if not user_id:
             QMessageBox.warning(self, "No User", "No user session found.")
-            return
 
         session_name = self.session_name.text().strip() or "Lytrize Session"
         dash_title = self.dash_title.text().strip()

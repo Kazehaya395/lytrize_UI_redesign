@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
 )
 
+from desktop.theme import PAGE_MARGINS
 from desktop.session_bridge import SessionBridge
 from desktop.widgets.dataframe_model import DataFrameModel
 from desktop.workers import ImportWorker
@@ -32,6 +33,7 @@ from desktop.pages.data_cleaner_panel import DataCleanerPanel
 from desktop.pages.dtype_transformer_panel import DtypeTransformerPanel
 from desktop.pages.excel_loader_panel import ExcelLoaderPanel
 from modules.utils.perf import read_csv_fast, mem_mb
+from services.transform_service import classify_columns
 
 log = logging.getLogger(__name__)
 
@@ -79,30 +81,24 @@ class UploadPage(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 24, 24, 24)
+        root.setContentsMargins(*PAGE_MARGINS)
         root.setSpacing(12)
 
         # -- Header --
         header = QHBoxLayout()
         title = QLabel("📂 Upload Dataset")
-        title.setStyleSheet("font-size: 20px; font-weight: 700; color: #e2e8f0;")
+        title.setProperty("class", "pageTitle")
         header.addWidget(title)
         header.addStretch()
 
         self.btn_import = QPushButton("📁 Import CSV / Excel")
-        self.btn_import.setStyleSheet(
-            "QPushButton {"
-            "  background: #4f46e5; color: white; border: none;"
-            "  border-radius: 8px; padding: 8px 16px; font-weight: 600;"
-            "}"
-            "QPushButton:hover { background: #6366f1; }"
-        )
+        self.btn_import.setProperty("kind", "primary")
         header.addWidget(self.btn_import)
         root.addLayout(header)
 
         # -- File info --
         self.lbl_file = QLabel("No file loaded")
-        self.lbl_file.setStyleSheet("font-size: 13px; color: #94a3b8;")
+        self.lbl_file.setProperty("class", "muted")
         root.addWidget(self.lbl_file)
 
         # -- Progress bar (hidden until import) --
@@ -121,45 +117,21 @@ class UploadPage(QWidget):
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("🔍 Search rows…")
         self.search_box.setClearButtonEnabled(True)
-        self.search_box.setStyleSheet(
-            "QLineEdit {"
-            "  background: #1e293b; color: #e2e8f0; border: 1px solid #334155;"
-            "  border-radius: 6px; padding: 6px 10px;"
-            "}"
-        )
+
         controls.addWidget(self.search_box, stretch=1)
 
         self.preview_mode = QComboBox()
         self.preview_mode.addItems(["Top 10", "Bottom 10", "Random 10", "All rows"])
-        self.preview_mode.setStyleSheet(
-            "QComboBox {"
-            "  background: #1e293b; color: #e2e8f0; border: 1px solid #334155;"
-            "  border-radius: 6px; padding: 6px 10px;"
-            "}"
-        )
+
         controls.addWidget(self.preview_mode)
 
         self.btn_go_analysis = QPushButton("📊 Go to Analysis →")
-        self.btn_go_analysis.setStyleSheet(
-            "QPushButton {"
-            "  background: #10b981; color: white; border: none;"
-            "  border-radius: 8px; padding: 8px 16px; font-weight: 600;"
-            "}"
-            "QPushButton:hover { background: #34d399; }"
-            "QPushButton:disabled { background: #1e293b; color: #475569; }"
-        )
+        self.btn_go_analysis.setProperty("kind", "success")
         self.btn_go_analysis.setEnabled(False)
         controls.addWidget(self.btn_go_analysis)
 
         self.btn_save_csv = QPushButton("💾 Save CSV")
-        self.btn_save_csv.setStyleSheet(
-            "QPushButton {"
-            "  background: #6366f1; color: white; border: none;"
-            "  border-radius: 8px; padding: 8px 16px; font-weight: 600;"
-            "}"
-            "QPushButton:hover { background: #818cf8; }"
-            "QPushButton:disabled { background: #1e293b; color: #475569; }"
-        )
+        self.btn_save_csv.setProperty("kind", "primary")
         self.btn_save_csv.setEnabled(False)
         self.btn_save_csv.clicked.connect(self._on_save_csv)
         controls.addWidget(self.btn_save_csv)
@@ -168,7 +140,8 @@ class UploadPage(QWidget):
 
         # -- Stats label --
         self.lbl_stats = QLabel("")
-        self.lbl_stats.setStyleSheet("font-size: 12px; color: #64748b;")
+        self.lbl_stats.setProperty("class", "faint")
+        self.lbl_stats.setStyleSheet("font-size: 12px;")
         root.addWidget(self.lbl_stats)
 
         # -- Filter row --
@@ -192,30 +165,10 @@ class UploadPage(QWidget):
         # row sizing on each pass; a fixed height sidesteps that entirely.
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.table.verticalHeader().setDefaultSectionSize(28)
-        self.table.setStyleSheet(
-            "QTableView {"
-            "  background: #0f172a; color: #e2e8f0;"
-            "  border: 1px solid #1e293b; border-radius: 8px;"
-            "  gridline-color: #1e293b;"
-            "}"
-            "QTableView::item:selected { background: rgba(99,102,241,0.3); }"
-            "QHeaderView::section {"
-            "  background: #1e293b; color: #94a3b8;"
-            "  border: none; padding: 6px; font-weight: 600;"
-            "}"
-        )
+
         # -- Transform Tools Tabs (hidden until data loaded) --
         self._transform_tabs = QTabWidget()
-        self._transform_tabs.setStyleSheet(
-            "QTabWidget { background: transparent; }"
-            "QTabBar::tab {"
-            "  background: #1e293b; color: #94a3b8;"
-            "  border: 1px solid #334155; border-bottom: none;"
-            "  border-top-left-radius: 6px; border-top-right-radius: 6px;"
-            "  padding: 8px 16px; font-size: 12px;"
-            "}"
-            "QTabBar::tab:selected { background: #0f172a; color: #e2e8f0; }"
-        )
+
 
         # Column Classification tab -- goes first since classifying column
         # types is the natural first step after import, before cleaning
@@ -255,10 +208,6 @@ class UploadPage(QWidget):
         # between them (a splitter with only one child renders no usable handle).
         splitter = QSplitter(Qt.Vertical)
         splitter.setHandleWidth(6)
-        splitter.setStyleSheet(
-            "QSplitter::handle { background: #1e293b; }"
-            "QSplitter::handle:hover { background: #334155; }"
-        )
         splitter.addWidget(self.table)
 
         # Wrap the transform-tools tab widget in a QScrollArea rather than
@@ -276,9 +225,6 @@ class UploadPage(QWidget):
         # control panel.
         self._transform_scroll = QScrollArea()
         self._transform_scroll.setWidgetResizable(True)
-        self._transform_scroll.setStyleSheet(
-            "QScrollArea { background: transparent; border: none; }"
-        )
         self._transform_scroll.setWidget(self._transform_tabs)
         self._transform_scroll.setVisible(False)
         splitter.addWidget(self._transform_scroll)
@@ -309,6 +255,13 @@ class UploadPage(QWidget):
         self.search_box.textChanged.connect(self._on_search)
         self.bridge.df_changed.connect(self._on_df_changed)
         self.classification_ready.connect(self._on_classification_ready)
+        self.bridge.theme_changed.connect(self._on_theme_changed)
+
+    def _on_theme_changed(self, _mode: str) -> None:
+        """Re-resolve model header colors + repolish the view after a
+        dark/light toggle (the global QSS is palette-driven and updates
+        itself; only model-provided colors need an explicit reset)."""
+        self._model.on_theme_changed()
 
     # -- Slots ---------------------------------------------------------------
 
@@ -471,18 +424,75 @@ class UploadPage(QWidget):
 
     # -- Helpers -------------------------------------------------------------
 
+    @staticmethod
+    def _value_sig(series: pd.Series) -> tuple:
+        """Fingerprint a column's value profile (dtype + sampled value types).
+
+        pandas dtype strings alone can't detect date/time conversions
+        (string 'object' -> date/time objects is object -> object), so the
+        sample of actual value types is part of the signature.
+        """
+        non_null = series.dropna()
+        types = tuple(sorted({type(v).__name__ for v in non_null.iloc[:20]}))
+        return (str(series.dtype), types)
+
+    def _effective_classification(self, df: pd.DataFrame) -> tuple:
+        """Resolve the active column families for the current df.
+
+        Starts from the user-confirmed classification (bridge), but re-derives
+        any column whose value profile changed since that confirmation (Dtype
+        Transformer conversions like 'Convert to time' produce datetime.time
+        objects in an object-dtype column), so the stats label and the bridge
+        stay in sync with what Analysis will actually use. Unchanged columns
+        keep the user's explicit family.
+        """
+        num = list(self.bridge.get("num_cols") or [])
+        cat = list(self.bridge.get("cat_cols") or [])
+        dt = list(self.bridge.get("dt_cols") or [])
+        fpsig = self.bridge.get("cls_value_sig") or {}
+        cur = {c: self._value_sig(df[c]) for c in df.columns}
+
+        if fpsig and cur == fpsig:
+            # Classification still current -- honor user intent verbatim.
+            return num, cat, dt
+
+        # Re-derive families ONLY for changed/new columns; unchanged columns
+        # keep the user's explicit choice.
+        changed = {c for c in df.columns if cur[c] != fpsig.get(c)}
+        if changed:
+            auto = classify_columns(df[list(changed)])
+        else:
+            auto = {"numeric": [], "categorical": [], "datetime": []}
+        num = [c for c in num if c in df.columns and c not in changed] + auto["numeric"]
+        cat = [c for c in cat if c in df.columns and c not in changed] + auto["categorical"]
+        dt = [c for c in dt if c in df.columns and c not in changed] + auto["datetime"]
+
+        # Persist so Analysis / other pages agree with what the label shows.
+        self.bridge.set("num_cols", num)
+        self.bridge.set("cat_cols", cat)
+        self.bridge.set("dt_cols", dt)
+        self.bridge.set("cls_value_sig", cur)
+        return num, cat, dt
+
     def _update_preview_label(self) -> None:
-        """Update the stats label with column type counts."""
+        """Update the stats label with column type counts.
+
+        Counts mirror the app's pipeline truth via
+        ``_effective_classification``: the user-confirmed Column
+        Classification (bridge keys num_cols/cat_cols/dt_cols), self-healed
+        after dtype conversions -- NOT raw pandas dtypes, which disagree
+        with the pipeline (e.g. a column converted to 'date'/'time' keeps
+        pandas dtype ``object`` but is datetime-family for analysis).
+        """
         df = self.bridge.df
         if df is None:
             self.lbl_stats.setText("")
             return
 
-        num_c = len(df.select_dtypes("number").columns)
-        cat_c = len(df.select_dtypes("object").columns)
-        dt_c = len(df.select_dtypes("datetime").columns)
+        num_cols, cat_cols, dt_cols = self._effective_classification(df)
         self.lbl_stats.setText(
-            f"🔢 {num_c} numeric  ·  🔤 {cat_c} text  ·  📅 {dt_c} datetime"
+            f"🔢 {len(num_cols)} numeric  ·  🔤 {len(cat_cols)} text"
+            f"  ·  📅 {len(dt_cols)} datetime"
         )
 
     def _build_filter_row(self, df: pd.DataFrame) -> None:
@@ -500,14 +510,7 @@ class UploadPage(QWidget):
             inp = QLineEdit()
             inp.setPlaceholderText(f"Filter {col}")
             inp.setClearButtonEnabled(True)
-            inp.setStyleSheet(
-                "QLineEdit {"
-                "  background: #1e293b; color: #e2e8f0; border: 1px solid #334155;"
-                "  border-radius: 4px; padding: 4px 6px; font-size: 11px;"
-                "  min-width: 80px;"
-                "}"
-                "QLineEdit:focus { border-color: #6366f1; }"
-            )
+            inp.setStyleSheet("QLineEdit { font-size: 11px; min-width: 80px; padding: 4px 6px; }")
             inp.textChanged.connect(lambda text, c=col: self._filter_timer.start())
             self._filter_inputs.append(inp)
             self.filter_row.layout().addWidget(inp)
@@ -536,13 +539,37 @@ class UploadPage(QWidget):
     def _on_operation_applied(self, message: str) -> None:
         """Show a status message when a transform operation succeeds."""
         self.lbl_file.setText(message)
-        # Refresh all panels with current data
+        # Refresh everything that reflects dtype/shape: the main grid
+        # (filter-aware), the stats label, and all transform panels. Some
+        # panels mutate the df and only emit `operation_applied` (without
+        # set_df), so this is the single guaranteed sync point.
         df = self.bridge.df
+        self._update_preview_label()
+        self._refresh_table_preserving_filter()
         if df is not None:
             self._column_manager_panel.set_dataframe(df)
             self._data_cleaner_panel.set_dataframe(df)
             self._dtype_transformer_panel.set_dataframe(df)
             self.btn_save_csv.setEnabled(True)
+
+    def _refresh_table_preserving_filter(self) -> None:
+        """Re-render the preview grid from the current bridge df, keeping
+        the active search filter / preview mode so an operation does not
+        silently reset the user's view."""
+        df = self.bridge.df
+        if df is None:
+            self._model.set_dataframe(pd.DataFrame())
+            return
+        text = getattr(self, "_pending_search_text", "") or ""
+        if text.strip():
+            try:
+                mask = df.astype(str).apply(
+                    lambda col: col.str.contains(text, case=False, na=False)
+                ).any(axis=1)
+                df = df[mask]
+            except Exception as exc:
+                log.warning("Filter re-apply failed: %s", exc)
+        self._model.set_dataframe(df)
 
     def _on_save_csv(self) -> None:
         """Save the current DataFrame to a CSV file."""
@@ -599,6 +626,10 @@ class UploadPage(QWidget):
         self.bridge.set("num_cols", classification.get("numeric", []))
         self.bridge.set("cat_cols", classification.get("categorical", []))
         self.bridge.set("dt_cols", classification.get("datetime", []))
+        # Baseline the value-profile fingerprint NOW so later Dtype
+        # Transformer conversions (string -> date/time objects) are detected
+        # as changes and the stats label re-derives those columns.
+        self._update_preview_label()
         # Emit signal to navigate to analysis
         self.classification_ready.emit(classification)
 

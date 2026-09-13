@@ -29,27 +29,7 @@ from modules.analysis.outlier import detect_outliers, remove_outlier_rows
 
 log = logging.getLogger(__name__)
 
-_INPUT_STYLE = (
-    "QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {"
-    "  background: #1e293b; color: #e2e8f0; border: 1px solid #334155;"
-    "  border-radius: 6px; padding: 5px 8px;"
-    "}"
-)
-_BTN_STYLE = (
-    "QPushButton {"
-    "  background: #4f46e5; color: white; border: none;"
-    "  border-radius: 6px; padding: 7px 14px; font-weight: 600;"
-    "}"
-    "QPushButton:hover { background: #6366f1; }"
-    "QPushButton:disabled { background: #1e293b; color: #475569; }"
-)
-_TABLE_STYLE = (
-    "QTableWidget {"
-    "  background: #0f172a; color: #e2e8f0; border: 1px solid #1e293b;"
-    "  gridline-color: #1e293b;"
-    "}"
-    "QHeaderView::section { background: #1e293b; color: #94a3b8; border: none; padding: 4px; }"
-)
+# Styling handled by global QSS (theme.py) via kind=primary and objectName selectors
 
 
 def _fill_preview_table(table: QTableWidget, df: pd.DataFrame) -> None:
@@ -92,7 +72,7 @@ class ColumnManagerTab(_BaseToolTab):
 
         self.action = QComboBox()
         self.action.addItems(["Add derived column", "Remove column", "Rename column"])
-        self.action.setStyleSheet(_INPUT_STYLE)
+        self.action
         root.addWidget(self.action)
 
         self.form_area = QWidget()
@@ -100,7 +80,7 @@ class ColumnManagerTab(_BaseToolTab):
         root.addWidget(self.form_area)
 
         self.btn_apply = QPushButton("✅ Apply")
-        self.btn_apply.setStyleSheet(_BTN_STYLE)
+        self.btn_apply.setProperty("kind", "primary")
         root.addWidget(self.btn_apply, alignment=Qt.AlignmentFlag.AlignLeft)
         root.addStretch()
 
@@ -121,7 +101,7 @@ class ColumnManagerTab(_BaseToolTab):
 
         if mode == "Add derived column":
             self.new_col_name = QLineEdit()
-            self.new_col_name.setStyleSheet(_INPUT_STYLE)
+            self.new_col_name
             self.form_layout.addRow("New column name", self.new_col_name)
 
             self.calc_type = QComboBox()
@@ -130,32 +110,32 @@ class ColumnManagerTab(_BaseToolTab):
                 "Column + Column", "Column − Column",
                 "Extract Date/Time Part", "Date Difference",
             ])
-            self.calc_type.setStyleSheet(_INPUT_STYLE)
+            self.calc_type
             self.form_layout.addRow("Calculation type", self.calc_type)
 
             self.formula_input = QLineEdit()
             self.formula_input.setPlaceholderText("e.g. `Sales` / `Units`")
-            self.formula_input.setStyleSheet(_INPUT_STYLE)
+            self.formula_input
             self.form_layout.addRow("Formula (use `Column Name`)", self.formula_input)
 
-            self.col_a = QComboBox(); self.col_a.addItems(num_cols); self.col_a.setStyleSheet(_INPUT_STYLE)
-            self.col_b = QComboBox(); self.col_b.addItems(num_cols); self.col_b.setStyleSheet(_INPUT_STYLE)
+            self.col_a = QComboBox(); self.col_a.addItems(num_cols); self.col_a
+            self.col_b = QComboBox(); self.col_b.addItems(num_cols); self.col_b
             self.form_layout.addRow("First column", self.col_a)
             self.form_layout.addRow("Second column", self.col_b)
 
-            self.date_col = QComboBox(); self.date_col.addItems(cols); self.date_col.setStyleSheet(_INPUT_STYLE)
-            self.date_part = QComboBox(); self.date_part.addItems(ts.DATE_PART_OPTIONS); self.date_part.setStyleSheet(_INPUT_STYLE)
+            self.date_col = QComboBox(); self.date_col.addItems(cols); self.date_col
+            self.date_part = QComboBox(); self.date_part.addItems(ts.DATE_PART_OPTIONS); self.date_part
             self.form_layout.addRow("Source date column", self.date_col)
             self.form_layout.addRow("Part to extract", self.date_part)
 
-            self.date_col_a = QComboBox(); self.date_col_a.addItems(cols); self.date_col_a.setStyleSheet(_INPUT_STYLE)
-            self.date_col_b = QComboBox(); self.date_col_b.addItems(["(today's date)"] + cols); self.date_col_b.setStyleSheet(_INPUT_STYLE)
+            self.date_col_a = QComboBox(); self.date_col_a.addItems(cols); self.date_col_a
+            self.date_col_b = QComboBox(); self.date_col_b.addItems(["(today's date)"] + cols); self.date_col_b
             self.date_unit = QComboBox()
             self.date_unit.addItems([
                 "Days", "Months", "Years", "Age (Years from DOB vs Today)",
                 "Previous Year (subtract 1 year)", "Previous Month (subtract 1 month)",
             ])
-            self.date_unit.setStyleSheet(_INPUT_STYLE)
+            self.date_unit
             self.form_layout.addRow("Start date column", self.date_col_a)
             self.form_layout.addRow("End date column", self.date_col_b)
             self.form_layout.addRow("Difference unit", self.date_unit)
@@ -174,12 +154,12 @@ class ColumnManagerTab(_BaseToolTab):
             sync_visibility()
 
         elif mode == "Remove column":
-            self.col_remove = QComboBox(); self.col_remove.addItems(cols); self.col_remove.setStyleSheet(_INPUT_STYLE)
+            self.col_remove = QComboBox(); self.col_remove.addItems(cols); self.col_remove
             self.form_layout.addRow("Column to remove", self.col_remove)
 
         elif mode == "Rename column":
-            self.col_rename = QComboBox(); self.col_rename.addItems(cols); self.col_rename.setStyleSheet(_INPUT_STYLE)
-            self.new_name = QLineEdit(); self.new_name.setStyleSheet(_INPUT_STYLE)
+            self.col_rename = QComboBox(); self.col_rename.addItems(cols); self.col_rename
+            self.new_name = QLineEdit(); self.new_name
             self.form_layout.addRow("Column to rename", self.col_rename)
             self.form_layout.addRow("New name", self.new_name)
 
@@ -240,27 +220,27 @@ class DtypeTransformerTab(_BaseToolTab):
         root.setSpacing(10)
 
         row = QHBoxLayout()
-        self.col_select = QComboBox(); self.col_select.setStyleSheet(_INPUT_STYLE)
-        self.dtype_select = QComboBox(); self.dtype_select.addItems(ts.DTYPE_OPTIONS); self.dtype_select.setStyleSheet(_INPUT_STYLE)
+        self.col_select = QComboBox(); self.col_select
+        self.dtype_select = QComboBox(); self.dtype_select.addItems(ts.DTYPE_OPTIONS); self.dtype_select
         row.addWidget(QLabel("Column:")); row.addWidget(self.col_select, stretch=1)
         row.addWidget(QLabel("Convert to:")); row.addWidget(self.dtype_select, stretch=1)
         root.addLayout(row)
 
         self.btn_preview = QPushButton("👁 Preview conversion")
-        self.btn_preview.setStyleSheet(_BTN_STYLE)
+        self.btn_preview.setProperty("kind", "primary")
         root.addWidget(self.btn_preview, alignment=Qt.AlignmentFlag.AlignLeft)
 
         self.lbl_result = QLabel("")
-        self.lbl_result.setStyleSheet("color: #94a3b8; font-size: 12px;")
+        self.lbl_result.setProperty("class", "muted")
         root.addWidget(self.lbl_result)
 
         self.preview_table = QTableWidget()
-        self.preview_table.setStyleSheet(_TABLE_STYLE)
+        self.preview_table
         self.preview_table.setMaximumHeight(220)
         root.addWidget(self.preview_table)
 
         self.btn_apply = QPushButton("✅ Apply conversion")
-        self.btn_apply.setStyleSheet(_BTN_STYLE)
+        self.btn_apply.setProperty("kind", "primary")
         self.btn_apply.setEnabled(False)
         root.addWidget(self.btn_apply, alignment=Qt.AlignmentFlag.AlignLeft)
         root.addStretch()
@@ -319,7 +299,7 @@ class DataCleanerTab(_BaseToolTab):
             "Text clean", "Find & replace", "Validate column",
             "String operations", "Numeric clean",
         ])
-        self.op_select.setStyleSheet(_INPUT_STYLE)
+        self.op_select
         root.addWidget(self.op_select)
 
         self.form_area = QWidget()
@@ -327,21 +307,21 @@ class DataCleanerTab(_BaseToolTab):
         root.addWidget(self.form_area)
 
         self.btn_preview = QPushButton("👁 Preview")
-        self.btn_preview.setStyleSheet(_BTN_STYLE)
+        self.btn_preview.setProperty("kind", "primary")
         root.addWidget(self.btn_preview, alignment=Qt.AlignmentFlag.AlignLeft)
 
         self.lbl_result = QLabel("")
-        self.lbl_result.setStyleSheet("color: #94a3b8; font-size: 12px;")
+        self.lbl_result.setProperty("class", "muted")
         self.lbl_result.setWordWrap(True)
         root.addWidget(self.lbl_result)
 
         self.preview_table = QTableWidget()
-        self.preview_table.setStyleSheet(_TABLE_STYLE)
+        self.preview_table
         self.preview_table.setMaximumHeight(220)
         root.addWidget(self.preview_table)
 
         self.btn_apply = QPushButton("✅ Apply")
-        self.btn_apply.setStyleSheet(_BTN_STYLE)
+        self.btn_apply.setProperty("kind", "primary")
         self.btn_apply.setEnabled(False)
         root.addWidget(self.btn_apply, alignment=Qt.AlignmentFlag.AlignLeft)
         root.addStretch()
@@ -376,7 +356,7 @@ class DataCleanerTab(_BaseToolTab):
         op = self.op_select.currentText()
 
         if op == "Text clean":
-            self.tc_col = QComboBox(); self.tc_col.addItems(self._str_cols()); self.tc_col.setStyleSheet(_INPUT_STYLE)
+            self.tc_col = QComboBox(); self.tc_col.addItems(self._str_cols()); self.tc_col
             self.form_layout.addRow("Column", self.tc_col)
             self.tc_checks = {}
             grid_w = QWidget()
@@ -396,9 +376,9 @@ class DataCleanerTab(_BaseToolTab):
             self.form_layout.addRow(grid_w)
 
         elif op == "Find & replace":
-            self.fr_col = QComboBox(); self.fr_col.addItems(self._str_cols()); self.fr_col.setStyleSheet(_INPUT_STYLE)
-            self.fr_find = QLineEdit(); self.fr_find.setStyleSheet(_INPUT_STYLE)
-            self.fr_replace = QLineEdit(); self.fr_replace.setStyleSheet(_INPUT_STYLE)
+            self.fr_col = QComboBox(); self.fr_col.addItems(self._str_cols()); self.fr_col
+            self.fr_find = QLineEdit(); self.fr_find
+            self.fr_replace = QLineEdit(); self.fr_replace
             self.fr_regex = QCheckBox("Use regular expression")
             self.fr_ci = QCheckBox("Case-insensitive")
             self.form_layout.addRow("Column", self.fr_col)
@@ -408,15 +388,15 @@ class DataCleanerTab(_BaseToolTab):
             self.form_layout.addRow(self.fr_ci)
 
         elif op == "Validate column":
-            self.val_col = QComboBox(); self.val_col.addItems(list(self.df.columns) if self.df is not None else []); self.val_col.setStyleSheet(_INPUT_STYLE)
+            self.val_col = QComboBox(); self.val_col.addItems(list(self.df.columns) if self.df is not None else []); self.val_col
             self.val_pattern = QComboBox()
             self.val_pattern.addItems(list(ts.VALIDATION_PATTERNS.keys()) + ["Custom regex…"])
-            self.val_pattern.setStyleSheet(_INPUT_STYLE)
+            self.val_pattern
             self.val_custom = QLineEdit(); self.val_custom.setPlaceholderText(r"e.g. ^\d{4}-\d{2}-\d{2}$")
-            self.val_custom.setStyleSheet(_INPUT_STYLE)
+            self.val_custom
             self.val_action = QComboBox()
             self.val_action.addItems(["Just report", "Replace failing values with NaN", "Add validity flag column"])
-            self.val_action.setStyleSheet(_INPUT_STYLE)
+            self.val_action
             self.form_layout.addRow("Column", self.val_col)
             self.form_layout.addRow("Validation rule", self.val_pattern)
             self.form_layout.addRow("Custom pattern", self.val_custom)
@@ -429,16 +409,16 @@ class DataCleanerTab(_BaseToolTab):
                 "Split column by delimiter", "Concatenate two columns",
                 "Extract with regex capture group",
             ])
-            self.so_op.setStyleSheet(_INPUT_STYLE)
-            self.so_col = QComboBox(); self.so_col.addItems(self._str_cols()); self.so_col.setStyleSheet(_INPUT_STYLE)
-            self.so_col2 = QComboBox(); self.so_col2.addItems(list(self.df.columns) if self.df is not None else []); self.so_col2.setStyleSheet(_INPUT_STYLE)
-            self.so_len = QSpinBox(); self.so_len.setRange(1, 1000); self.so_len.setValue(50); self.so_len.setStyleSheet(_INPUT_STYLE)
-            self.so_start = QSpinBox(); self.so_start.setRange(0, 999); self.so_start.setStyleSheet(_INPUT_STYLE)
-            self.so_end = QSpinBox(); self.so_end.setRange(0, 999); self.so_end.setStyleSheet(_INPUT_STYLE)
-            self.so_delim = QLineEdit(","); self.so_delim.setStyleSheet(_INPUT_STYLE)
-            self.so_sep = QLineEdit(" "); self.so_sep.setStyleSheet(_INPUT_STYLE)
-            self.so_regex = QLineEdit(); self.so_regex.setPlaceholderText(r"e.g. (\d{4})"); self.so_regex.setStyleSheet(_INPUT_STYLE)
-            self.so_new_col = QLineEdit(); self.so_new_col.setStyleSheet(_INPUT_STYLE)
+            self.so_op
+            self.so_col = QComboBox(); self.so_col.addItems(self._str_cols()); self.so_col
+            self.so_col2 = QComboBox(); self.so_col2.addItems(list(self.df.columns) if self.df is not None else []); self.so_col2
+            self.so_len = QSpinBox(); self.so_len.setRange(1, 1000); self.so_len.setValue(50); self.so_len
+            self.so_start = QSpinBox(); self.so_start.setRange(0, 999); self.so_start
+            self.so_end = QSpinBox(); self.so_end.setRange(0, 999); self.so_end
+            self.so_delim = QLineEdit(","); self.so_delim
+            self.so_sep = QLineEdit(" "); self.so_sep
+            self.so_regex = QLineEdit(); self.so_regex.setPlaceholderText(r"e.g. (\d{4})"); self.so_regex
+            self.so_new_col = QLineEdit(); self.so_new_col
             self.form_layout.addRow("Operation", self.so_op)
             self.form_layout.addRow("Source column", self.so_col)
             self.form_layout.addRow("Second column", self.so_col2)
@@ -464,7 +444,7 @@ class DataCleanerTab(_BaseToolTab):
             sync()
 
         else:  # Numeric clean
-            self.nc_col = QComboBox(); self.nc_col.addItems(self._num_cols()); self.nc_col.setStyleSheet(_INPUT_STYLE)
+            self.nc_col = QComboBox(); self.nc_col.addItems(self._num_cols()); self.nc_col
             self.nc_op = QComboBox()
             self.nc_op.addItems([
                 "Clamp to min/max range", "Fill outliers (IQR) with median",
@@ -472,12 +452,12 @@ class DataCleanerTab(_BaseToolTab):
                 "Scale to 0-1 (min-max)", "Z-score standardisation",
                 "Fill NaN with median", "Fill NaN with mean", "Fill NaN with custom value",
             ])
-            self.nc_op.setStyleSheet(_INPUT_STYLE)
-            self.nc_min = QDoubleSpinBox(); self.nc_min.setRange(-1e12, 1e12); self.nc_min.setStyleSheet(_INPUT_STYLE)
-            self.nc_max = QDoubleSpinBox(); self.nc_max.setRange(-1e12, 1e12); self.nc_max.setStyleSheet(_INPUT_STYLE)
-            self.nc_iqr = QDoubleSpinBox(); self.nc_iqr.setRange(1.0, 3.0); self.nc_iqr.setValue(1.5); self.nc_iqr.setSingleStep(0.1); self.nc_iqr.setStyleSheet(_INPUT_STYLE)
-            self.nc_decimals = QSpinBox(); self.nc_decimals.setRange(0, 10); self.nc_decimals.setValue(2); self.nc_decimals.setStyleSheet(_INPUT_STYLE)
-            self.nc_fill = QDoubleSpinBox(); self.nc_fill.setRange(-1e12, 1e12); self.nc_fill.setStyleSheet(_INPUT_STYLE)
+            self.nc_op
+            self.nc_min = QDoubleSpinBox(); self.nc_min.setRange(-1e12, 1e12); self.nc_min
+            self.nc_max = QDoubleSpinBox(); self.nc_max.setRange(-1e12, 1e12); self.nc_max
+            self.nc_iqr = QDoubleSpinBox(); self.nc_iqr.setRange(1.0, 3.0); self.nc_iqr.setValue(1.5); self.nc_iqr.setSingleStep(0.1); self.nc_iqr
+            self.nc_decimals = QSpinBox(); self.nc_decimals.setRange(0, 10); self.nc_decimals.setValue(2); self.nc_decimals
+            self.nc_fill = QDoubleSpinBox(); self.nc_fill.setRange(-1e12, 1e12); self.nc_fill
             self.form_layout.addRow("Column", self.nc_col)
             self.form_layout.addRow("Operation", self.nc_op)
             self.form_layout.addRow("Min", self.nc_min)
@@ -637,7 +617,7 @@ class DataQualityTab(_BaseToolTab):
 
         root = QVBoxLayout(self)
         self.btn_run = QPushButton("🔍 Run Data Quality Analysis")
-        self.btn_run.setStyleSheet(_BTN_STYLE)
+        self.btn_run.setProperty("kind", "primary")
         root.addWidget(self.btn_run, alignment=Qt.AlignmentFlag.AlignLeft)
 
         self.results_area = QVBoxLayout()
@@ -690,31 +670,31 @@ class OutlierTab(_BaseToolTab):
 
         row = QHBoxLayout()
         self.mult = QDoubleSpinBox(); self.mult.setRange(0.5, 5.0); self.mult.setValue(1.5); self.mult.setSingleStep(0.5)
-        self.mult.setStyleSheet(_INPUT_STYLE)
+        self.mult
         row.addWidget(QLabel("IQR multiplier:")); row.addWidget(self.mult)
         row.addStretch()
         root.addLayout(row)
 
         self.col_list = QListWidget()
-        self.col_list.setStyleSheet(_TABLE_STYLE)
+        self.col_list
         self.col_list.setMaximumHeight(120)
         root.addWidget(self.col_list)
 
         self.btn_detect = QPushButton("🔍 Detect Outliers")
-        self.btn_detect.setStyleSheet(_BTN_STYLE)
+        self.btn_detect.setProperty("kind", "primary")
         root.addWidget(self.btn_detect, alignment=Qt.AlignmentFlag.AlignLeft)
 
         self.lbl_result = QLabel("")
-        self.lbl_result.setStyleSheet("color: #94a3b8; font-size: 12px;")
+        self.lbl_result.setProperty("class", "muted")
         root.addWidget(self.lbl_result)
 
         self.summary_table = QTableWidget()
-        self.summary_table.setStyleSheet(_TABLE_STYLE)
+        self.summary_table
         self.summary_table.setMaximumHeight(180)
         root.addWidget(self.summary_table)
 
         self.btn_delete_all = QPushButton("🗑️ Delete all flagged outlier rows")
-        self.btn_delete_all.setStyleSheet(_BTN_STYLE.replace("#4f46e5", "#ef4444").replace("#6366f1", "#f87171"))
+        self.btn_delete_all.setProperty("kind", "danger")
         self.btn_delete_all.setEnabled(False)
         root.addWidget(self.btn_delete_all, alignment=Qt.AlignmentFlag.AlignLeft)
         root.addStretch()

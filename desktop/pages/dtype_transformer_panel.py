@@ -52,7 +52,7 @@ class DtypeTransformerPanel(QWidget):
 
         # -- Header --
         header = QLabel("🔍 Data Type Inspector & Transformer")
-        header.setStyleSheet("font-size: 16px; font-weight: 700; color: #e2e8f0;")
+        header.setProperty("class", "sectionTitle")
         root.addWidget(header)
 
         # -- Current dtypes table --
@@ -60,9 +60,7 @@ class DtypeTransformerPanel(QWidget):
         self.table_dtypes.setColumnCount(3)
         self.table_dtypes.setHorizontalHeaderLabels(["Column", "Current Dtype", "Sample Value"])
         self.table_dtypes.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table_dtypes.setStyleSheet(
-            "QTableWidget { background: #1e293b; color: #e2e8f0; gridline-color: #334155; }"
-        )
+        # Table styling handled by global _tables_qss
         # The dtypes table is this panel's main content: NO max-height cap.
         # It sits in the body row (stretch=3, below) so it covers ALL of the
         # panel's leftover space instead of leaving dead gaps (UI issues:
@@ -86,9 +84,7 @@ class DtypeTransformerPanel(QWidget):
 
         # -- Transform controls (right-hand side panel) --
         side_frame = QFrame()
-        side_frame.setStyleSheet(
-            "QFrame { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; }"
-        )
+        side_frame.setObjectName("config_panel")
         side_layout = QVBoxLayout(side_frame)
         side_layout.setContentsMargins(12, 12, 12, 12)
         side_layout.setSpacing(8)
@@ -96,10 +92,6 @@ class DtypeTransformerPanel(QWidget):
 
         side_layout.addWidget(QLabel("Select column to transform:"))
         self.cmb_col = QComboBox()
-        self.cmb_col.setStyleSheet(
-            "QComboBox { background: #1e293b; color: #e2e8f0;"
-            "  border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; }"
-        )
         side_layout.addWidget(self.cmb_col)
 
         side_layout.addWidget(QLabel("Convert to:"))
@@ -108,10 +100,7 @@ class DtypeTransformerPanel(QWidget):
             "object", "string", "int64", "float64", "bool", "category",
             "datetime64[ns]", "date", "time", "timedelta64[ns]",
         ])
-        self.cmb_target_dtype.setStyleSheet(
-            "QComboBox { background: #1e293b; color: #e2e8f0;"
-            "  border: 1px solid #334155; border-radius: 6px; padding: 6px 10px; }"
-        )
+        # Combo styling handled by global QSS
         side_layout.addWidget(self.cmb_target_dtype)
         side_layout.addStretch(1)
         body.addWidget(side_frame)
@@ -119,9 +108,7 @@ class DtypeTransformerPanel(QWidget):
 
         # -- Preview result area (spans the full width below the body) --
         controls = QFrame()
-        controls.setStyleSheet(
-            "QFrame { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; }"
-        )
+        controls.setObjectName("config_panel")
         ctrl_layout = QVBoxLayout(controls)
         ctrl_layout.setContentsMargins(12, 12, 12, 12)
         ctrl_layout.setSpacing(8)
@@ -134,7 +121,7 @@ class DtypeTransformerPanel(QWidget):
         # Preview result area
         preview_header_row = QHBoxLayout()
         self.lbl_preview_title = QLabel("")
-        self.lbl_preview_title.setStyleSheet("font-size: 13px; font-weight: 600; color: #e2e8f0;")
+        self.lbl_preview_title.setProperty("class", "cardSub")
         self.lbl_preview_title.setVisible(False)
         preview_header_row.addWidget(self.lbl_preview_title)
         preview_header_row.addStretch()
@@ -145,19 +132,14 @@ class DtypeTransformerPanel(QWidget):
         # Highlighted accent style so the user can spot the dismiss control
         # at a glance (UI issue: the old dark-grey style was nearly invisible
         # against the panel background).
-        self.btn_clear_preview.setStyleSheet(
-            "QPushButton { background: #4f46e5; color: white; border: none;"
-            "  border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; }"
-            "QPushButton:hover { background: #6366f1; }"
-            "QPushButton:pressed { background: #4338ca; }"
-            "QPushButton:disabled { background: #334155; color: #64748b; }"
-        )
+        self.btn_clear_preview.setProperty("kind", "primary")
         preview_header_row.addWidget(self.btn_clear_preview)
         ctrl_layout.addLayout(preview_header_row)
 
         self.lbl_preview_stats = QLabel("")
         self.lbl_preview_stats.setWordWrap(True)
-        self.lbl_preview_stats.setStyleSheet("font-size: 11px; color: #94a3b8;")
+        self.lbl_preview_stats.setProperty("class", "faint")
+        self.lbl_preview_stats.setStyleSheet("font-size: 11px;")
         self.lbl_preview_stats.setVisible(False)
         ctrl_layout.addWidget(self.lbl_preview_stats)
 
@@ -165,9 +147,6 @@ class DtypeTransformerPanel(QWidget):
         self.table_preview.setColumnCount(2)
         self.table_preview.setHorizontalHeaderLabels(["Before", "After"])
         self.table_preview.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table_preview.setStyleSheet(
-            "QTableWidget { background: #1e293b; color: #e2e8f0; gridline-color: #334155; }"
-        )
         # Explicit min AND max so the preview can never balloon the whole
         # pane -- it scrolls internally instead of forcing the transform
         # controls to shrink out of usability.
@@ -183,18 +162,10 @@ class DtypeTransformerPanel(QWidget):
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         self.btn_preview = QPushButton("🔎 Preview Conversion")
-        self.btn_preview.setStyleSheet(
-            "QPushButton { background: #4f46e5; color: white; border: none;"
-            "  border-radius: 6px; padding: 8px 16px; font-weight: 600; }"
-            "QPushButton:disabled { background: #334155; color: #64748b; }"
-        )
+        self.btn_preview.setProperty("kind", "primary")
         self.btn_apply = QPushButton("🔄 Apply Transformation")
         self.btn_apply.setEnabled(False)
-        self.btn_apply.setStyleSheet(
-            "QPushButton { background: #10b981; color: white; border: none;"
-            "  border-radius: 6px; padding: 8px 16px; font-weight: 600; }"
-            "QPushButton:disabled { background: #334155; color: #64748b; }"
-        )
+        self.btn_apply.setProperty("kind", "success")
         btn_row.addWidget(self.btn_preview)
         btn_row.addWidget(self.btn_apply)
         ctrl_layout.addLayout(btn_row)
@@ -210,7 +181,13 @@ class DtypeTransformerPanel(QWidget):
     # -- Signal connections -------------------------------------------------
 
     def _connect_signals(self) -> None:
-        pass
+        # Changing the target dtype invalidates any shown preview (it was
+        # computed for the previous target), so dismiss it.
+        self.cmb_target_dtype.currentTextChanged.connect(self._on_target_changed)
+
+    def _on_target_changed(self, _text: str) -> None:
+        """Stale-preview guard for the 'Convert to' combo."""
+        self._clear_preview()
 
     # -- Public API ---------------------------------------------------------
 
@@ -240,6 +217,10 @@ class DtypeTransformerPanel(QWidget):
 
     def _on_col_changed(self, text: str) -> None:
         """Update target dtype default when column changes."""
+        # Stale preview guard: the old banner/before-after table described a
+        # different column -- drop it so it can't be mistaken for the
+        # current selection's result.
+        self._clear_preview()
         if self._df is None or not text:
             return
         current_dtype = str(self._df[text].dtype)
@@ -381,6 +362,10 @@ class DtypeTransformerPanel(QWidget):
 
         self.btn_apply.setEnabled(False)
         self.btn_preview.setEnabled(False)
+        # Capture the selection NOW: when the worker finishes, set_df() makes
+        # the page re-sync this panel (repopulating the combos), so reading
+        # them in _on_apply_finished would report the wrong column/target.
+        self._pending_col, self._pending_target = col, target
         self._worker = TransformWorker(apply_dtype_conversion, self._df, col, target)
         self._worker.finished_ok.connect(self._on_apply_finished)
         self._worker.failed.connect(self._on_worker_failed)
@@ -389,7 +374,13 @@ class DtypeTransformerPanel(QWidget):
     def _on_apply_finished(self, new_df: pd.DataFrame) -> None:
         """Handle successful dtype conversion."""
         self.bridge.set_df(new_df)
-        self.operation_applied.emit(f"✅ Converted '{self.cmb_col.currentText()}' to {self.cmb_target_dtype.currentText()}")
+        self.operation_applied.emit(
+            f"✅ Converted '{getattr(self, '_pending_col', '?')}'"
+            f" to {getattr(self, '_pending_target', '?')}")
+        # The applied result is now the live data (dtype table re-syncs via
+        # df_changed); the old preview described pre-conversion values, so
+        # dismiss it rather than leaving a stale before/after on screen.
+        self._clear_preview()
         self.btn_apply.setEnabled(False)
         self.btn_preview.setEnabled(True)
         self.set_dataframe(new_df)

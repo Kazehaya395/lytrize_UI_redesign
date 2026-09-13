@@ -13,6 +13,8 @@ from typing import Any, Optional
 from PySide6.QtCore import QUrl, Qt
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
+from desktop import theme as _theme_mod
+
 log = logging.getLogger(__name__)
 
 
@@ -58,7 +60,8 @@ class PlotlyView(QWebEngineView):
         except Exception as exc:
             log.warning("PlotlyView.set_figure failed: %s", exc)
             self.setHtml(
-                "<html><body style='background:#0b1120;color:#94a3b8;"
+                "<html><body style='background:" + _theme_mod.resolve_color("window_bg") +
+                ";color:" + _theme_mod.resolve_color("text_muted") + ";"
                 "font-family:sans-serif;padding:20px;'>"
                 f"<p>Failed to render chart: {exc}</p></body></html>"
             )

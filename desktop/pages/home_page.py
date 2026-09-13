@@ -14,9 +14,10 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QMessageBox, QInputDialog,
-    QMenu, QToolButton,
+    QMenu, QToolButton, QFrame,
 )
 
+from desktop.theme import PAGE_MARGINS
 from desktop.session_bridge import SessionBridge
 from desktop.widgets.stat_card import StatCard
 from services.database_service import (
@@ -46,24 +47,18 @@ class HomePage(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 24, 24, 24)
+        root.setContentsMargins(*PAGE_MARGINS)
         root.setSpacing(12)
 
         # -- Header --
         header = QHBoxLayout()
         title = QLabel("🏠 Home")
-        title.setStyleSheet("font-size: 20px; font-weight: 700; color: #e2e8f0;")
+        title.setProperty("class", "pageTitle")
         header.addWidget(title)
         header.addStretch()
 
         self.btn_new = QPushButton("🚀 Start New Analysis")
-        self.btn_new.setStyleSheet(
-            "QPushButton {"
-            "  background: #4f46e5; color: white; border: none;"
-            "  border-radius: 8px; padding: 8px 16px; font-weight: 600;"
-            "}"
-            "QPushButton:hover { background: #6366f1; }"
-        )
+        self.btn_new.setProperty("kind", "primary")
         header.addWidget(self.btn_new)
 
         # Action buttons for selected session are built here (styles only);
@@ -71,22 +66,11 @@ class HomePage(QWidget):
         # not in this page-level header, since they act on a selected session.
         self.btn_rename = QPushButton("✏️ Rename")
         self.btn_rename.setEnabled(False)
-        self.btn_rename.setStyleSheet(
-            "QPushButton { background: #1e293b; color: #94a3b8; border: 1px solid #334155;"
-            "  border-radius: 8px; padding: 6px 14px; font-weight: 600; }"
-            "QPushButton:hover { background: #334155; color: #e2e8f0; }"
-            "QPushButton:disabled { color: #475569; border-color: #1e293b; }"
-        )
+        self.btn_rename.setProperty("kind", "ghost")
 
         self.btn_delete = QPushButton("🗑 Delete")
         self.btn_delete.setEnabled(False)
-        self.btn_delete.setStyleSheet(
-            "QPushButton { background: rgba(239,68,68,0.1); color: #f87171;"
-            "  border: 1px solid rgba(239,68,68,0.3); border-radius: 8px;"
-            "  padding: 6px 14px; font-weight: 600; }"
-            "QPushButton:hover { background: rgba(239,68,68,0.2); }"
-            "QPushButton:disabled { background: transparent; color: #475569; border-color: #1e293b; }"
-        )
+        self.btn_delete.setProperty("kind", "danger")
 
         root.addLayout(header)
 
@@ -95,19 +79,17 @@ class HomePage(QWidget):
             username = getpass.getuser().strip() or "user"
         except Exception:
             username = "user"
-        welcome = QLabel(
-            f"<span style='font-size:16px; font-weight:700; color:#e2e8f0;'>"
-            f"Welcome “{username}” to Lytrize — your local-first analytics workspace.</span>"
-            f"<br>"
-            f"<span style='font-size:13px; color:#94a3b8;'>"
-            f"Import a dataset, generate charts, and compose dashboards — all offline.</span>"
-        )
-        welcome.setStyleSheet(
-            "font-size: 13px; color: #94a3b8;"
-            "background: #0f172a; border: 1px solid #1e293b;"
-            "border-radius: 8px; padding: 16px;"
-        )
-        welcome.setWordWrap(False)
+        welcome = QFrame()
+        welcome.setObjectName("welcome_banner")
+        welcome_lay = QVBoxLayout(welcome)
+        welcome_lay.setContentsMargins(16, 16, 16, 16)
+        welcome_lay.setSpacing(4)
+        lbl_welcome_title = QLabel(f"Welcome “{username}” to Lytrize — your local-first analytics workspace.")
+        lbl_welcome_title.setProperty("class", "sectionTitle")
+        welcome_lay.addWidget(lbl_welcome_title)
+        lbl_welcome_desc = QLabel("Import a dataset, generate charts, and compose dashboards — all offline.")
+        lbl_welcome_desc.setProperty("class", "muted")
+        welcome_lay.addWidget(lbl_welcome_desc)
         root.addWidget(welcome, 0, Qt.AlignLeft | Qt.AlignTop)
 
         # -- Stat cards: sessions saved, datasets analyzed, analyses run --
@@ -125,7 +107,7 @@ class HomePage(QWidget):
         # -- Sessions section --
         section_row = QHBoxLayout()
         section = QLabel("💾 Saved Sessions")
-        section.setStyleSheet("font-size: 15px; font-weight: 600; color: #cbd5e1; margin-top: 8px;")
+        section.setProperty("class", "sectionTitle")
         section_row.addWidget(section)
         section_row.addStretch()
         section_row.addWidget(self.btn_rename)
@@ -133,21 +115,12 @@ class HomePage(QWidget):
         root.addLayout(section_row)
 
         self.session_list = QListWidget()
-        self.session_list.setStyleSheet(
-            "QListWidget {"
-            "  background: #0f172a; color: #e2e8f0;"
-            "  border: 1px solid #1e293b; border-radius: 8px;"
-            "  font-size: 13px;"
-            "}"
-            "QListWidget::item { padding: 10px 12px; border-bottom: 1px solid #1e293b; }"
-            "QListWidget::item:hover { background: rgba(99,102,241,0.1); }"
-            "QListWidget::item:selected { background: rgba(99,102,241,0.2); }"
-        )
+        self.session_list.setStyleSheet("font-size: 13px;")
         root.addWidget(self.session_list, stretch=1)
 
         # -- Empty state --
         self.lbl_empty = QLabel("No saved sessions yet. Start a new analysis to begin.")
-        self.lbl_empty.setStyleSheet("font-size: 12px; color: #64748b; padding: 8px;")
+        self.lbl_empty.setProperty("class", "faint"); self.lbl_empty.setStyleSheet("font-size: 12px; padding: 8px;")
         self.lbl_empty.setAlignment(Qt.AlignCenter)
         root.addWidget(self.lbl_empty)
 
@@ -226,12 +199,6 @@ class HomePage(QWidget):
             return
 
         menu = QMenu()
-        menu.setStyleSheet(
-            "QMenu { background: #1e293b; color: #e2e8f0;"
-            "  border: 1px solid #334155; padding: 4px; }"
-            "QMenu::item { padding: 6px 20px; }"
-            "QMenu::item:selected { background: rgba(99,102,241,0.3); }"
-        )
 
         action_open = menu.addAction("📂 Open")
         action_rename = menu.addAction("✏️ Rename")

@@ -30,6 +30,7 @@ class SessionBridge(QObject):
     charts_changed = Signal(object)    # emits list of (uid, title, fig)
     state_changed = Signal(str, object)  # emits key, value
     user_changed = Signal(object)      # emits user_id int
+    theme_changed = Signal(str)        # emits theme_mode ("dark" | "light")
 
     def __init__(self, manager: Optional[SessionManager] = None, parent=None) -> None:
         super().__init__(parent)

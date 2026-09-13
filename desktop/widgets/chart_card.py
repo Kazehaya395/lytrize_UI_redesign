@@ -53,12 +53,6 @@ class ChartCard(QFrame):
         self._style = dict(self._meta.get("display_options", {}))
 
         self.setObjectName("chart_card")
-        self.setStyleSheet(
-            "QFrame#chart_card {"
-            "  background: #0f172a; border: 1px solid #1e293b;"
-            "  border-radius: 10px;"
-            "}"
-        )
 
         self._build_ui()
 
@@ -74,62 +68,42 @@ class ChartCard(QFrame):
         header.setSpacing(6)
 
         self.lbl_title = QLabel(self._title)
-        self.lbl_title.setStyleSheet("font-size: 14px; font-weight: 600; color: #e2e8f0;")
+        self.lbl_title.setProperty("class", "cardTitle")
         self.lbl_title.setWordWrap(True)
         header.addWidget(self.lbl_title, stretch=1)
 
         self.btn_up = QPushButton("⬆")
         self.btn_up.setFixedSize(28, 28)
         self.btn_up.setToolTip("Move up")
-        self.btn_up.setStyleSheet(
-            "QPushButton { background: #1e293b; color: #94a3b8; border: none;"
-            "  border-radius: 4px; font-size: 12px; }"
-            "QPushButton:hover { background: #334155; color: #e2e8f0; }"
-        )
+        self.btn_up.setProperty("kind", "icon")
         self.btn_up.clicked.connect(lambda: self.move_up_requested.emit(self.uid))
         header.addWidget(self.btn_up)
 
         self.btn_down = QPushButton("⬇")
         self.btn_down.setFixedSize(28, 28)
         self.btn_down.setToolTip("Move down")
-        self.btn_down.setStyleSheet(
-            "QPushButton { background: #1e293b; color: #94a3b8; border: none;"
-            "  border-radius: 4px; font-size: 12px; }"
-            "QPushButton:hover { background: #334155; color: #e2e8f0; }"
-        )
+        self.btn_down.setProperty("kind", "icon")
         self.btn_down.clicked.connect(lambda: self.move_down_requested.emit(self.uid))
         header.addWidget(self.btn_down)
 
         self.btn_edit = QPushButton("✏️")
         self.btn_edit.setFixedSize(28, 28)
         self.btn_edit.setToolTip("Edit chart")
-        self.btn_edit.setStyleSheet(
-            "QPushButton { background: #1e293b; color: #94a3b8; border: none;"
-            "  border-radius: 4px; font-size: 12px; }"
-            "QPushButton:hover { background: #334155; color: #e2e8f0; }"
-        )
+        self.btn_edit.setProperty("kind", "icon")
         self.btn_edit.clicked.connect(lambda: self.edit_requested.emit(self.uid))
         header.addWidget(self.btn_edit)
 
         self.btn_style = QPushButton("🎨")
         self.btn_style.setFixedSize(28, 28)
         self.btn_style.setToolTip("Chart style")
-        self.btn_style.setStyleSheet(
-            "QPushButton { background: #1e293b; color: #94a3b8; border: none;"
-            "  border-radius: 4px; font-size: 12px; }"
-            "QPushButton:hover { background: #334155; color: #e2e8f0; }"
-        )
+        self.btn_style.setProperty("kind", "icon")
         self.btn_style.clicked.connect(self._on_open_style_dialog)
         header.addWidget(self.btn_style)
 
         self.btn_delete = QPushButton("🗑")
         self.btn_delete.setFixedSize(28, 28)
         self.btn_delete.setToolTip("Delete chart")
-        self.btn_delete.setStyleSheet(
-            "QPushButton { background: #1e293b; color: #94a3b8; border: none;"
-            "  border-radius: 4px; font-size: 12px; }"
-            "QPushButton:hover { background: rgba(239,68,68,0.2); color: #f87171; }"
-        )
+        self.btn_delete.setProperty("kind", "icon")
         self.btn_delete.clicked.connect(lambda: self.delete_requested.emit(self.uid))
         header.addWidget(self.btn_delete)
 
@@ -140,12 +114,7 @@ class ChartCard(QFrame):
         self.btn_expand.setFixedSize(28, 28)
         self.btn_expand.setCheckable(True)
         self.btn_expand.setToolTip("Expand chart")
-        self.btn_expand.setStyleSheet(
-            "QPushButton { background: #1e293b; color: #94a3b8; border: none;"
-            "  border-radius: 4px; font-size: 12px; }"
-            "QPushButton:checked { background: rgba(99,102,241,0.3); color: #a5b4fc; }"
-            "QPushButton:hover { background: #334155; color: #e2e8f0; }"
-        )
+        self.btn_expand.setProperty("kind", "icon")
         self.btn_expand.toggled.connect(self._on_expand_toggled)
         header.addWidget(self.btn_expand)
 
@@ -158,12 +127,7 @@ class ChartCard(QFrame):
         self.btn_fullwidth.setFixedSize(28, 28)
         self.btn_fullwidth.setCheckable(True)
         self.btn_fullwidth.setToolTip("Full width row")
-        self.btn_fullwidth.setStyleSheet(
-            "QPushButton { background: #1e293b; color: #94a3b8; border: none;"
-            "  border-radius: 4px; font-size: 12px; }"
-            "QPushButton:checked { background: rgba(99,102,241,0.3); color: #a5b4fc; }"
-            "QPushButton:hover { background: #334155; color: #e2e8f0; }"
-        )
+        self.btn_fullwidth.setProperty("kind", "icon")
         self.btn_fullwidth.setVisible(False)
         self.btn_fullwidth.toggled.connect(
             lambda checked: self.fullwidth_toggled.emit(self.uid, checked)
@@ -175,7 +139,7 @@ class ChartCard(QFrame):
         # -- Chart type label --
         if self._chart_type:
             type_lbl = QLabel(f"Type: {self._chart_type}")
-            type_lbl.setStyleSheet("font-size: 11px; color: #64748b;")
+            type_lbl.setProperty("class", "faint"); type_lbl.setStyleSheet("font-size: 11px;")
             layout.addWidget(type_lbl)
 
         # -- Plotly view --
@@ -194,13 +158,7 @@ class ChartCard(QFrame):
         self.notes = QTextEdit()
         self.notes.setPlaceholderText("Add analysis notes…")
         self.notes.setMaximumHeight(80)
-        self.notes.setStyleSheet(
-            "QTextEdit {"
-            "  background: #1a1732; color: #e2e8f0;"
-            "  border: 1px solid #2c3564; border-radius: 6px;"
-            "  font-size: 12px; padding: 6px;"
-            "}"
-        )
+        self.notes.setStyleSheet("font-size: 12px; padding: 6px;")
         self.notes.textChanged.connect(self._on_notes_changed)
         layout.addWidget(self.notes)
 
@@ -280,7 +238,6 @@ class ChartCard(QFrame):
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Style — {self._title}")
         dialog.setMinimumWidth(340)
-        dialog.setStyleSheet("QDialog { background: #0f172a; }")
         dlg_layout = QVBoxLayout(dialog)
 
         panel = ChartStylePanel(chart_type=self._chart_type, style=self._style)

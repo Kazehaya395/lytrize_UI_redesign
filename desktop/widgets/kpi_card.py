@@ -38,56 +38,47 @@ class KpiCard(QFrame):
         self._build_ui(label, value, delta)
 
     def _build_ui(self, label: str, value: str, delta: Optional[str]) -> None:
-        self.setStyleSheet(
-            "QFrame#kpi_card {"
-            "  background: #1b2245; border: 1px solid #2c3564;"
-            "  border-radius: 10px;"
-            "}"
-        )
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 6, 10, 10)
         layout.setSpacing(2)
 
-        btn_style = (
-            "QPushButton { background: transparent; color: #64748b; border: none;"
-            "  font-size: 11px; padding: 0px; }"
-            "QPushButton:hover { color: #e2e8f0; }"
-        )
+        btn_style = {"kind": "icon"}
         header = QHBoxLayout()
         header.setSpacing(2)
         header.addStretch()
         self.btn_up = QPushButton("⬆")
         self.btn_up.setFixedSize(18, 18)
         self.btn_up.setToolTip("Move up")
-        self.btn_up.setStyleSheet(btn_style)
+        self.btn_up.setProperty("kind","icon")
         self.btn_up.clicked.connect(lambda: self.move_up_requested.emit(self._index))
         header.addWidget(self.btn_up)
 
         self.btn_down = QPushButton("⬇")
         self.btn_down.setFixedSize(18, 18)
         self.btn_down.setToolTip("Move down")
-        self.btn_down.setStyleSheet(btn_style)
+        self.btn_down.setProperty("kind","icon")
         self.btn_down.clicked.connect(lambda: self.move_down_requested.emit(self._index))
         header.addWidget(self.btn_down)
 
         self.btn_remove = QPushButton("✕")
         self.btn_remove.setFixedSize(18, 18)
         self.btn_remove.setToolTip("Remove KPI")
-        self.btn_remove.setStyleSheet(btn_style)
+        self.btn_remove.setProperty("kind","icon")
         self.btn_remove.clicked.connect(lambda: self.remove_requested.emit(self._index))
         header.addWidget(self.btn_remove)
         layout.addLayout(header)
 
         self.lbl_label = QLabel(label)
-        self.lbl_label.setStyleSheet("font-size: 11px; color: #94a3b8; font-weight: 600;")
+        self.lbl_label.setProperty("class", "kpiLabel")
         layout.addWidget(self.lbl_label)
 
         self.lbl_value = QLabel(str(value))
-        self.lbl_value.setStyleSheet("font-size: 14px; color: #f5f7ff; font-weight: 700;")
+        self.lbl_value.setProperty("class", "kpiValue")
         layout.addWidget(self.lbl_value)
 
         self.lbl_delta = QLabel(delta or "")
-        self.lbl_delta.setStyleSheet("font-size: 11px; color: #34d399;")
+        self.lbl_delta.setProperty("class", "kpiDelta")
         self.lbl_delta.setVisible(bool(delta))
         layout.addWidget(self.lbl_delta)
 

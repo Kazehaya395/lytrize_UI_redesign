@@ -14,6 +14,8 @@ import pandas as pd
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor, QFont
 
+from desktop.theme import resolve_color
+
 log = logging.getLogger(__name__)
 
 
@@ -27,6 +29,10 @@ class DataFrameModel(QAbstractTableModel):
     def __init__(self, df: Optional[pd.DataFrame] = None, parent=None) -> None:
         super().__init__(parent)
         self._df = df if df is not None else pd.DataFrame()
+        self._colors_cache: dict = {}
+        self._colors_cache_mode: str = ""
+        from desktop.theme import current_mode as _cm
+        self._current_theme_mode: str = _cm()
 
     # -- Public API ---------------------------------------------------------
 
@@ -34,6 +40,16 @@ class DataFrameModel(QAbstractTableModel):
         """Replace the underlying DataFrame and notify views."""
         self.beginResetModel()
         self._df = df if df is not None else pd.DataFrame()
+        self.endResetModel()
+
+    def on_theme_changed(self) -> None:
+        """Invalidate per-mode header colors and re-fetch them on next
+        paint (called after a dark/light toggle so the header row and
+        row-index gutter re-resolve their colors)."""
+        from desktop.theme import current_mode as _cm
+        self._current_theme_mode = _cm()
+        self._colors_cache_mode = ""
+        self.beginResetModel()
         self.endResetModel()
 
     def dataframe(self) -> pd.DataFrame:
@@ -87,16 +103,24 @@ class DataFrameModel(QAbstractTableModel):
         # Column headers: make them bold (brand styling also comes from the
         # global QSS on QHeaderView::section, but the font role keeps the
         # emphasis even if a caller overrides the QSS).
-        if role in (Qt.FontRole, Qt.ForegroundRole) and orientation == Qt.Horizontal:
-            if 0 <= section < len(self._df.columns):
+        # Use theme colors for header text (read from the global theme tokens
+        # so the header reads correctly in both dark and light modes).
+        # Colors are cached per mode to avoid repeated resolve_color calls
+        # during the relayout storm triggered by a theme toggle.
+        if role in (Qt.FontRole, Qt.ForegroundRole, Qt.BackgroundRole) and orientation in (Qt.Horizontal, Qt.Vertical):
+            colors = self._header_colors
+            if orientation == Qt.Horizontal and role in (Qt.FontRole, Qt.ForegroundRole):
+                if 0 <= section < len(self._df.columns):
+                    if role == Qt.FontRole:
+                        return QFont("", 10, QFont.Weight.Bold)
+                    return colors.get("header_text")
+            elif orientation == Qt.Vertical:
+                if role == Qt.ForegroundRole:
+                    return colors.get("index_text")
+                if role == Qt.BackgroundRole:
+                    return colors.get("index_bg")
                 if role == Qt.FontRole:
                     return QFont("", 10, QFont.Weight.Bold)
-                return QColor("#e0e7ff")
-        # Row index gutter: tinted, bold, indigo numerals for quick scanning.
-        if role == Qt.ForegroundRole and orientation == Qt.Vertical:
-            return QColor("#a5b4fc")
-        if role == Qt.FontRole and orientation == Qt.Vertical:
-            return QFont("", 10, QFont.Weight.Bold)
         if role != Qt.DisplayRole:
             return None
 
@@ -107,6 +131,19 @@ class DataFrameModel(QAbstractTableModel):
             return section + 1
 
         return None
+
+    @property
+    def _header_colors(self) -> dict:
+        """Cache theme colors per mode to avoid repeated resolve_color calls."""
+        mode = self._current_theme_mode
+        if self._colors_cache_mode != mode:
+            self._colors_cache_mode = mode
+            self._colors_cache = {
+                "header_text": QColor(resolve_color("header_text")),
+                "index_text": QColor(resolve_color("index_text")),
+                "index_bg": QColor(resolve_color("index_bg")),
+            }
+        return self._colors_cache
 
     def sort(self, column: int, order: Qt.SortOrder = Qt.AscendingOrder) -> None:  # noqa: N802
         """Sort the DataFrame by the given column."""
