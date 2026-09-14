@@ -76,6 +76,7 @@ class UploadPage(QWidget):
         if self.bridge.df is not None:
             self._model.set_dataframe(self.bridge.df)
             self._update_preview_label()
+            self._auto_fit_index_width()
 
     # -- UI construction ----------------------------------------------------
 
@@ -158,13 +159,18 @@ class UploadPage(QWidget):
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
         self.table.horizontalHeader().setStretchLastSection(True)
-        # Fixed row height avoids per-row sizeHint recalculation on every
-        # geometry pass (viewport resize, splitter drag, model reset).
-        # With 100k+ rows the default Interactive/ContentBased sizing makes
-        # any resize or drag feel stepped/laggy since Qt has to reconsult
-        # row sizing on each pass; a fixed height sidesteps that entirely.
+        # Compact index gutter: a narrow, digit-driven fixed width. The
+        # 149,116-row screenshot overflows a roomy gutter, but a fully
+        # hidden header would also remove the only positional row cue.
+        # Fixed + minimumSectionSize avoids section-sizeHint churn on the
+        # large-table resize path, and _auto_fit_index_width() widens it
+        # only as far as the loaded row count's digit width requires.
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.table.verticalHeader().setDefaultSectionSize(28)
+        self.table.verticalHeader().setDefaultAlignment(Qt.AlignCenter)
+        self.table.verticalHeader().setMinimumSectionSize(22)
+        self.table.verticalHeader().setFixedWidth(36)
+        self._auto_fit_index_width()
 
         # -- Transform Tools Tabs (hidden until data loaded) --
         self._transform_tabs = QTabWidget()
@@ -301,6 +307,7 @@ class UploadPage(QWidget):
         # Update model
         self._model.set_dataframe(df)
         self._update_preview_label()
+        self._auto_fit_index_width()
         self.btn_go_analysis.setEnabled(True)
         self.btn_save_csv.setEnabled(True)
 
@@ -494,6 +501,17 @@ class UploadPage(QWidget):
             f"🔢 {len(num_cols)} numeric  ·  🔤 {len(cat_cols)} text"
             f"  ·  📅 {len(dt_cols)} datetime"
         )
+
+    def _auto_fit_index_width(self) -> None:
+        """Widen the row-index gutter only as far as the loaded row count's
+        digit width requires.  The base is 36px (fits ~5 digits); datasets
+        with more rows get a few extra pixels so large index numbers in the
+        screenshot no longer crowd the first data column."""
+        n = len(self._model.dataframe())
+        # digits needed for the largest index (max row number = n)
+        digits = max(1, len(str(n)))
+        width = max(36, 26 + digits * 8)
+        self.table.verticalHeader().setFixedWidth(width)
 
     def _build_filter_row(self, df: pd.DataFrame) -> None:
         """Build per-column filter inputs based on DataFrame columns."""

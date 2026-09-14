@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QUrl, QObject, Signal, Slot
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QSizePolicy
 from PySide6.QtGui import QPixmap
 
 from desktop import theme as _theme_mod
@@ -143,12 +143,22 @@ class _ChartBridge(QObject):
 
 class PlotlyWebView(QWidget):
     """Widget that renders a Plotly figure interactively, offline, with
-    in-place updates on subsequent renders."""
+    in-place updates on subsequent renders.
+
+    Auto-resizes the Plotly chart to match the widget's current size
+    (responsive:true + Plots.resize on Qt resizeEvent) so the chart
+    always fills its container without clipping — the parent layout
+    decides the size, this widget just follows."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
+        # Expanding in both directions so the chart fills whatever
+        # space the parent layout assigns — never a hard-coded floor
+        # that would push the preview off-screen.
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumHeight(0)
 
         self._web_view = None
         self._fallback_label = None
@@ -182,6 +192,25 @@ class PlotlyWebView(QWidget):
             self._fallback_label.setAlignment(Qt.AlignCenter)
             self._fallback_label.setStyleSheet("background: %s;" % _theme_mod.resolve_color("border_subtle"))
             self._layout.addWidget(self._fallback_label)
+
+    # -- Qt resize forwarding --------------------------------------------
+
+    def resizeEvent(self, event):  # noqa: N802 — Qt override signature
+        """Forward Qt resize events to Plotly so the chart reflows
+        instantly instead of waiting for the next render() call.
+
+        Without this, dragging the splitter handle between the config
+        pane and the preview pane leaves the chart clipped/cropped
+        until the next set_figure() call. Plotly.Plots.resize() tells
+        the JS chart to re-fit to its container's current pixel size."""
+        super().resizeEvent(event)
+        if self._use_web_engine and self._web_view is not None:
+            try:
+                self._web_view.page().runJavaScript(
+                    "if(window.Plotly){Plotly.Plots.resize(document.getElementById('chart'))}"
+                )
+            except Exception as exc:  # pragma: no cover — JS runtime
+                log.debug("Plotly resize forward failed: %s", exc)
 
     # -- Internal --------------------------------------------------------
 

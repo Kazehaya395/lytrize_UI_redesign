@@ -1006,17 +1006,27 @@ def test_date_difference(ts):
 
 
 def test_analysis_redesign():
-    """Analysis page redesign: config rebuild never duplicates the Generate
-    button / orphaned fields, and editing prefills from the saved snapshot."""
-    from PySide6.QtWidgets import QPushButton
-    from desktop.pages.analysis_page import AnalysisPage, WIDGET_SPEC
+    """Analysis page redesign (tab shell + +/- next to Generate).
 
-    print("[17] Analysis page: clean rebuild + edit prefill (redesign)")
+    Phase scope: the TOP half shows three tabs (Chart Generate/Edit,
+    Layout Options, Typography Options) and ONLY the selected page is
+    visible; chart +/- sit next to Generate in the tabs strip. Option
+    fields intentionally arrive later, so this test asserts SHELL ONLY:
+    header tabs exist, selection switches the visible page, and no option
+    field widgets (combo/list/spin/checkbox) exist in the config panel.
+    """
+    from desktop.pages.analysis_page import AnalysisPage
+    from services.analysis_service import WIDGET_SPEC
+    from PySide6.QtWidgets import QComboBox, QListWidget, QSpinBox, QCheckBox
+
+    print("[17] Analysis page: tab shell + +/- next to Generate (redesign)")
 
     # Ensure import path allows it.
     import sys
     if "backend" not in sys.path:
         sys.path.insert(0, "backend")
+
+    from PySide6.QtCore import Qt
 
     class _Sig:
         def connect(self, cb):
@@ -1081,8 +1091,16 @@ def test_analysis_redesign():
     b = _Bridge(df)
     page = AnalysisPage(b)
 
-    # 1) Rebuild across every analysis type: config area must contain no
-    #    stray Generate buttons, and widget count matches the WIDGET_SPEC.
+    # 1) +/- live next to Generate in the tabs strip (single Generate only).
+    check("analysis shell: +/- next to Generate",
+          page.btn_add_chart is not None and page.btn_remove_chart is not None
+          and page.btn_generate is not None
+          and page.btn_add_chart.parent() is page.btn_generate.parent()
+          and page.btn_remove_chart.parent() is page.btn_generate.parent(),
+          "")
+
+    # 2) Non-descriptive types show the tabbed shell; exactly one page
+    #    visible at a time; no option field widgets exist in this phase.
     for aid in WIDGET_SPEC:
         for i in range(page.analysis_list.count()):
             it = page.analysis_list.item(i)
@@ -1090,60 +1108,34 @@ def test_analysis_redesign():
                 page.analysis_list.setCurrentItem(it)
                 page._on_analysis_selected(it, None)
                 break
-        keys = {k for (k, _k, _kind) in WIDGET_SPEC[aid]}
-        check(f"analysis rebuild '{aid}': no stray Generate in config",
-              page.btn_generate is not None and page.btn_generate.parent() is not None,
+        panel = page.config_panel
+        tab_names = [panel.tab_bar.tabText(i) for i in range(panel.tab_bar.count())]
+        check(f"analysis shell '{aid}': three setting tabs",
+              tab_names == ["Chart Generate/Edit", "Layout Options", "Typography Options"],
+              str(tab_names))
+        check(f"analysis shell '{aid}': only selected page visible",
+              panel.row1.currentWidget() is panel.body_generate
+              and not panel.body_layout.isVisibleTo(panel)
+              and not panel.body_typo.isVisibleTo(panel),
               "")
-        check(f"analysis rebuild '{aid}': widget count matches spec",
-              set(page._config_widgets.keys()) == keys,
-              f"{sorted(page._config_widgets)} vs {sorted(keys)}")
-        # No QPushButton should live in the rebuildable content area (the
-        # Generate/Update button is the persistent footer only).
-        stray = 0
-        for i in range(page.config_layout.count()):
-            it = page.config_layout.itemAt(i)
-            w = it.widget() if it else None
-            if isinstance(w, QPushButton):
-                stray += 1
-        check(f"analysis rebuild '{aid}': content area has no buttons",
-              stray == 0, f"stray buttons={stray}")
-
-    # 2) Edit prefill round-trip: build a pie_chart form, save those values
-    #    as the chart's meta config, then edit -> widgets should match.
-    for i in range(page.analysis_list.count()):
-        it = page.analysis_list.item(i)
-        if it.data(Qt.UserRole) == "pie_chart":
-            page.analysis_list.setCurrentItem(it)
-            break
-    # choose x=cat, y=num, agg=Sum
-    cfg = page._config_widgets
-    cfg["x"].setCurrentText("cat")
-    cfg["y"].setCurrentText("num")
-    cfg["agg"].setCurrentText("Sum")
-    page._collect_at_generate = page._collect_widget_values()
-    snap = page._collect_widget_values()
-    b.set("chart_type_c1", "pie_chart")
-    b.set_chart_meta("c1", config=snap)
-
-    page._on_edit_chart("c1")
-    page._build_config_panel("pie_chart", prefill=snap)
-    got = page._collect_widget_values()
-    check("analysis edit: enters edit mode", page._editing_uid == "c1", "")
-    check("analysis edit: prefill round-trip",
-          got.get("x") == snap.get("x") and got.get("y") == snap.get("y")
-          and got.get("agg") == snap.get("agg"),
-          f"saved={snap} got={got}")
-    check("analysis edit: update-chart chrome",
-          "Update Chart" in page.btn_generate.text()
-          and not page.btn_cancel_edit.isHidden(), page.btn_generate.text())
-
-    # 3) Cancel returns to a blank new-chart form.
-    page._on_cancel_edit()
-    check("analysis cancel: exits edit mode + fresh form",
-          page._editing_uid is None
-          and "Generate Charts" in page.btn_generate.text()
-          and not page.btn_cancel_edit.isVisible(),
-          page.btn_generate.text())
+        fields = []
+        for _cls in (QComboBox, QListWidget, QSpinBox, QCheckBox):
+            fields.extend(panel.findChildren(_cls))
+        check(f"analysis shell '{aid}': no option fields yet",
+              fields == [], f"fields={[type(w).__name__ for w in fields]}")
+        # Switching to Layout/Typography shows ONLY that page.
+        panel.tab_bar.setCurrentIndex(1)
+        check(f"analysis shell '{aid}': layout page shows alone",
+              panel.row1.currentWidget() is panel.body_layout
+              and not panel.body_generate.isVisibleTo(panel)
+              and not panel.body_typo.isVisibleTo(panel),
+              "")
+        panel.tab_bar.setCurrentIndex(2)
+        check(f"analysis shell '{aid}': typography page shows alone",
+              panel.row1.currentWidget() is panel.body_typo
+              and not panel.body_generate.isVisibleTo(panel)
+              and not panel.body_layout.isVisibleTo(panel),
+              "")
 
 
 def main():

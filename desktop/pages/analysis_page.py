@@ -23,10 +23,13 @@ from PySide6.QtWidgets import (
 
 from desktop.theme import PAGE_MARGINS
 from desktop.session_bridge import SessionBridge
+from desktop.widgets.chart_legend_panel import ChartLegendPanel
+from desktop.widgets.analysis_config_panel import AnalysisConfigPanel
+from desktop.widgets.analysis_notes_bar import AnalysisNotesBar
 from desktop.widgets.chart_card import ChartCard
 from desktop.workers import ChartGenerationWorker
 from services.analysis_service import (
-    ANALYSIS_OPTIONS, WIDGET_SPEC, run_analysis_with_config,
+    ANALYSIS_OPTIONS, WIDGET_SPEC, run_analysis_with_config, run_analysis,
     num_cols, cat_cols, dt_cols,
 )
 from services.chart_service import PALETTES, apply_hover_format
@@ -61,11 +64,27 @@ _NUMERIC_ONLY = {"y", "x_col", "y_col", "size_col", "values_col",
 _CAT_ONLY = {"color", "color_col", "index_col", "columns_col",
              "location_col", "geo_col"}
 
-
 def _field_label(key: str) -> str:
     """Human label for a widget key, e.g. 'color_col' -> 'Color Col'."""
     return key.replace("_", " ").title()
 
+class _TabPane(QWidget):
+    """Per-tab container: ChartCard (auto-fit) + LegendPanel (fixed) side by
+    side, so clicking a tab shows the full chart AND its legend together
+    without any scrolling."""
+
+    def __init__(self, card: ChartCard, parent=None) -> None:
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self.card = card
+        self.legend = ChartLegendPanel()
+        lay.addWidget(card, stretch=1)
+        lay.addWidget(self.legend)
+
+    def update_legend(self) -> None:
+        self.legend.set_legend(self.card.legend_data())
 
 class AnalysisPage(QWidget):
     """Analysis page: chart generation and management."""
@@ -143,93 +162,112 @@ class AnalysisPage(QWidget):
 
         splitter.addWidget(left_panel)
 
-        # -- Right: config + charts --
+        # -- Right: vertical splitter (TOP compact config | BOTTOM preview) --
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(8, 0, 0, 0)
-        right_layout.setSpacing(8)
+        right_layout.setSpacing(0)
 
-        # Config panel (hidden until an analysis is selected). The outer
-        # layout holds a rebuildable content area plus a *persistent* footer
-        # button bar. The footer is created once here and never rebuilt, so
-        # the Generate button can never duplicate no matter how many times the
-        # fields above it are swapped out for a different analysis type.
-        self.config_panel = QFrame()
-        self.config_panel.setObjectName("config_panel")
-        # (QFrame#config_panel themed globally via QSS)
-        config_outer = QVBoxLayout(self.config_panel)
-        config_outer.setContentsMargins(12, 12, 12, 12)
-        config_outer.setSpacing(8)
+        self._v_split = QSplitter(Qt.Vertical)
+        self._v_split.setHandleWidth(6)
+        self._v_split.setChildrenCollapsible(False)
+        # Same colored-bar handle styling as the outer splitter / other pages.
+        self._v_split.setStyleSheet(
+            "QSplitter::handle { background: #1e293b; }"
+            "QSplitter::handle:hover { background: #334155; }"
+        )
 
-        # Rebuildable content area (moved field widgets live here).
-        self.config_layout = QVBoxLayout()
-        self.config_layout.setSpacing(6)
-        config_outer.addLayout(self.config_layout)
-
-        # Persistent footer: Cancel (edit mode) + Generate/Update button.
-        self.config_footer = QWidget()
-        footer_lay = QHBoxLayout(self.config_footer)
-        footer_lay.setContentsMargins(0, 0, 0, 0)
-        footer_lay.setSpacing(8)
-        self.btn_cancel_edit = QPushButton("✕ Cancel")
-        self.btn_cancel_edit.setVisible(False)
-        self.btn_cancel_edit.setProperty("kind", "ghost")
-        footer_lay.addWidget(self.btn_cancel_edit)
-        footer_lay.addStretch()
-        self.btn_generate = QPushButton("▶ Generate Charts")
-        self.btn_generate.setProperty("kind", "primary")
-        footer_lay.addWidget(self.btn_generate)
-        config_outer.addWidget(self.config_footer)
-
+        # TOP pane: tabbed config shell (tabs only in this phase).
+        self.config_panel = AnalysisConfigPanel()
+        self.config_panel.collapse_toggled.connect(self._on_collapse_toggled)
         self.config_panel.setVisible(False)
-        right_layout.addWidget(self.config_panel)
+        self._v_split.addWidget(self.config_panel)
 
-        # -- Generated charts section header (visual separation from config) --
-        charts_header = QHBoxLayout()
-        charts_header.setSpacing(8)
-        self.lbl_charts_header = QLabel("📈 Generated Charts (0)")
-        self.lbl_charts_header.setProperty("class", "cardTitle")
-        charts_header.addWidget(self.lbl_charts_header)
-        header_hr = QFrame()
-        header_hr.setFrameShape(QFrame.HLine)
-        charts_header.addWidget(header_hr, stretch=1)
-        right_layout.addLayout(charts_header)
+        # BOTTOM pane: tabs strip + chart preview + notes footer
+        bottom = QWidget()
+        bl = QVBoxLayout(bottom)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(0)
 
-        # Charts tab widget -- one tab per generated chart, titled with
-        # the chart type + a running count ("Pie Chart 1", "Pie Chart 2"),
-        # or the exact custom title if the user renamed a chart. Was a
-        # simple vertical stack of cards before; a stack of 5+ full-size
-        # charts meant a lot of scrolling to compare or find one.
+        # Tabs strip (fixed height) -- one full-view chart per tab.
+        self.tabs_row = QWidget()
+        self.tabs_row.setFixedHeight(42)
+        tr = QHBoxLayout(self.tabs_row)
+        tr.setContentsMargins(6, 4, 6, 4)
+        tr.setSpacing(6)
         self.charts_tabs = QTabWidget()
-        # (QTabWidget themed globally via QSS)
-        # Many charts -> a clean tab/selector system that scrolls instead of
-        # overcrowding. Tabs are closable (wired to delete below) and movable
-        # so users can order them without opening each chart's card controls.
         self.charts_tabs.setTabsClosable(True)
         self.charts_tabs.setMovable(True)
         self.charts_tabs.setUsesScrollButtons(True)
-        right_layout.addWidget(self.charts_tabs, stretch=1)
+        self.charts_tabs.tabCloseRequested.connect(self._on_tab_close)
+        self.charts_tabs.currentChanged.connect(self._on_tab_changed)
+        tr.addWidget(self.charts_tabs, stretch=1)
+        # Chart add/delete live next to Generate, never in the config tabs.
+        self.btn_add_chart = QPushButton("+")
+        self.btn_add_chart.setFixedSize(28, 28)
+        self.btn_add_chart.setToolTip("Add another chart of this type")
+        self.btn_add_chart.setProperty("kind", "icon")
+        self.btn_add_chart.clicked.connect(self._on_add_chart)
+        tr.addWidget(self.btn_add_chart)
+        self.btn_remove_chart = QPushButton("x")
+        self.btn_remove_chart.setFixedSize(28, 28)
+        self.btn_remove_chart.setToolTip("Delete selected chart")
+        self.btn_remove_chart.setProperty("kind", "icon")
+        self.btn_remove_chart.clicked.connect(self._on_delete_current)
+        tr.addWidget(self.btn_remove_chart)
+        self.btn_generate = QPushButton("▶ Generate Charts")
+        self.btn_generate.setProperty("kind", "primary")
+        self.btn_generate.setMinimumHeight(30)
+        self.btn_generate.clicked.connect(self._on_generate)
+        tr.addWidget(self.btn_generate)
+        bl.addWidget(self.tabs_row)
 
+        # Chart preview = the tab widget (each tab pane holds card + legend).
+        bl.addWidget(self.charts_tabs, stretch=1)
+
+        # Descriptive-only full-area table view.
+        self.descriptive_container = QWidget()
+        self.descriptive_container_layout = QVBoxLayout(self.descriptive_container)
+        self.descriptive_container_layout.setContentsMargins(0, 0, 0, 0)
+        bl.addWidget(self.descriptive_container, stretch=1)
+
+        # No-charts placeholder.
         self.lbl_no_charts = QLabel("No charts yet. Configure an analysis and click Generate.")
         self.lbl_no_charts.setAlignment(Qt.AlignCenter)
         self.lbl_no_charts.setProperty("class", "faint"); self.lbl_no_charts.setStyleSheet("font-size: 13px; padding: 40px;")
-        right_layout.addWidget(self.lbl_no_charts)
+        bl.addWidget(self.lbl_no_charts, stretch=1)
 
+        # Notes footer (fixed height, per-analysis-type notes).
+        self.notes_bar = AnalysisNotesBar(self.bridge)
+        self.notes_bar.note_changed.connect(self._on_analysis_note_changed)
+        bl.addWidget(self.notes_bar)
+
+        self._v_split.addWidget(bottom)
+        self._v_split.setStretchFactor(0, 0)
+        self._v_split.setStretchFactor(1, 1)
+        self._v_split.setSizes([296, 544])
+        self.config_panel.setMinimumHeight(48)
+        bottom.setMinimumHeight(248)
+
+        right_layout.addWidget(self._v_split)
         splitter.addWidget(right_panel)
         splitter.setSizes([220, 800])
+
+        # Initial view: no charts yet -> hide tabs & descriptive.
+        self.tabs_row.setVisible(False)
+        self.charts_tabs.setVisible(False)
+        self.descriptive_container.setVisible(False)
+        self.notes_bar.setVisible(False)
 
     # -- Signal connections -------------------------------------------------
 
     def _connect_signals(self) -> None:
         self.analysis_list.currentItemChanged.connect(self._on_analysis_selected)
-        self.btn_generate.clicked.connect(self._on_generate)
         self.btn_clear.clicked.connect(self._on_clear_all)
         self.btn_dashboard.clicked.connect(
             lambda: self.navigate_requested.emit("dashboard")
         )
         self.bridge.charts_changed.connect(self._on_charts_changed)
-        self.btn_cancel_edit.clicked.connect(self._on_cancel_edit)
-        self.charts_tabs.tabCloseRequested.connect(self._on_tab_close)
 
     # -- Analysis selection -------------------------------------------------
 
@@ -246,220 +284,136 @@ class AnalysisPage(QWidget):
 
     # -- Config panel construction -----------------------------------------
 
-    @staticmethod
-    def _clear_layout(layout) -> None:
-        """Recursively delete everything in a QLayout -- widgets AND nested
-        layouts. The old teardown only took top-level widgets via takeAt(), so
-        every nested sub-layout (multi-select column, button row) survived a
-        rebuild and the config panel accumulated orphaned fields + extra
-        Generate buttons each time you switched analysis type."""
-        while layout.count():
-            item = layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-                continue
-            child = item.layout()
-            if child is not None:
-                AnalysisPage._clear_layout(child)
-
-    def _styled_combo(self, items) -> QComboBox:
-        combo = QComboBox()
-        combo.addItems(items)
-        combo.setMinimumHeight(30)
-        return combo
-
-    def _scalar_options(self, key: str, num, cat, all_cols) -> list:
-        """Option list for a single-select field, mirroring the backend's
-        per-key column pools (numeric-only / cat-only / both)."""
-        NONE = "None"
-        if key in ("x", "color", "y", "x_col", "y_col", "color_col",
-                   "size_col", "index_col", "columns_col", "values_col",
-                   "lat_col", "lon_col", "location_col", "value_col",
-                   "geo_col", "dual_y", "dual_y_ts"):
-            if key in _NUMERIC_ONLY:
-                return [NONE] + num
-            if key in _CAT_ONLY:
-                return [NONE] + cat
-            return [NONE] + num + cat
-        if key == "palette":
-            return list(PALETTES.keys())
-        if key in ("agg", "agg_func", "dual_y_agg"):
-            return ["Avg", "Sum", "Median", "Count", "Min", "Max"]
-        if key in ("sort", "sort_rows"):
-            return ["Value \u2193", "Value \u2191", "Category A\u2192Z", "Category Z\u2192A"]
-        if key == "direction":
-            return ["Vertical (Column chart)", "Horizontal (Bar chart)"]
-        if key == "date_part":
-            return ["None", "Year", "Quarter", "Month (number)", "Month Name",
-                    "Weekday Name", "Day", "Hour"]
-        if key == "trendline":
-            return ["None", "ols", "lowess"]
-        if key == "render_mode":
-            return ["svg", "webgl"]
-        if key == "map_mode":
-            return ["Scatter (Lat/Lon)", "Choropleth (Location Names)"]
-        if key == "map_style":
-            return ["carto-positron", "open-street-map", "carto-darkmatter"]
-        if key == "choropleth_colorscale":
-            return ["Blues", "Reds", "Greens", "Viridis", "Plasma",
-                    "Cividis", "Magma", "Inferno"]
-        if key == "choropleth_projection":
-            return ["natural earth", "equirectangular", "mercator",
-                    "orthographic", "azimuthal equal area"]
-        if key == "choropleth_scope":
-            return ["world", "usa", "europe", "asia", "africa",
-                    "north america", "south america"]
-        return [NONE] + num + cat
-
-    def _add_group_header(self, name: str) -> None:
-        hr = QFrame()
-        hr.setFrameShape(QFrame.HLine)
-        lab = QLabel(name.upper())
-        lay = QHBoxLayout()
-        lay.setSpacing(8)
-        lay.addWidget(lab)
-        lay.addWidget(hr, stretch=1)
-        self.config_layout.addLayout(lay)
-
-    def _add_field_row(self, label_text: str, widget) -> None:
-        """Compact single row: fixed-width label column + control."""
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        lbl = QLabel(label_text)
-        lbl.setMinimumWidth(130)
-        row.addWidget(lbl)
-        row.addWidget(widget, stretch=1)
-        self.config_layout.addLayout(row)
-
-    def _prefill_widgets(self, values: dict) -> None:
-        """Pre-populate every widget from a previously saved config snapshot
-        so editing a chart only requires changing what the user wants."""
-        for key, widget in self._config_widgets.items():
-            val = values.get(key)
-            if val is None:
-                continue
-            if isinstance(widget, QComboBox):
-                idx = widget.findText(str(val))
-                if idx >= 0:
-                    widget.setCurrentIndex(idx)
-            elif isinstance(widget, QListWidget):
-                valset = set(val) if not isinstance(val, str) else {val}
-                for i in range(widget.count()):
-                    item = widget.item(i)
-                    if item.data(Qt.UserRole) in valset:
-                        item.setSelected(True)
-            elif isinstance(widget, QSpinBox):
-                widget.setValue(int(val))
-            elif isinstance(widget, QCheckBox):
-                widget.setChecked(bool(val))
-
     def _build_config_panel(self, aid: str, prefill: Optional[dict] = None) -> None:
         """Build the config form for the selected analysis type.
 
-        Fields are rendered in a consistent Data → Options → Appearance
-        order with shared styling so every chart type looks like the same
-        product. *prefill* (an optional saved config snapshot) pre-selects
-        the widgets so editing an existing chart starts where it left off.
+        Descriptive is special-cased: it is a pure data overview that does
+        NOT belong on the dashboard, so it shows only a clean full-area
+        table (no config form, no Generate, no tabs, no legend, and nothing
+        is added to the bridge charts -- so it can never reach a saved
+        dashboard). Everything else renders through the compact 3-column
+        AnalysisConfigPanel in the splitter's top pane.
         """
-        self._clear_layout(self.config_layout)
-        self._config_widgets.clear()
-        self._active_analysis = aid
+        if aid == "descriptive":
+            self._show_descriptive()
+            return
 
+        self._active_analysis = aid
         df = self.bridge.df
         if df is None:
             self.config_panel.setVisible(False)
             return
-        self.config_panel.setVisible(True)
+        self._config_widgets = {}
 
-        num = num_cols(df)
-        cat = cat_cols(df)
-        dt = dt_cols(df)
-        all_cols = df.columns.tolist()
-        NONE = "None"
+        # Refresh column pools for the injected scalar-options closure.
+        self._num = num_cols(df)
+        self._cat = cat_cols(df)
+        self._all_cols = df.columns.tolist()
 
-        # Title (edit mode swaps chrome: label, accent colour, button text)
         opt = next((o for o in ANALYSIS_OPTIONS if o["id"] == aid), None)
         name = opt["name"] if opt else aid
-        if self._editing_uid:
-            title = QLabel("\u270f\ufe0f  Edit \u2014 " + name)
-            title.setStyleSheet("font-size: 14px; font-weight: 700;")
-            self.btn_generate.setText("\U0001f4be Update Chart")
-            self.btn_cancel_edit.setVisible(True)
-        else:
-            title = QLabel("\u2699\ufe0f  Configure \u2014 " + name)
-            title.setStyleSheet("font-size: 14px; font-weight: 700;")
-            self.btn_generate.setText("\u25b6 Generate Charts")
-            self.btn_cancel_edit.setVisible(False)
-        self.config_layout.addWidget(title)
+        editing = self._editing_uid is not None
 
-        spec = WIDGET_SPEC.get(aid, [])
-        current_group: Optional[str] = None
-        for widget_key, _kwarg, kind in spec:
-            group = _FIELD_GROUP.get(widget_key, "Options")
-            if group != current_group:
-                current_group = group
-                self._add_group_header(group)
-            label_text = _field_label(widget_key)
-
-            if kind in ("scalar", "scalar_map", "palette"):
-                combo = self._styled_combo(
-                    self._scalar_options(widget_key, num, cat, all_cols)
-                )
-                self._config_widgets[widget_key] = combo
-                self._add_field_row(label_text, combo)
-
-            elif kind == "list":
-                # Multi-select column bar on its own row so it gets real width.
-                pool = num if widget_key in ("x", "y", "x_cols", "y_cols") else all_cols
-                lw = QListWidget()
-                lw.setSelectionMode(QListWidget.MultiSelection)
-                lw.setMinimumHeight(110)
-                lw.setMaximumHeight(150)
-                lw.setStyleSheet("font-size: 12px; padding: 2px;")
-                for col in pool:
-                    item = QListWidgetItem(str(col))
-                    item.setData(Qt.UserRole, col)
-                    lw.addItem(item)
-                self._config_widgets[widget_key] = lw
-
-                list_col = QVBoxLayout()
-                list_col.setSpacing(4)
-                lab = QLabel(label_text)
-                list_col.addWidget(lab)
-                list_col.addWidget(lw)
-                self.config_layout.addLayout(list_col)
-
-            elif kind == "number":
-                spin = QSpinBox()
-                spin.setRange(0, 500)
-                spin.setValue(0)
-                spin.setMinimumHeight(30)
-                self._config_widgets[widget_key] = spin
-                self._add_field_row(label_text, spin)
-
-            elif kind == "bool":
-                chk = QCheckBox()
-                chk.setStyleSheet("font-size: 12px;")
-                self._config_widgets[widget_key] = chk
-                self._add_field_row(label_text, chk)
-
+        self.config_panel.set_logic(
+            spec=WIDGET_SPEC.get(aid, []),
+            scalar_options_fn=self._column_scalar_options,
+            field_group_fn=self._field_group_of,
+        )
+        self.config_panel.set_active(aid, name, editing=editing)
         if prefill:
-            self._prefill_widgets(prefill)
+            self.config_panel.prefill(prefill)
+        self.config_panel.setVisible(True)
+
+        self._update_config_chart_no()
+        self.notes_bar.set_analysis_type(aid)
+        self._show_chart_area(False)
+
+    def _update_config_chart_no(self) -> None:
+        n = 1
+        if self._editing_uid:
+            idx = self.charts_tabs.currentIndex()
+            n = idx + 1 if idx >= 0 else 1
+        else:
+            n = len(self._tab_order) + 1
+        self.config_panel.set_chart_number(n)
+
+    def _column_scalar_options(self, key: str) -> list:
+        NONE = "None"
+        if key in _NUMERIC_ONLY:
+            return [NONE] + self._num
+        if key in _CAT_ONLY:
+            return [NONE] + self._cat
+        return [NONE] + self._num + self._cat
+
+    def _field_group_of(self, key: str) -> str:
+        return _FIELD_GROUP.get(key, "Options")
+
+    def _show_descriptive(self) -> None:
+        self._active_analysis = "descriptive"
+        self.config_panel.setVisible(False)
+        self._refresh_descriptive_table()
+        self._show_chart_area(True)
+
+    def _refresh_descriptive_table(self) -> None:
+        df = self.bridge.df
+        if df is None:
+            return
+        while self.descriptive_container_layout.count():
+            item = self.descriptive_container_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        try:
+            results = run_analysis("descriptive", df)
+        except Exception as exc:  # pragma: no cover
+            log.error("Descriptive run failed: %s", exc)
+            results = []
+        if results:
+            uid, title, fig = results[0]
+            card = ChartCard(uid, title, fig, "descriptive")
+            card.set_note("")
+            for btn in (card.btn_edit, card.btn_style, card.btn_delete,
+                        card.btn_up, card.btn_down):
+                btn.setVisible(False)
+            self.descriptive_container_layout.addWidget(card, stretch=1)
+
+    def _show_chart_area(self, descriptive: bool) -> None:
+        has = len(self.bridge.get("charts", [])) > 0
+        self.tabs_row.setVisible(not descriptive and has)
+        self.charts_tabs.setVisible(not descriptive and has)
+        self.descriptive_container.setVisible(descriptive)
+        self.lbl_no_charts.setVisible(not descriptive and not has)
+        self.notes_bar.setVisible(not descriptive)
+
     def _collect_widget_values(self) -> dict:
-        """Collect current widget values into a dict for the analysis service."""
-        values = {}
-        for key, widget in self._config_widgets.items():
-            if isinstance(widget, QComboBox):
-                values[key] = widget.currentText()
-            elif isinstance(widget, QListWidget):
-                selected = [item.data(Qt.UserRole) for item in widget.selectedItems()]
-                values[key] = selected
-            elif isinstance(widget, QSpinBox):
-                values[key] = widget.value()
-            elif isinstance(widget, QCheckBox):
-                values[key] = widget.isChecked()
-        return values
+        return self.config_panel.collect_values()
+
+    # -- Config panel hooks (signals) -------------------------------------
+
+    def _on_add_chart(self) -> None:
+        """[+] -> start a fresh blank chart of the current type."""
+        aid = self._active_analysis
+        if not aid or aid == "descriptive":
+            return
+        self._editing_uid = None
+        self._build_config_panel(aid)
+
+    def _on_delete_current(self) -> None:
+        """[x] -> delete the currently-selected chart."""
+        idx = self.charts_tabs.currentIndex()
+        if 0 <= idx < len(self._tab_order):
+            self._on_delete_chart(self._tab_order[idx])
+
+    def _on_collapse_toggled(self, collapsed: bool) -> None:
+        if not self.config_panel.isVisible():
+            return
+        sizes = list(self._v_split.sizes())
+        sizes[0] = 40 if collapsed else 296
+        self._v_split.setSizes(sizes)
+
+    def _on_analysis_note_changed(self, text: str) -> None:
+        aid = self._active_analysis or ""
+        self.bridge.set(f"analysis_note__{aid}", text)
 
     def _on_generate(self) -> None:
         """Generate (or update) charts for the active analysis type."""
@@ -573,12 +527,6 @@ class AnalysisPage(QWidget):
                 w.deleteLater()
 
         charts = self.bridge.get("charts", [])
-        self.lbl_no_charts.setVisible(len(charts) == 0)
-        self.charts_tabs.setVisible(len(charts) > 0)
-        # Keep the section header + count in sync (hidden when nothing yet).
-        self.lbl_charts_header.setText(f"📈 Generated Charts ({len(charts)})")
-        self.lbl_charts_header.setVisible(len(charts) > 0)
-
         self._tab_order = []
         type_counter: dict = {}
         restore_idx = 0
@@ -597,18 +545,37 @@ class AnalysisPage(QWidget):
             card.style_changed.connect(self._on_style_changed)
 
             label = self._chart_tab_label(title, chart_type, type_counter)
-            self.charts_tabs.addTab(card, label)
-            self._chart_cards[uid] = card
+            pane = _TabPane(card)
+            pane.update_legend()
+            self.charts_tabs.addTab(pane, label)
             self._tab_order.append(uid)
+            self._chart_cards[uid] = card
             if uid == prev_uid:
                 restore_idx = i
 
+        # Keep chart-area visibility in sync (descriptive hides them).
+        descriptive = self._active_analysis == "descriptive"
+        self.tabs_row.setVisible((not descriptive) and len(charts) > 0)
+        self.charts_tabs.setVisible((not descriptive) and len(charts) > 0)
+        self.lbl_no_charts.setVisible((not descriptive) and len(charts) == 0)
+
         if charts:
             self.charts_tabs.setCurrentIndex(restore_idx)
+        self._update_current_legend()
 
     def _on_charts_changed(self, charts) -> None:
         """Handle charts_changed signal from the bridge."""
         self._refresh_charts()
+
+    def _on_tab_changed(self) -> None:
+        """Refresh the legend when the user switches charts (each tab pane
+        holds its own ChartCard + LegendPanel)."""
+        self._update_current_legend()
+
+    def _update_current_legend(self) -> None:
+        w = self.charts_tabs.currentWidget()
+        if isinstance(w, _TabPane):
+            w.update_legend()
 
     def _on_delete_chart(self, uid: str) -> None:
         """Delete a chart."""

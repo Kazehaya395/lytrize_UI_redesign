@@ -236,13 +236,11 @@ QLabel#version {{ font-size: 10px; color: palette(dark); padding: 8px 12px; }}
 QListWidget#nav_list {{ background: transparent; border: none; font-size: 14px; font-weight: 600; color: palette(window-text); outline: none; }}
 QListWidget#nav_list::item {{ background: transparent; padding: 10px 12px; border-radius: 8px; margin: 2px 0; }}
 QListWidget#nav_list::item:hover {{ background: {ACCENT_RGBA_HOVER}; }}
-QListWidget#nav_list::item:selected {{ background: {ACCENT_RGBA_SELECTED}; color: palette(bright-text); }}
-/* ---- Toolbar ---- */
-QToolBar {{ background: palette(window); border: none; spacing: 8px; padding: 4px 8px; }}
-QPushButton#btn_hamburger {{ background: transparent; color: palette(window-text); border: none; font-size: 18px; font-weight: bold; border-radius: 6px; }}
-QToolButton#btn_theme {{ background: transparent; border: none; border-radius: 6px; }}
-QPushButton#btn_hamburger:hover {{ background: {ACCENT_RGBA_HOVER}; }}
-QToolButton#btn_theme:hover {{ background: {ACCENT_RGBA_HOVER}; }}
+QListWidget#nav_list::item:selected {{ background: {ACCENT_RGBA_SELECTED}; color: palette(text); }}
+/* ---- Top rail (hamburger + theme toggle) ---- */
+#top_rail {{ background: palette(window); border-bottom: 1px solid palette(mid); }}
+QToolButton#topbar_btn {{ background: transparent; color: palette(window-text); border: none; border-radius: 6px; padding: 4px; }}
+QToolButton#topbar_btn:hover {{ background: {ACCENT_RGBA_HOVER}; }}
 /* ---- Generic labels ---- */
 QLabel[class="pageTitle"] {{ font-size: 20px; font-weight: 700; color: palette(window-text); }}
 QLabel[class="cardTitle"] {{ font-size: 14px; font-weight: 600; color: palette(window-text); }}
@@ -293,7 +291,7 @@ QPushButton[kind="ghost"] {{ background: transparent; color: palette(window-text
 QPushButton[kind="ghost"]:hover {{ background: {ACCENT_RGBA_HOVER}; color: palette(window-text); }}
 QPushButton[kind="icon"] {{ background: transparent; color: palette(window-text); border: none; border-radius: 4px; font-size: 13px; padding: 2px; }}
 QPushButton[kind="icon"]:hover {{ background: {ACCENT_RGBA_HOVER}; color: palette(window-text); }}
-QPushButton[kind="icon"]:checked {{ background: {ACCENT_RGBA_SELECTED}; color: palette(bright-text); }}
+QPushButton[kind="icon"]:checked {{ background: {ACCENT_RGBA_SELECTED}; color: palette(text); }}
 QPushButton[kind="icon"]:disabled {{ color: palette(mid); background: transparent; }}
 """
 
@@ -325,7 +323,7 @@ def _lists_qss():
 QListWidget, QListView {{ background: palette(window); color: palette(window-text); border: 1px solid palette(midlight); border-radius: 8px; font-size: {BASE_FONT_PT}dpt; outline: none; }}
 QListWidget::item, QListView::item {{ padding: 6px 10px; border-radius: 4px; }}
 QListWidget::item:hover, QListView::item:hover {{ background: {ACCENT_RGBA_HOVER}; }}
-QListWidget::item:selected, QListView::item:selected {{ background: {ACCENT_RGBA_SELECTED}; color: palette(bright-text); }}
+QListWidget::item:selected, QListView::item:selected {{ background: {ACCENT_RGBA_SELECTED}; color: palette(text); }}
 """
 
 
@@ -360,6 +358,13 @@ def _scroll_split_qss():
 QScrollArea { background: transparent; border: none; }
 QSplitter::handle { background: palette(midlight); }
 QSplitter::handle:hover { background: palette(mid); }
+QSplitter[style="analysis_v"]::handle { background: #1e293b; }
+QSplitter[style="analysis_v"]::handle:hover { background: #334155; }
+QSplitter::handle:horizontal { width: 6px; }
+QSplitter::handle:vertical { height: 6px; }
+
+/* Tab buttons (+/x) restyle */
+QTabBar::tab { padding: 6px 10px; }
 """
 
 

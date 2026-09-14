@@ -18,11 +18,11 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSize, QTimer
-from PySide6.QtGui import QIcon, QAction, QPixmap, QPainter, QPen, QColor, QShortcut, QKeySequence
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QPen, QColor, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QStackedWidget, QFrame, QListWidget,
-    QListWidgetItem, QStatusBar, QToolBar, QToolButton, QSizePolicy,
+    QLabel, QStackedWidget, QFrame, QListWidget,
+    QListWidgetItem, QStatusBar, QToolButton,
 )
 
 from desktop.session_bridge import SessionBridge
@@ -47,11 +47,16 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1024, 700)
         self.resize(1280, 800)
 
+        # QMainWindow ships with an empty menu bar; without a visible menu it
+        # can still reserve a strip at the very top (the white band reported
+        # above the pages). Hide it -- navigation lives in the sidebar.
+        self.menuBar().setVisible(False)
+
         self._theme_icon_cache: dict[str, QIcon] = {}
         self._build_ui()
         self._build_statusbar()
         self._build_nav()
-        self._build_toolbar()
+        self._build_top_rail()
         self._connect_signals()
 
         # Initialise the user session
@@ -83,9 +88,48 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
 
-        root = QHBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
+        # Outer vertical stack: persistent top rail (hamburger + theme, always
+        # visible even when the sidebar is hidden) above the body (sidebar +
+        # page stack). The rail spans the full window width so the ☰ button
+        # survives a sidebar toggle and the theme icon sits at the corner.
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # -- Top rail (compact, functional, never an empty band) --
+        self.top_rail = QFrame()
+        self.top_rail.setObjectName("top_rail")
+        self.top_rail.setFixedHeight(38)
+        rail_layout = QHBoxLayout(self.top_rail)
+        rail_layout.setContentsMargins(8, 0, 8, 0)
+        rail_layout.setSpacing(4)
+
+        # Hamburger: toggles ONLY the sidebar, so this button is always
+        # available to bring the sidebar back.
+        self.btn_sidebar_top = QToolButton()
+        self.btn_sidebar_top.setObjectName("topbar_btn")
+        self.btn_sidebar_top.setText("☰")
+        self.btn_sidebar_top.setToolTip("Toggle sidebar")
+        self.btn_sidebar_top.setIconSize(QSize(20, 20))
+        self.btn_sidebar_top.clicked.connect(self._toggle_sidebar)
+        rail_layout.addWidget(self.btn_sidebar_top)
+
+        rail_layout.addStretch()
+
+        # Theme toggle: pinned to the extreme top-right corner, one global
+        # instance, always visible regardless of page or sidebar state.
+        self.theme_btn = QToolButton()
+        self.theme_btn.setObjectName("topbar_btn")
+        self.theme_btn.setToolTip("Toggle dark / light theme")
+        self.theme_btn.setIconSize(QSize(20, 20))
+        self.theme_btn.clicked.connect(self.toggle_theme)
+        rail_layout.addWidget(self.theme_btn)
+        outer.addWidget(self.top_rail)
+
+        # -- Body: sidebar (left) + page stack (right) --
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
 
         # -- Sidebar (left) --
         self.sidebar = QFrame()
@@ -141,7 +185,7 @@ class MainWindow(QMainWindow):
         version.setObjectName("version")
         side_layout.addWidget(version)
 
-        root.addWidget(self.sidebar)
+        body.addWidget(self.sidebar)
 
         # Sidebar toggle state
         self._sidebar_visible = True
@@ -149,7 +193,9 @@ class MainWindow(QMainWindow):
         # -- Main content area --
         self.stack = QStackedWidget()
         self.stack.setObjectName("stack")
-        root.addWidget(self.stack, stretch=1)
+        body.addWidget(self.stack, stretch=1)
+
+        outer.addLayout(body)
 
         # Add pages
         self.pages = {}
@@ -188,47 +234,16 @@ class MainWindow(QMainWindow):
         self.nav_list.currentRowChanged.connect(self._on_nav_changed)
         self.nav_list.setCurrentRow(0)
 
-    def _build_toolbar(self) -> None:
-        """Build the top toolbar: hamburger (left), theme toggle (right)."""
-        toolbar = QToolBar("Main Toolbar")
-        toolbar.setMovable(False)
-        toolbar.setIconSize(QSize(20, 20))
-        # Compact shell: Fusion adds ~8px of internal chrome on top of the
-        # children, inflating the bar to 56px. 44px logical still fits the
-        # 36px hamburger and 40px theme toggle and scales with HiDPI (all
-        # sizes here are logical pixels, Qt scales them together).
-        toolbar.setFixedHeight(44)
-        self.addToolBar(toolbar)
-
-        # Hamburger menu button
-        self.btn_hamburger = QPushButton("☰")
-        self.btn_hamburger.setObjectName("btn_hamburger")
-        self.btn_hamburger.setFixedSize(36, 36)
-        self.btn_hamburger.setToolTip("Toggle sidebar")
-        self.btn_hamburger.clicked.connect(self._toggle_sidebar)
-        toolbar.addWidget(self.btn_hamburger)
-
-        # Spacer to push subsequent items to the right
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        toolbar.addWidget(spacer)
-
-        # Dark / light theme toggle (sun/moon glyphs reflect current mode).
+    def _build_top_rail(self) -> None:
+        # The rail itself (☰ + theme icon) is created in _build_ui. This hook
+        # just syncs the theme glyph + tooltip from the saved mode and wires
+        # the app-wide Ctrl+T shortcut. Called once from __init__.
         from desktop import theme as _theme_mod
-        _cur = _theme_mod.current_mode()
-        self.btn_theme = QToolButton()
-        self.btn_theme.setObjectName("btn_theme")
-        self.btn_theme.setFixedSize(40, 40)
-        self.btn_theme.setIconSize(QSize(32, 32))
-        self.btn_theme.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        self.btn_theme.setIcon(self._icon_for_current())
-        self.btn_theme.setToolTip(
-            "Switch to light mode (Ctrl+T)" if _cur == "dark"
+        self.theme_btn.setIcon(self._icon_for_current())
+        self.theme_btn.setToolTip(
+            "Switch to light mode (Ctrl+T)" if _theme_mod.current_mode() == "dark"
             else "Switch to dark mode (Ctrl+T)"
         )
-        self.btn_theme.clicked.connect(self.toggle_theme)
-        toolbar.addWidget(self.btn_theme)
-
         # Ctrl+T toggles the theme app-wide.
         self._theme_shortcut = QShortcut(QKeySequence("Ctrl+T"), self)
         self._theme_shortcut.activated.connect(self.toggle_theme)
@@ -297,10 +312,10 @@ class MainWindow(QMainWindow):
         # Instant feedback: swap glyph + status now (one frame, no repolish).
         # The glyph always shows the mode we'd switch to FROM the resulting
         # state, so it stays consistent with the actual theme afterwards.
-        self.btn_theme.setIcon(
+        self.theme_btn.setIcon(
             self._get_theme_icon("dark" if next_mode == "light" else "light")
         )
-        self.btn_theme.setToolTip(
+        self.theme_btn.setToolTip(
             "Switch to light mode (Ctrl+T)" if next_mode == "dark"
             else "Switch to dark mode (Ctrl+T)"
         )

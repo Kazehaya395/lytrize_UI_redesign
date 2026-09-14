@@ -12,12 +12,13 @@ from typing import Any, Optional
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTextEdit, QFrame, QScrollArea, QSizePolicy, QDialog, QDialogButtonBox,
+    QTextEdit, QFrame, QSizePolicy, QDialog, QDialogButtonBox,
 )
 
 from desktop.widgets.plotly_web_view import PlotlyWebView
 from desktop.widgets.chart_style_panel import ChartStylePanel
 from chart_style import apply_chart_style
+from modules.charts import PALETTES, COLORS
 
 log = logging.getLogger(__name__)
 
@@ -107,22 +108,8 @@ class ChartCard(QFrame):
         self.btn_delete.clicked.connect(lambda: self.delete_requested.emit(self.uid))
         header.addWidget(self.btn_delete)
 
-        # Expand/collapse toggle -- useful when several charts of the same
-        # type are on screen and one needs a closer look without navigating
-        # away or resizing the whole grid.
-        self.btn_expand = QPushButton("⤢")
-        self.btn_expand.setFixedSize(28, 28)
-        self.btn_expand.setCheckable(True)
-        self.btn_expand.setToolTip("Expand chart")
-        self.btn_expand.setProperty("kind", "icon")
-        self.btn_expand.toggled.connect(self._on_expand_toggled)
-        header.addWidget(self.btn_expand)
-
-        # Full-width toggle -- dashboard grid only (hidden by default,
-        # same pattern as btn_up/btn_down being hidden there and shown on
-        # Analysis instead). Lets one chart span the entire row instead of
-        # sharing it with the other grid slots, matching the old
-        # codebase's "Full Width" per-row option.
+        # Full-width toggle -- dashboard grid only (hidden by default, shown
+        # on the Dashboard page). Lets one chart span the entire grid row.
         self.btn_fullwidth = QPushButton("⬌")
         self.btn_fullwidth.setFixedSize(28, 28)
         self.btn_fullwidth.setCheckable(True)
@@ -144,14 +131,12 @@ class ChartCard(QFrame):
 
         # -- Plotly view --
         self.plot_view = PlotlyWebView()
-        # If this chart already has saved style settings (e.g. reloading
-        # a session), apply them now instead of showing the raw
-        # unstyled figure and only picking up styling the next time the
-        # user opens the style dialog.
+        # No hard-coded floor — Expanding policy + parent layout stretch
+        # means the chart auto-fits to whatever space the splitter leaves,
+        # so there is never a scrollbar fighting the viewport.
         if self._style:
             self._fig = apply_chart_style(self._base_fig, self._style, self._chart_type)
         self.plot_view.set_figure(self._fig)
-        self.plot_view.setMinimumHeight(300)
         layout.addWidget(self.plot_view, stretch=1)
 
         # -- Notes editor --
@@ -197,6 +182,70 @@ class ChartCard(QFrame):
         self.btn_fullwidth.setChecked(is_full_width)
         self.btn_fullwidth.blockSignals(False)
 
+    def legend_data(self) -> dict:
+        """Return a read-only description of this chart's legend for the
+        side LegendPanel.
+
+        Structure:
+          kind: "table" | "palette" | "colorscale" | "categories"
+          title: chart title
+          rows / colors / scale / domain+labels per kind
+
+        Pure function of self._chart_type + self._base_fig + self._style.
+        The LegendPanel renders it; this never touches Plotly figures.
+        """
+        palette_name = (self._style or {}).get("palette", "🔵 Default Blue-Purple")
+        palette = list(PALETTES.get(palette_name, PALETTES.get("🔵 Default Blue-Purple", COLORS)))
+        fig = self._base_fig
+
+        # go.Table (descriptive, matrix_table): no palette legend.
+        if fig is not None and any(type(t).__name__ == "Table" for t in getattr(fig, "data", []) or []):
+            return {"kind": "table", "title": self._title}
+
+        colorscale_names = {
+            "Blues", "Reds", "Greens", "Viridis", "Plasma", "Cividis", "Magma", "Inferno",
+        }
+        if fig is not None:
+            for tr in fig.data:
+                # Heatmap/choropleth: numeric colorbar.
+                if type(tr).__name__ in {"Heatmap", "Densitymapbox"}:
+                    cs = None
+                    try:
+                        cs = getattr(getattr(tr, "marker", None), "colorscale", None)
+                    except Exception:
+                        cs = None
+                    label = ""
+                    try:
+                        # hovertemplate or name fallback
+                        label = getattr(tr, "name", "") or ""
+                    except Exception:
+                        pass
+                    return {
+                        "kind": "colorscale",
+                        "title": self._title,
+                        "colorscale": cs or "Viridis",
+                        "label": label,
+                    }
+                # Pie: category -> color mapping.
+                if type(tr).__name__ == "Pie":
+                    labels = list(getattr(tr, "labels", []) or [])
+                    values = list(getattr(tr, "values", []) or [])
+                    colors = list(getattr(getattr(tr, "marker", None), "colors", None) or palette)
+                    rows = []
+                    for i, lab in enumerate(labels):
+                        c = colors[i % len(colors)]
+                        v = values[i] if i < len(values) else None
+                        rows.append({"label": str(lab), "value": v, "color": c})
+                    return {"kind": "categories", "title": self._title, "rows": rows}
+
+        # Generic bar/scatter/line: one palette swatch per trace name.
+        rows = []
+        if fig is not None:
+            for i, tr in enumerate(fig.data):
+                name = getattr(tr, "name", None) or f"Trace {i + 1}"
+                rows.append({"label": str(name), "color": palette[i % len(palette)]})
+        return {"kind": "palette", "title": self._title, "rows": rows}
+
     def apply_style(self, style: dict) -> None:
         """Re-skin this card in place from a dashboard export-style dict.
 
@@ -220,14 +269,6 @@ class ChartCard(QFrame):
 
     def _on_notes_changed(self) -> None:
         self.note_changed.emit(self.uid, self.notes.toPlainText())
-
-    def _on_expand_toggled(self, checked: bool) -> None:
-        if checked:
-            self.plot_view.setMinimumHeight(560)
-            self.btn_expand.setToolTip("Collapse chart")
-        else:
-            self.plot_view.setMinimumHeight(300)
-            self.btn_expand.setToolTip("Expand chart")
 
     def _on_open_style_dialog(self) -> None:
         """Open the granular chart-style controls in a dialog. Changes
