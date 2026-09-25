@@ -293,24 +293,40 @@ def slider_with_readout(minimum, maximum, value, is_int=True, step=1, readout_wi
     wrap._as_slider = sl
     wrap._as_spin = spin
     return wrap
+def _chip_style(col):
+    """Stylesheet for a colour chip: the row shows the COLOUR itself (as in
+    chart_designs.pdf) with the hex value kept on the tooltip."""
+    c = QColor(str(col or ''))
+    hexv = c.name() if c.isValid() else '#6163df'
+    return ('QPushButton { background: ' + hexv + '; border: 1px solid palette(mid);'
+            ' border-radius: 4px; color: transparent; }')
+
+
 def color_swatch(current, on_pick):
-    btn = QPushButton(str(current or ''))
-    btn.setFixedSize(96, 26)
+    btn = QPushButton()
+    btn.setFixedSize(56, 24)
     btn.setCursor(Qt.PointingHandCursor)
     btn.setProperty('theme_role', 'swatch')
     def _retint(col):
         try:
+            # The button's text is the current colour value (kept for
+            # prefill/restyle); it is painted transparently so the chip
+            # itself is what the user sees.
             btn.setText(str(col))
+            btn.setToolTip(str(col))
+            btn.setStyleSheet(_chip_style(col))
         except Exception:
             pass
     btn._retint = _retint
+    _retint(current)
     try:
         btn.clicked.connect(lambda: _pick())
     except Exception:
         pass
     def _pick():
         try:
-            col = QColorDialog.getColor(QColor(str(current or '#6163df')))
+            start = str(btn.text() or current or '#6163df')
+            col = QColorDialog.getColor(QColor(start))
             if col.isValid():
                 btn._retint(col.name())
                 on_pick(col.name())

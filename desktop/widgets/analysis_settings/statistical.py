@@ -20,7 +20,7 @@ class StatisticalSettings(AnalysisSettingsBase):
             self._layout_opts = {}
             self._typo_opts = {}
         self._pending = {'x': None, 'y': [], 'palette': None}
-        for attr in ('_as_slider', '_as_spin', '_cb_bmode', '_cb_fam', '_cb_fstyle', '_cb_hfont', '_cb_hfstyle', '_cb_legpos', '_cb_lpos', '_ck_grid', '_ck_vals', '_combo_groupby', '_combo_metrics', '_combo_palette', '_gap_slider', '_gap_spin', '_hs_slider', '_hs_spin', '_le_leg', '_le_title', '_le_x', '_le_y', '_ls_slider', '_ls_spin', '_prev1', '_prev2', '_sw_acol', '_sw_hcol', '_sw_lcol', '_sw_tcol', '_ts_slider', '_ts_spin'):
+        for attr in ('_as_slider', '_as_spin', '_axs_slider', '_axs_spin', '_cb_bmode', '_cb_fam', '_cb_fstyle', '_cb_hfont', '_cb_hfstyle', '_cb_legpos', '_cb_lpos', '_ck_grid', '_ck_vals', '_combo_groupby', '_combo_metrics', '_combo_palette', '_gap_slider', '_gap_spin', '_hs_slider', '_hs_spin', '_le_leg', '_le_title', '_le_x', '_le_y', '_ls_slider', '_ls_spin', '_prev1', '_prev2', '_sw_acol', '_sw_hcol', '_sw_lcol', '_sw_tcol', '_ts_slider', '_ts_spin'):
             if not hasattr(self, attr):
                 setattr(self, attr, None)
     def prefill(self, values):
@@ -108,12 +108,12 @@ class StatisticalSettings(AnalysisSettingsBase):
                     w.blockSignals(False)
             except Exception:
                 pass
-        for attr, key in (("_hs_spin", "header_size"), ("_ts_spin", "axis_title_size"), ("_ls_spin", "legend_item_size")):
+        for attr, key, dflt in (("_hs_spin", "header_size", 28), ("_ts_spin", "axis_title_size", 16), ("_axs_spin", "axis_tick_size", 12), ("_ls_spin", "legend_item_size", 11)):
             try:
                 w = getattr(self, attr, None)
                 if w is not None:
                     w.blockSignals(True)
-                    w.setValue(int(self._typo_opts.get(key, 12)))
+                    w.setValue(int(self._typo_opts.get(key, dflt)))
                     w.blockSignals(False)
             except Exception:
                 pass
@@ -130,13 +130,15 @@ class StatisticalSettings(AnalysisSettingsBase):
             pass
     def _on_groupby(self, text):
         self._pending['x'] = None if text in ('', NONE_SENTINEL) else text
-        self._mark_dirty(emit=False)
+        # emit=True so the host panel learns the form is dirty (Re-Generate
+        # stays disabled until something actually changed).
+        self._mark_dirty(emit=True)
     def _on_metrics(self, sel):
         self._pending['y'] = list(sel or [])
-        self._mark_dirty(emit=False)
+        self._mark_dirty(emit=True)
     def _on_palette(self, text):
         self._pending['palette'] = text
-        self._mark_dirty(emit=False)
+        self._mark_dirty(emit=True)
     def collect_values(self):
         try:
             x = self._pending.get('x')
@@ -205,52 +207,79 @@ class StatisticalSettings(AnalysisSettingsBase):
         rl.addWidget(cols)
         rl.addStretch()
         return root
-    def _section(self, title, body='', hint=''):
-        return section_box(title, body, hint) if isinstance(body, QWidget) else section_box(title, QWidget())
-    def _pill_row(self, label, widget, label_w=None):
-        return grid_row(label, widget, label_w or 128)
-    def _text_row(self, label, key, placeholder=''):
-        le = QLineEdit()
-        try:
-            le.setText(str(self._layout_opts.get(key, '') or ''))
-        except Exception:
-            pass
-        if placeholder:
-            le.setPlaceholderText(placeholder)
-        le.textChanged.connect(lambda t, k=key: self._set_layout(**{k: t}))
-        return grid_row(label, le)
+    @staticmethod
+    def _check_row(box):
+        """A checkbox that carries its own label (design: the tick box sits
+        in the label column instead of getting a separate leading label)."""
+        row = QWidget()
+        hl = QHBoxLayout(row)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(ROW_SPACING)
+        hl.addWidget(box)
+        hl.addStretch()
+        return row
+    @staticmethod
+    def _option_column():
+        """A vertical stack of option rows.
+
+        The Layout/Typography tabs lay several of these side by side (as in
+        chart_designs.pdf) so every control stays visible inside the short
+        top pane of the analysis splitter instead of clipping/scrolling.
+        """
+        col = QWidget()
+        lay = QVBoxLayout(col)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(HINT_GAP)
+        return col, lay
     def build_layout(self):
         root, rl = page_root()
+        cols = QWidget()
+        cl = QHBoxLayout(cols)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(SECTION_GAP)
+        left, ll_ = self._option_column()
+        right, rr = self._option_column()
         rl.addWidget(hint_label('\u2728 Live Preview \u2014 changes appear instantly on the chart \u2192'))
+        # -- Left column: chart / axis / legend titles (chart_designs.pdf) --
         self._le_title = QLineEdit(str(self._layout_opts.get('title', '') or ''))
         self._le_title.setPlaceholderText('Statistics of <metric> by <group>')
         self._le_title.textChanged.connect(lambda t: self._set_layout(title=t))
-        rl.addWidget(grid_row('Chart title', self._le_title))
+        ll_.addWidget(grid_row('Chart title', self._le_title))
         self._le_x = QLineEdit(str(self._layout_opts.get('x_label', '') or ''))
         self._le_x.textChanged.connect(lambda t: self._set_layout(x_label=t))
-        rl.addWidget(grid_row('X-axis', self._le_x))
+        ll_.addWidget(grid_row('X-axis', self._le_x))
         self._le_y = QLineEdit(str(self._layout_opts.get('y_label', '') or ''))
         self._le_y.textChanged.connect(lambda t: self._set_layout(y_label=t))
-        rl.addWidget(grid_row('Y-axis', self._le_y))
+        ll_.addWidget(grid_row('Y-axis', self._le_y))
         self._le_leg = QLineEdit(str(self._layout_opts.get('legend_title', '') or ''))
         self._le_leg.textChanged.connect(lambda t: self._set_layout(legend_title=t))
-        rl.addWidget(grid_row('Legend title', self._le_leg))
+        ll_.addWidget(grid_row('Legend title', self._le_leg))
+        # The mockup's Layout tab lists no legend-position row; it stays with
+        # the other legend control (still exercised) rather than being dropped.
+        self._cb_legpos = QComboBox()
+        cap_widget(self._cb_legpos, 200)
+        self._cb_legpos.addItems(LPOS_FRIENDLY)
+        self._cb_legpos.setCurrentText(str(self._layout_opts.get('legend_position', 'Top Right')))
+        self._cb_legpos.currentTextChanged.connect(lambda t: self._set_layout(legend_position=t))
+        ll_.addWidget(grid_row('Legend position', self._cb_legpos))
+        ll_.addStretch()
+        # -- Right column: the design's display rows, in design order --------
         self._ck_vals = QCheckBox('Show value labels')
-        self._ck_vals.setChecked(bool(self._layout_opts.get('show_value_labels', False)))
+        self._ck_vals.setChecked(bool(self._layout_opts.get('show_value_labels', True)))
         self._ck_vals.toggled.connect(lambda v: self._set_layout(show_value_labels=bool(v)))
-        rl.addWidget(grid_row('Labels', self._ck_vals))
+        rr.addWidget(self._check_row(self._ck_vals))
         self._cb_lpos = QComboBox()
         cap_widget(self._cb_lpos, 200)
         self._cb_lpos.addItems(LPOS)
         self._cb_lpos.setCurrentText(str(self._layout_opts.get('label_position', 'outside')))
         self._cb_lpos.currentTextChanged.connect(lambda t: self._set_layout(label_position=t))
-        rl.addWidget(grid_row('Label pos', self._cb_lpos))
+        rr.addWidget(grid_row('Label pos', self._cb_lpos))
         self._cb_bmode = QComboBox()
         cap_widget(self._cb_bmode, 200)
         self._cb_bmode.addItems(BMODES)
         self._cb_bmode.setCurrentText(str(self._layout_opts.get('bar_mode', 'group')))
         self._cb_bmode.currentTextChanged.connect(lambda t: self._set_layout(bar_mode=t))
-        rl.addWidget(grid_row('Bar mode', self._cb_bmode))
+        rr.addWidget(grid_row('Bar mode', self._cb_bmode))
         gap = slider_with_readout(0.0, 0.9, float(self._layout_opts.get('bar_gap', 0.28)), is_int=False, step=0.01)
         self._gap_slider = gap._as_slider
         self._gap_spin = gap._as_spin
@@ -258,17 +287,15 @@ class StatisticalSettings(AnalysisSettingsBase):
             self._gap_spin.valueChanged.connect(lambda v: self._set_layout(bar_gap=float(v)))
         except Exception:
             pass
-        rl.addWidget(grid_row('Bar gap', gap))
+        rr.addWidget(grid_row('Bar gap', gap))
         self._ck_grid = QCheckBox('Show grid')
         self._ck_grid.setChecked(bool(self._layout_opts.get('show_grid', True)))
         self._ck_grid.toggled.connect(lambda v: self._set_layout(show_grid=bool(v)))
-        rl.addWidget(grid_row('Grid', self._ck_grid))
-        self._cb_legpos = QComboBox()
-        cap_widget(self._cb_legpos, 200)
-        self._cb_legpos.addItems(LPOS_FRIENDLY)
-        self._cb_legpos.setCurrentText(str(self._layout_opts.get('legend_position', 'Top Right')))
-        self._cb_legpos.currentTextChanged.connect(lambda t: self._set_layout(legend_position=t))
-        rl.addWidget(grid_row('Legend position', self._cb_legpos))
+        rr.addWidget(self._check_row(self._ck_grid))
+        rr.addStretch()
+        cl.addWidget(left, stretch=1)
+        cl.addWidget(right, stretch=1)
+        rl.addWidget(cols)
         rl.addStretch()
         return root
     def _set_layout(self, emit=True, **kw):
@@ -276,6 +303,9 @@ class StatisticalSettings(AnalysisSettingsBase):
             self._layout_opts.update(kw)
         except Exception:
             pass
+        # Layout edits count as changes too: they dirty the form (gates
+        # Re-Generate) even though they also live-apply to the chart.
+        self._dirty = True
         if emit:
             try:
                 self.values_changed.emit({'layout': dict(self._layout_opts)})
@@ -283,21 +313,34 @@ class StatisticalSettings(AnalysisSettingsBase):
                 pass
     def build_typography(self):
         root, rl = page_root()
+        cols = QWidget()
+        cl = QHBoxLayout(cols)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(SECTION_GAP)
+        # Narrow label column: these three stacks sit side by side, so the
+        # controls need the horizontal room (chart_designs.pdf).
+        label_w = 104
+        body, bl = self._option_column()
+        head, hl = self._option_column()
+        axis, al = self._option_column()
         rl.addWidget(hint_label('\u2728 Live Preview \u2014 changes appear instantly on the chart \u2192'))
+        # -- Column 1: body font (family / style) + its live preview --------
         self._cb_fam = QComboBox()
         cap_widget(self._cb_fam, 220)
         self._cb_fam.addItems(FONTS)
         self._cb_fam.setCurrentText(str(self._typo_opts.get('family', 'Inter')))
         self._cb_fam.currentTextChanged.connect(lambda t: self._set_typo(family=t))
-        rl.addWidget(grid_row('Font family', self._cb_fam))
+        bl.addWidget(grid_row('Font family', self._cb_fam, label_w))
         self._cb_fstyle = QComboBox()
         cap_widget(self._cb_fstyle, 220)
         self._cb_fstyle.addItems(FSTYLES)
         self._cb_fstyle.setCurrentText(str(self._typo_opts.get('font_style', 'Normal')))
         self._cb_fstyle.currentTextChanged.connect(lambda t: self._set_typo(font_style=t))
-        rl.addWidget(grid_row('Font style', self._cb_fstyle))
+        bl.addWidget(grid_row('Font style', self._cb_fstyle, label_w))
         self._prev1 = live_preview_label()
-        rl.addWidget(self._prev1)
+        bl.addWidget(self._prev1)
+        bl.addStretch()
+        # -- Column 2: the header (the chart title) + its live preview ------
         hs = slider_with_readout(10, 60, int(self._typo_opts.get('header_size', 28)))
         self._hs_slider = hs._as_slider
         self._hs_spin = hs._as_spin
@@ -305,52 +348,61 @@ class StatisticalSettings(AnalysisSettingsBase):
             self._hs_spin.valueChanged.connect(lambda v: self._set_typo(header_size=int(v)))
         except Exception:
             pass
-        rl.addWidget(grid_row('Header size', hs))
+        hl.addWidget(grid_row('Header size', hs, label_w))
         self._sw_hcol = color_swatch(str(self._typo_opts.get('header_color', '#6163df')), lambda c: self._set_typo(header_color=c))
-        rl.addWidget(grid_row('Header color', self._sw_hcol))
+        hl.addWidget(grid_row('Header color', self._sw_hcol, label_w))
         self._cb_hfont = QComboBox()
         cap_widget(self._cb_hfont, 220)
         self._cb_hfont.addItems(FONTS)
         self._cb_hfont.setCurrentText(str(self._typo_opts.get('header_family', 'Inter')))
         self._cb_hfont.currentTextChanged.connect(lambda t: self._set_typo(header_family=t))
-        rl.addWidget(grid_row('Header font', self._cb_hfont))
+        hl.addWidget(grid_row('Header font', self._cb_hfont, label_w))
         self._cb_hfstyle = QComboBox()
         cap_widget(self._cb_hfstyle, 220)
         self._cb_hfstyle.addItems(FSTYLES)
         self._cb_hfstyle.setCurrentText(str(self._typo_opts.get('header_font_style', 'Normal')))
         self._cb_hfstyle.currentTextChanged.connect(lambda t: self._set_typo(header_font_style=t))
-        rl.addWidget(grid_row('Header font style', self._cb_hfstyle))
+        hl.addWidget(grid_row('Header font style', self._cb_hfstyle, label_w))
         self._prev2 = live_preview_label()
-        rl.addWidget(self._prev2)
-        ts = slider_with_readout(8, 32, int(self._typo_opts.get('axis_title_size', 12)))
+        hl.addWidget(self._prev2)
+        hl.addStretch()
+        cl.addWidget(head, stretch=1)
+        # -- Column 3: axis + legend typography -----------------------------
+        ts = slider_with_readout(8, 32, int(self._typo_opts.get('axis_title_size', 16)))
         self._ts_slider = ts._as_slider
         self._ts_spin = ts._as_spin
         try:
             self._ts_spin.valueChanged.connect(lambda v: self._set_typo(axis_title_size=int(v)))
         except Exception:
             pass
-        rl.addWidget(grid_row('Title size', ts))
+        al.addWidget(grid_row('Title size', ts, label_w))
         self._sw_tcol = color_swatch(str(self._typo_opts.get('axis_title_color', '#cbd5e1')), lambda c: self._set_typo(axis_title_color=c))
-        rl.addWidget(grid_row('Title color', self._sw_tcol))
-        axs = slider_with_readout(8, 24, int(self._typo_opts.get('axis_tick_size', 10)))
-        self._ts_slider = axs._as_slider
+        al.addWidget(grid_row('Title color', self._sw_tcol, label_w))
+        axs = slider_with_readout(8, 24, int(self._typo_opts.get('axis_tick_size', 12)))
+        self._axs_slider = axs._as_slider
+        self._axs_spin = axs._as_spin
         try:
-            axs._as_spin.valueChanged.connect(lambda v: self._set_typo(axis_tick_size=int(v)))
+            self._axs_spin.valueChanged.connect(lambda v: self._set_typo(axis_tick_size=int(v)))
         except Exception:
             pass
-        rl.addWidget(grid_row('Axis size', axs))
+        al.addWidget(grid_row('Axis size', axs, label_w))
         self._sw_acol = color_swatch(str(self._typo_opts.get('axis_tick_color', '#94a3b8')), lambda c: self._set_typo(axis_tick_color=c))
-        rl.addWidget(grid_row('Axis color', self._sw_acol))
+        al.addWidget(grid_row('Axis color', self._sw_acol, label_w))
         ls = slider_with_readout(8, 24, int(self._typo_opts.get('legend_item_size', 11)))
         self._ls_slider = ls._as_slider
         self._ls_spin = ls._as_spin
         try:
-            ls._as_spin.valueChanged.connect(lambda v: self._set_typo(legend_item_size=int(v), legend_title_size=int(v)))
+            self._ls_spin.valueChanged.connect(lambda v: self._set_typo(legend_item_size=int(v), legend_title_size=int(v)))
         except Exception:
             pass
-        rl.addWidget(grid_row('Legend size', ls))
+        al.addWidget(grid_row('Legend size', ls, label_w))
         self._sw_lcol = color_swatch(str(self._typo_opts.get('legend_item_color', '#e2e8f0')), lambda c: self._set_typo(legend_item_color=c, legend_title_color=c))
-        rl.addWidget(grid_row('Legend color', self._sw_lcol))
+        al.addWidget(grid_row('Legend color', self._sw_lcol, label_w))
+        al.addStretch()
+        cl.addWidget(body, stretch=1)
+        cl.addWidget(head, stretch=1)
+        cl.addWidget(axis, stretch=1)
+        rl.addWidget(cols)
         rl.addStretch()
         self._refresh_previews()
         return root
@@ -360,6 +412,8 @@ class StatisticalSettings(AnalysisSettingsBase):
             self._typo_opts.update(kw)
         except Exception:
             pass
+        # Same dirty-gate contract as _set_layout.
+        self._dirty = True
         try:
             self._refresh_previews()
         except Exception:

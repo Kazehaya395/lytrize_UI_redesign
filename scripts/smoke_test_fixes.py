@@ -1091,16 +1091,34 @@ def test_analysis_redesign():
     b = _Bridge(df)
     page = AnalysisPage(b)
 
-    # 1) +/- live next to Generate in the tabs strip (single Generate only).
-    check("analysis shell: +/- next to Generate",
+    # 1) Tabs strip: edit / delete / new-chart icons; Generate + Re-Generate
+    #    live in the settings panel (chart_designs.pdf layout).
+    check("analysis shell: edit/delete/new in tabs strip",
           page.btn_add_chart is not None and page.btn_remove_chart is not None
-          and page.btn_generate is not None
-          and page.btn_add_chart.parent() is page.btn_generate.parent()
-          and page.btn_remove_chart.parent() is page.btn_generate.parent(),
+          and page.btn_edit_chart is not None
+          and page.btn_add_chart.parent() is page.btn_remove_chart.parent()
+          and page.btn_edit_chart.parent() is page.btn_remove_chart.parent(),
           "")
+    # The action row only exists once a type with a settings form is built.
+    for i in range(page.analysis_list.count()):
+        it = page.analysis_list.item(i)
+        if it.data(Qt.UserRole) == "statistical":
+            page.analysis_list.setCurrentItem(it)
+            page._on_analysis_selected(it, None)
+            break
+    check("analysis shell: Generate moved into settings panel",
+          not hasattr(page, "btn_generate")
+          and page.config_panel.action_button() is not None
+          and page.config_panel.regenerate_button() is not None
+          and page.config_panel.action_button().parent().parent()
+          is page.config_panel.body_generate,
+          "")
+    check("analysis shell: Re-Generate starts disabled",
+          not page.config_panel.regenerate_button().isEnabled(), "")
 
     # 2) Non-descriptive types show the tabbed shell; exactly one page
-    #    visible at a time; no option field widgets exist in this phase.
+    #    visible at a time. Types with a registered settings builder
+    #    (statistical) get real option fields; the rest stay placeholders.
     for aid in WIDGET_SPEC:
         for i in range(page.analysis_list.count()):
             it = page.analysis_list.item(i)
@@ -1114,28 +1132,38 @@ def test_analysis_redesign():
               tab_names == ["Chart Generate/Edit", "Layout Options", "Typography Options"],
               str(tab_names))
         check(f"analysis shell '{aid}': only selected page visible",
-              panel.row1.currentWidget() is panel.body_generate
+              panel.current_body() is panel.body_generate
               and not panel.body_layout.isVisibleTo(panel)
               and not panel.body_typo.isVisibleTo(panel),
               "")
         fields = []
         for _cls in (QComboBox, QListWidget, QSpinBox, QCheckBox):
             fields.extend(panel.findChildren(_cls))
-        check(f"analysis shell '{aid}': no option fields yet",
-              fields == [], f"fields={[type(w).__name__ for w in fields]}")
+        if aid == "statistical":
+            # Registered builder -> real controls on all three tabs.
+            check(f"analysis shell '{aid}': settings fields present",
+                  len(fields) >= 3, f"fields={len(fields)}")
+            check(f"analysis shell '{aid}': has builder",
+                  panel.has_builder(), "")
+        else:
+            check(f"analysis shell '{aid}': no option fields yet",
+                  fields == [], f"fields={[type(w).__name__ for w in fields]}")
+            check(f"analysis shell '{aid}': no builder yet",
+                  not panel.has_builder(), "")
         # Switching to Layout/Typography shows ONLY that page.
         panel.tab_bar.setCurrentIndex(1)
         check(f"analysis shell '{aid}': layout page shows alone",
-              panel.row1.currentWidget() is panel.body_layout
+              panel.current_body() is panel.body_layout
               and not panel.body_generate.isVisibleTo(panel)
               and not panel.body_typo.isVisibleTo(panel),
               "")
         panel.tab_bar.setCurrentIndex(2)
         check(f"analysis shell '{aid}': typography page shows alone",
-              panel.row1.currentWidget() is panel.body_typo
+              panel.current_body() is panel.body_typo
               and not panel.body_generate.isVisibleTo(panel)
               and not panel.body_layout.isVisibleTo(panel),
               "")
+        panel.tab_bar.setCurrentIndex(0)
 
 
 def main():

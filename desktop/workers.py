@@ -43,27 +43,45 @@ class ImportWorker(QThread):
 
 
 class ChartGenerationWorker(QThread):
-    """Generate charts in a background thread."""
+    """Generate charts in a background thread.
+
+    ``layout_opts`` / ``typography_opts`` (from the Layout Options and
+    Typography Options settings tabs) are applied to every produced
+    figure right after generation so a chart is born already matching
+    the user's display settings -- see ``chart_display.apply_display_options``.
+    """
 
     finished_ok = Signal(object)      # emits list of (uid, title, fig)
     failed = Signal(str)              # emits error message
 
     def __init__(self, aid: str, df: pd.DataFrame, widget_values: dict,
-                 parent=None) -> None:
+                 parent=None, *, layout_opts: Optional[dict] = None,
+                 typography_opts: Optional[dict] = None) -> None:
         super().__init__(parent)
         self._aid = aid
         self._df = df
         self._widget_values = widget_values
+        self._layout_opts = dict(layout_opts) if layout_opts else None
+        self._typo_opts = dict(typography_opts) if typography_opts else None
 
     def run(self) -> None:
         try:
             from services.analysis_service import run_analysis_with_config
             from services.chart_service import apply_hover_format
+            from chart_display import apply_display_options
 
             results = run_analysis_with_config(self._aid, self._df, self._widget_values)
+            apply_display = (self._layout_opts is not None
+                             or self._typo_opts is not None)
+            out = []
             for uid, title, fig in results:
+                if apply_display:
+                    # apply_display_options returns a NEW figure.
+                    fig = apply_display_options(fig, self._layout_opts,
+                                                self._typo_opts)
                 apply_hover_format(fig)
-            self.finished_ok.emit(results)
+                out.append((uid, title, fig))
+            self.finished_ok.emit(out)
         except Exception as exc:
             log.error("ChartGenerationWorker failed: %s", exc)
             self.failed.emit(str(exc))

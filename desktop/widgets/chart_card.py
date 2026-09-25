@@ -18,9 +18,13 @@ from PySide6.QtWidgets import (
 from desktop.widgets.plotly_web_view import PlotlyWebView
 from desktop.widgets.chart_style_panel import ChartStylePanel
 from chart_style import apply_chart_style
-from modules.charts import PALETTES, COLORS
+from services.analysis_service import ANALYSIS_OPTIONS
 
 log = logging.getLogger(__name__)
+
+# id -> friendly display name, from the same list the analysis-type picker
+# uses, so a card header reads "Type: Statistical" instead of the raw id.
+_TYPE_NAME = {opt["id"]: opt["name"] for opt in ANALYSIS_OPTIONS}
 
 
 class ChartCard(QFrame):
@@ -125,7 +129,9 @@ class ChartCard(QFrame):
 
         # -- Chart type label --
         if self._chart_type:
-            type_lbl = QLabel(f"Type: {self._chart_type}")
+            friendly = _TYPE_NAME.get(self._chart_type,
+                                      self._chart_type.replace("_", " ").title())
+            type_lbl = QLabel(f"Type: {friendly}")
             type_lbl.setProperty("class", "faint"); type_lbl.setStyleSheet("font-size: 11px;")
             layout.addWidget(type_lbl)
 
@@ -181,70 +187,6 @@ class ChartCard(QFrame):
         self.btn_fullwidth.blockSignals(True)
         self.btn_fullwidth.setChecked(is_full_width)
         self.btn_fullwidth.blockSignals(False)
-
-    def legend_data(self) -> dict:
-        """Return a read-only description of this chart's legend for the
-        side LegendPanel.
-
-        Structure:
-          kind: "table" | "palette" | "colorscale" | "categories"
-          title: chart title
-          rows / colors / scale / domain+labels per kind
-
-        Pure function of self._chart_type + self._base_fig + self._style.
-        The LegendPanel renders it; this never touches Plotly figures.
-        """
-        palette_name = (self._style or {}).get("palette", "🔵 Default Blue-Purple")
-        palette = list(PALETTES.get(palette_name, PALETTES.get("🔵 Default Blue-Purple", COLORS)))
-        fig = self._base_fig
-
-        # go.Table (descriptive, matrix_table): no palette legend.
-        if fig is not None and any(type(t).__name__ == "Table" for t in getattr(fig, "data", []) or []):
-            return {"kind": "table", "title": self._title}
-
-        colorscale_names = {
-            "Blues", "Reds", "Greens", "Viridis", "Plasma", "Cividis", "Magma", "Inferno",
-        }
-        if fig is not None:
-            for tr in fig.data:
-                # Heatmap/choropleth: numeric colorbar.
-                if type(tr).__name__ in {"Heatmap", "Densitymapbox"}:
-                    cs = None
-                    try:
-                        cs = getattr(getattr(tr, "marker", None), "colorscale", None)
-                    except Exception:
-                        cs = None
-                    label = ""
-                    try:
-                        # hovertemplate or name fallback
-                        label = getattr(tr, "name", "") or ""
-                    except Exception:
-                        pass
-                    return {
-                        "kind": "colorscale",
-                        "title": self._title,
-                        "colorscale": cs or "Viridis",
-                        "label": label,
-                    }
-                # Pie: category -> color mapping.
-                if type(tr).__name__ == "Pie":
-                    labels = list(getattr(tr, "labels", []) or [])
-                    values = list(getattr(tr, "values", []) or [])
-                    colors = list(getattr(getattr(tr, "marker", None), "colors", None) or palette)
-                    rows = []
-                    for i, lab in enumerate(labels):
-                        c = colors[i % len(colors)]
-                        v = values[i] if i < len(values) else None
-                        rows.append({"label": str(lab), "value": v, "color": c})
-                    return {"kind": "categories", "title": self._title, "rows": rows}
-
-        # Generic bar/scatter/line: one palette swatch per trace name.
-        rows = []
-        if fig is not None:
-            for i, tr in enumerate(fig.data):
-                name = getattr(tr, "name", None) or f"Trace {i + 1}"
-                rows.append({"label": str(name), "color": palette[i % len(palette)]})
-        return {"kind": "palette", "title": self._title, "rows": rows}
 
     def apply_style(self, style: dict) -> None:
         """Re-skin this card in place from a dashboard export-style dict.

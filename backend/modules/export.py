@@ -56,9 +56,9 @@ def _default_text_style() -> dict:
         "legend_title_color": "#cbd5e1",
         "legend_item_size": 11,
         "legend_item_color": "#e2e8f0",
-        "axis_title_size": 12,
+        "axis_title_size": 16,
         "axis_title_color": "#cbd5e1",
-        "axis_tick_size": 10,
+        "axis_tick_size": 12,
         "axis_tick_color": "#94a3b8",
     }
 
