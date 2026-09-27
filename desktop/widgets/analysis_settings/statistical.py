@@ -155,12 +155,14 @@ class StatisticalSettings(AnalysisSettingsBase):
         cl = QHBoxLayout(cols)
         cl.setContentsMargins(0, 0, 0, 0)
         cl.setSpacing(SECTION_GAP)
+        # Compact Generate fields: fixed ~210px widths per annotated design.
+        GEN_W = 210
         gbody = QWidget()
         gl = QVBoxLayout(gbody)
         gl.setContentsMargins(0, 0, 0, 0)
         gl.setSpacing(HINT_GAP)
         self._combo_groupby = QComboBox()
-        cap_widget(self._combo_groupby)
+        cap_widget(self._combo_groupby, GEN_W)
         opts = [NONE_SENTINEL] + list(self._group_cols or [])
         self._combo_groupby.addItems(opts)
         cur = self._pending.get('x')
@@ -171,12 +173,13 @@ class StatisticalSettings(AnalysisSettingsBase):
         self._combo_groupby.currentTextChanged.connect(self._on_groupby)
         gl.addWidget(self._combo_groupby)
         gl.addStretch()
-        cl.addWidget(section_box('Group by (optional)', gbody, 'None = summarise the whole dataset'), stretch=1)
+        cl.addWidget(section_box('Group by (optional)', gbody, 'None = summarise the whole dataset'))
         mbody = QWidget()
         ml = QVBoxLayout(mbody)
         ml.setContentsMargins(0, 0, 0, 0)
         ml.setSpacing(HINT_GAP)
         self._combo_metrics = multi_select_combo(list(self._num_cols or []))
+        cap_widget(self._combo_metrics, GEN_W)
         try:
             self._combo_metrics.set_selection(list(self._pending.get('y') or []))
         except Exception:
@@ -187,13 +190,13 @@ class StatisticalSettings(AnalysisSettingsBase):
             pass
         ml.addWidget(self._combo_metrics)
         ml.addStretch()
-        cl.addWidget(section_box('Metrics', mbody, 'Dropdown with checkboxes; click to expand'), stretch=1)
+        cl.addWidget(section_box('Metrics', mbody, 'Dropdown with checkboxes; click to expand'))
         pbody = QWidget()
         pl = QVBoxLayout(pbody)
         pl.setContentsMargins(0, 0, 0, 0)
         pl.setSpacing(HINT_GAP)
         self._combo_palette = QComboBox()
-        cap_widget(self._combo_palette)
+        cap_widget(self._combo_palette, GEN_W)
         pals = list(self._palette_names or ['Default'])
         self._combo_palette.addItems(pals)
         if self._pending.get('palette') in pals:
@@ -203,7 +206,8 @@ class StatisticalSettings(AnalysisSettingsBase):
         self._combo_palette.currentTextChanged.connect(self._on_palette)
         pl.addWidget(self._combo_palette)
         pl.addStretch()
-        cl.addWidget(section_box('\U0001f3a8 Palette', pbody), stretch=1)
+        cl.addWidget(section_box('\U0001f3a8 Palette', pbody))
+        cl.addStretch()
         rl.addWidget(cols)
         rl.addStretch()
         return root

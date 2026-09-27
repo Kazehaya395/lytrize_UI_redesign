@@ -453,12 +453,9 @@ def test_page_flows(page, b):
           and page._settings_target_uid == page._tab_order[other_idx],
           f"{page._active_analysis} / {page._settings_target_uid}")
 
-    # -- ➕ New chart unbinds -----------------------------------------------
-    page._on_add_chart()
-    check("new chart: target cleared", page._settings_target_uid is None, "")
-    _set_form(page, "region", ["profit"])
-    check("new chart: dirty change still cannot Re-Generate (no target)",
-          not panel.regenerate_button().isEnabled(), "")
+    # -- Generate always appends (no blank-form flow) ------------------------
+    check("no blank-form flow: _on_add_chart removed",
+          not hasattr(page, "_on_add_chart"), "")
 
     # -- Delete selected chart clears the binding ---------------------------
     n_charts = len(page._tab_order)

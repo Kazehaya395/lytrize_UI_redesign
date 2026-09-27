@@ -36,10 +36,17 @@ log = logging.getLogger(__name__)
 
 # Dashed "replace the previous chart" look for Re-Generate (the design
 # calls it out with a dashed border so it reads as the *edit* action).
+# The :enabled rule matters: Qt re-polishes on setEnabled(), and without an
+# explicit enabled-state rule the button can render flat grey after a
+# disable/enable cycle (reported as "Re-Generate not highlighted during
+# chart edit, but Generate is").
 _REGENERATE_QSS = """
 QPushButton[kind="regenerate"] {
     background: transparent; border: 1px dashed #6163df; color: #6163df;
     border-radius: 8px; padding: 8px 16px; font-weight: 600;
+}
+QPushButton[kind="regenerate"]:enabled {
+    background: rgba(97, 99, 223, 18); border: 1px dashed #6163df; color: #6163df;
 }
 QPushButton[kind="regenerate"]:hover { background: rgba(97, 99, 223, 40); }
 QPushButton[kind="regenerate"]:disabled { border: 1px dashed #94a3b8; color: #94a3b8; }
@@ -63,10 +70,9 @@ class AnalysisConfigPanel(QFrame):
         self._spec: list[tuple[str, str, str]] = []
         self._editing = False
         self._active_aid: Optional[str] = None
-        # Header state: which analysis type is on screen and, when the form is
-        # bound to an existing chart, which one ("Edit — Statistical · Chart 2")
-        # -- with several charts of one analysis open, the bind target is not
-        # otherwise obvious from the form itself.
+        # Header state: which analysis type is on screen. (A per-chart
+        # "Edit — ..." suffix was removed per UI review; the bind target is
+        # tracked by the page's _settings_target_uid, not shown here.)
         self._active_name: str = ""
         self._chart_no: int = 0
         self._chart_title: str = ""
@@ -169,25 +175,28 @@ class AnalysisConfigPanel(QFrame):
         self._ctx = {k: v for k, v in ctx.items() if v is not None}
 
     def set_chart_number(self, n: int, title: str = "") -> None:
-        """Name the chart this form is bound to in the header, e.g.
-        "✏️ Edit — Statistical · Chart 2".
+        """Record which chart the form is bound to (header shows type only).
 
-        *n* is the chart's position among the charts of the SAME analysis type
-        (the same numbering the compact tab labels use, "Statistical 2"), and
-        *title* is the chart's full title, shown as the header's tooltip since
-        it is usually too long to print. ``n=0`` means "not bound to an
-        existing chart" (a fresh blank form).
+        Kept API-compatible: the page still reports the bound chart's
+        position among its analysis type, but the pinned header no longer
+        renders the old per-chart suffix (removed per UI review -- it
+        duplicated the chart-tabs strip and stole width). The bind truth
+        lives in the page's ``_settings_target_uid``.
         """
         self._chart_no = int(n) if n else 0
         self._chart_title = title or ""
         self._refresh_header()
 
     def _refresh_header(self) -> None:
-        """Rebuild the pinned header text from the current bind state."""
-        prefix = "✏️  Edit — " if self._editing else "⚙️  Configure — "
-        label = prefix + (self._active_name or "")
-        if self._chart_no:
-            label += f"   ·   Chart {self._chart_no}"
+        """Update the pinned header title (no per-chart suffix).
+
+        Removed per UI review (Image 3: "Remove this useless section"): the
+        "Edit — <Type> · Chart N" suffix duplicated the chart-tabs strip
+        below and stole horizontal space. The bind target stays in
+        ``_editing``/``_chart_no`` for API compatibility, but the header
+        only ever shows which analysis type is on screen.
+        """
+        label = (self._active_name or "").strip() or "Settings"
         self.lbl_title.setText(label)
         self.lbl_title.setToolTip(self._chart_title or "")
 
@@ -269,6 +278,11 @@ class AnalysisConfigPanel(QFrame):
         if btn is None or self._actions_busy:
             return
         btn.setEnabled(bool(enabled))
+        # Re-apply the QSS after every enable/disable flip: Qt re-polishes
+        # on setEnabled() and the inline sheet can lose to the stock
+        # disabled look, leaving Re-Generate flat grey while Generate
+        # (theme-styled) highlights normally (Image 3 report).
+        btn.setStyleSheet(_REGENERATE_QSS)
 
     def set_actions_busy(self, busy: bool, text: Optional[str] = None) -> None:
         """Disable both action buttons while a generation worker runs.
@@ -288,6 +302,8 @@ class AnalysisConfigPanel(QFrame):
         if regen is not None:
             if busy:
                 regen.setEnabled(False)
+            # Keep the dashed-accent look in sync (see set_regenerate_enabled).
+            regen.setStyleSheet(_REGENERATE_QSS)
 
     def _build_action_row(self) -> QWidget:
         row = QWidget()
@@ -416,7 +432,7 @@ class AnalysisConfigPanel(QFrame):
             ):
                 _lay = _page.layout()
                 _lbl = QLabel(_name)
-                _lbl.setStyleSheet("font-size: 11px;")
+                _lbl.setStyleSheet("font-size: 13px;")
                 _lay.addWidget(_lbl)
 
         # Generate / Re-Generate always live in the Generate tab (design).

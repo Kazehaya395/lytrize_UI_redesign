@@ -207,40 +207,9 @@ class AnalysisPage(QWidget):
         self.charts_tabs.tabCloseRequested.connect(self._on_tab_close)
         self.charts_tabs.currentChanged.connect(self._on_tab_changed)
 
-        # Tab-strip action row: edit / delete / new live beside each other
-        # (test_analysis_redesign asserts the three share one parent).
-        # The Generate / Re-Generate pair itself is owned by the
-        # AnalysisConfigPanel; this strip stays a slim icon row so the
-        # chart keeps the full pane below it.
-        self.tabs_row = QWidget()
-        self.tabs_row.setFixedHeight(32)
-        _tr = QHBoxLayout(self.tabs_row)
-        _tr.setContentsMargins(0, 4, 0, 4)
-        _tr.setSpacing(6)
-
-        self.btn_edit_chart = QPushButton("✏️")
-        self.btn_edit_chart.setFixedSize(24, 24)
-        self.btn_edit_chart.setToolTip("Edit selected chart")
-        self.btn_edit_chart.setProperty("kind", "icon")
-        self.btn_edit_chart.clicked.connect(self._on_edit_current)
-        _tr.addWidget(self.btn_edit_chart)
-
-        self.btn_remove_chart = QPushButton("🗑")
-        self.btn_remove_chart.setFixedSize(24, 24)
-        self.btn_remove_chart.setToolTip("Delete selected chart")
-        self.btn_remove_chart.setProperty("kind", "icon")
-        self.btn_remove_chart.clicked.connect(self._on_delete_current)
-        _tr.addWidget(self.btn_remove_chart)
-
-        self.btn_add_chart = QPushButton("➕")
-        self.btn_add_chart.setFixedSize(24, 24)
-        self.btn_add_chart.setToolTip("New chart (blank settings)")
-        self.btn_add_chart.setProperty("kind", "icon")
-        self.btn_add_chart.clicked.connect(self._on_add_chart)
-        _tr.addWidget(self.btn_add_chart)
-        _tr.addStretch()
-
-        bl.addWidget(self.tabs_row)
+        # Compact tab bar: edit/delete live only on the card header, and
+        # new charts come from Generate, so no action strip sits above the
+        # tabs -- the chart keeps the full pane below the bar.
         bl.addWidget(self.charts_tabs, stretch=1)
 
         # Descriptive-only full-area table view.
@@ -267,7 +236,6 @@ class AnalysisPage(QWidget):
         splitter.setSizes([220, 800])
 
         # Initial view: nothing selected yet -> nothing in the bottom pane.
-        self.tabs_row.setVisible(False)
         self.charts_tabs.setVisible(False)
         self.descriptive_container.setVisible(False)
         self.lbl_no_charts.setVisible(False)
@@ -473,20 +441,16 @@ class AnalysisPage(QWidget):
             card = ChartCard(uid, title, fig, "descriptive")
             card.set_note("")
             for btn in (card.btn_edit, card.btn_style, card.btn_delete,
-                        card.btn_up, card.btn_down):
+                        card.btn_up, card.btn_down, card.btn_fullwidth):
                 btn.setVisible(False)
             self.descriptive_container_layout.addWidget(card, stretch=1)
 
     def _show_chart_area(self, descriptive: bool) -> None:
-        """Switch the bottom pane between the chart strip, the descriptive
-        table, and the empty-state hint.
-
-        The tab strip and its slim icon row stay visible for every
-        chart-producing type -- even with zero charts -- so the ➕ "New
-        chart" action is always reachable from the same place.
+        """Switch the bottom pane between the chart tabs, the descriptive
+        table, and the empty-state hint. New charts come from the
+        Generate button in the settings panel.
         """
         has = len(self.bridge.get("charts", [])) > 0
-        self.tabs_row.setVisible(not descriptive)
         self.charts_tabs.setVisible(not descriptive)
         self.descriptive_container.setVisible(descriptive)
         self.lbl_no_charts.setVisible(not descriptive and not has)
@@ -495,38 +459,6 @@ class AnalysisPage(QWidget):
         return self.config_panel.collect_values()
 
     # -- Config panel hooks (signals) -------------------------------------
-
-    def _on_add_chart(self) -> None:
-        """[➕] -> start a fresh blank chart of the current type.
-
-        Deliberately unbinds the settings form from the selected chart tab
-        (Re-Generate has no target until a chart tab is selected again)."""
-        aid = self._active_analysis
-        if not aid or aid == "descriptive":
-            return
-        self._build_config_panel(aid, bind=False)
-        # Re-open the settings pane if the user had collapsed it: the blank
-        # form we just prepared would otherwise stay invisible.
-        self.config_panel.expand()
-
-    def _current_tab_uid(self) -> Optional[str]:
-        """Uid of the currently selected chart tab (None when empty)."""
-        idx = self.charts_tabs.currentIndex()
-        if 0 <= idx < len(self._tab_order):
-            return self._tab_order[idx]
-        return None
-
-    def _on_edit_current(self) -> None:
-        """[✏️] -> edit the chart on the selected tab."""
-        uid = self._current_tab_uid()
-        if uid:
-            self._on_edit_chart(uid)
-
-    def _on_delete_current(self) -> None:
-        """[🗑] -> delete the chart on the selected tab (asks first)."""
-        uid = self._current_tab_uid()
-        if uid:
-            self._on_delete_chart(uid)
 
     def _on_collapse_toggled(self, collapsed: bool) -> None:
         if not self.config_panel.isVisible():
@@ -782,10 +714,11 @@ class AnalysisPage(QWidget):
             card.set_note(note)
             card.delete_requested.connect(self._on_delete_chart)
             card.edit_requested.connect(self._on_edit_chart)
-            card.move_up_requested.connect(self._on_move_up)
-            card.move_down_requested.connect(self._on_move_down)
+            # Analysis cards keep only edit + delete on the header: style
+            # lives in the Layout/Typography tabs, reorder via tab drag.
+            for _btn in (card.btn_up, card.btn_down, card.btn_style):
+                _btn.setVisible(False)
             card.note_changed.connect(self._on_note_changed)
-            card.style_changed.connect(self._on_style_changed)
 
             label = self._chart_tab_label(title, chart_type, type_counter)
             idx = self.charts_tabs.addTab(card, label)
@@ -799,10 +732,7 @@ class AnalysisPage(QWidget):
                 restore_idx = i
 
         # Keep chart-area visibility in sync (descriptive shows the table).
-        # The strip + its icon row stay for every chart-producing type --
-        # the ➕ row is the only "new chart" affordance when none exist yet.
         descriptive = self._active_analysis == "descriptive"
-        self.tabs_row.setVisible(not descriptive)
         self.charts_tabs.setVisible(not descriptive)
         self.lbl_no_charts.setVisible((not descriptive) and len(charts) == 0)
 
@@ -819,11 +749,28 @@ class AnalysisPage(QWidget):
 
     def _on_tab_changed(self, *args) -> None:
         """Bind the settings form to the newly selected chart (per-chart
-        settings: prefill + dirty-gate reset)."""
+        settings: prefill + dirty-gate reset) and repaint its view.
+
+        A hidden tab's web view may never have run its pending page load
+        while off-screen ("only the last chart shows, other tabs blank") --
+        now that the tab is visible, replay its already-computed figure so
+        it paints immediately. showEvent on PlotlyWebView covers the same
+        case from the widget side; this is the page-side belt-and-braces.
+        Runs unconditionally (even when the settings bind is a no-op) so
+        every tab switch repaints. Plotly.react is in-place: flicker-free.
+        """
         if self._refreshing_charts:
             return
         if self._active_analysis:
             self._bind_selected_chart_settings()
+        try:
+            idx = self.charts_tabs.currentIndex()
+            if 0 <= idx < len(self._tab_order):
+                card = self._chart_cards.get(self._tab_order[idx])
+                if card is not None:
+                    card.refresh_view()
+        except Exception:
+            log.debug("tab-change view refresh failed", exc_info=True)
 
     def _ask_delete(self, uid: str) -> bool:
         """Confirm a chart deletion. There is no undo, and the ✕ on a tab used
@@ -918,33 +865,9 @@ class AnalysisPage(QWidget):
         except ValueError:
             pass
 
-    def _on_move_up(self, uid: str) -> None:
-        """Move a chart up in the list."""
-        charts = list(self.bridge.get("charts", []))
-        idx = next((i for i, c in enumerate(charts) if c[0] == uid), -1)
-        if idx > 0:
-            charts[idx - 1], charts[idx] = charts[idx], charts[idx - 1]
-            self.bridge.set("charts", charts)
-            self._refresh_charts()
-
-    def _on_move_down(self, uid: str) -> None:
-        """Move a chart down in the list."""
-        charts = list(self.bridge.get("charts", []))
-        idx = next((i for i, c in enumerate(charts) if c[0] == uid), -1)
-        if 0 <= idx < len(charts) - 1:
-            charts[idx], charts[idx + 1] = charts[idx + 1], charts[idx]
-            self.bridge.set("charts", charts)
-            self._refresh_charts()
-
     def _on_note_changed(self, uid: str, text: str) -> None:
         """Handle note changes from a chart card."""
         self.bridge.set_note(uid, text)
-
-    def _on_style_changed(self, uid: str, style: dict) -> None:
-        """Persist a chart's style settings to the bridge -- same pattern
-        as _on_note_changed, so styling survives a session save instead
-        of only living on the in-memory ChartCard instance."""
-        self.bridge.set_chart_meta(uid, display_options=style)
 
     def _on_clear_all(self) -> None:
         """Clear all charts."""

@@ -212,6 +212,68 @@ class PlotlyWebView(QWidget):
             except Exception as exc:  # pragma: no cover — JS runtime
                 log.debug("Plotly resize forward failed: %s", exc)
 
+    def showEvent(self, event):  # noqa: N802 — Qt override signature
+        """Re-push the current figure when this widget becomes visible.
+
+        Root-cause fix for "only the last created/edited chart shows, other
+        tabs are blank": a ``QWebEngineView`` living inside a hidden
+        ``QTabWidget`` page does not reliably run its pending page load while
+        it is off-screen, so ``_on_load_finished`` never fires for that tab
+        and the figure sent by ``set_figure()`` sits in ``_pending_fig_json``
+        forever. The freshly generated chart always worked because generation
+        selects its tab (making it visible, so its page loads); switching
+        back to an older chart's tab showed a blank view.
+
+        On first show after construction this forces the pending shell load;
+        on later shows (tab re-selected) it re-emits the current figure so a
+        tab whose page loaded while hidden repaints at the correct size.
+        ``set_figure()`` during generation stays the single write path --
+        this only *replays* the latest figure, never recomputes anything.
+        """
+        super().showEvent(event)
+        if not self._use_web_engine or self._web_view is None:
+            return
+        try:
+            if not self._page_loaded:
+                # Kick the deferred shell load for a tab that was hidden
+                # since construction; the pending figure flushes from
+                # _on_load_finished as usual.
+                self._web_view.load(self._shell_url)
+            elif self._current_fig is not None:
+                import plotly.io as pio
+                self._bridge.figureReady.emit(pio.to_json(self._current_fig))
+        except Exception as exc:  # pragma: no cover — JS bridge runtime
+            log.debug("Plotly showEvent re-push failed: %s", exc)
+
+    def showEvent(self, event):  # noqa: N802 — Qt override signature
+        """Re-push the current figure when this widget becomes visible.
+
+        Root-cause fix for "only the last created/edited chart shows, other
+        tabs are blank": a ``QWebEngineView`` inside a hidden ``QTabWidget``
+        page does not reliably run its pending page load while off-screen,
+        so ``_on_load_finished`` never fires for that tab and the figure
+        sent by ``set_figure()`` sits in ``_pending_fig_json`` forever. The
+        freshly generated chart always worked because generation selects
+        its tab (visible → page loads); older tabs stayed blank.
+
+        On first show this kicks the deferred shell load (pending figure
+        flushes from ``_on_load_finished`` as usual); on later shows it
+        re-emits the current figure so a tab that loaded while hidden
+        repaints at the correct size. ``set_figure()`` stays the single
+        write path -- this only *replays* the latest figure.
+        """
+        super().showEvent(event)
+        if not self._use_web_engine or self._web_view is None:
+            return
+        try:
+            if not self._page_loaded:
+                self._web_view.load(self._shell_url)
+            elif self._current_fig is not None:
+                import plotly.io as pio
+                self._bridge.figureReady.emit(pio.to_json(self._current_fig))
+        except Exception as exc:  # pragma: no cover — JS bridge runtime
+            log.debug("Plotly showEvent re-push failed: %s", exc)
+
     # -- Internal --------------------------------------------------------
 
     def _on_load_finished(self, ok: bool) -> None:

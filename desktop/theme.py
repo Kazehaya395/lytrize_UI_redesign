@@ -436,7 +436,7 @@ def input_style(mode=None):
         "QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit {"
         f"  background: {t['input_bg']}; color: {t['text']};"
         f"  border: 1px solid {t['border']}; border-radius: 6px;"
-        "  padding: 4px 10px; font-size: 12px;"
+        "  padding: 5px 10px; font-size: 13px;"
         "}"
         "QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover, QLineEdit:hover { border-color: " + ACCENT_LIGHT + " }"
         "QComboBox QAbstractItemView {"
@@ -449,12 +449,17 @@ def input_style(mode=None):
 
 def label_style(mode=None):
     t = mode_tokens(mode)
-    return f"font-size: 12px; font-weight: 500; color: {t['text_muted']};"
+    # 13px/600 body: UI review (Image 3) flagged every Generate/Layout/
+    # Typography caption as "extreme small, unreadable" -- 12px/500 sits
+    # below the app's own 13px body baseline.
+    return f"font-size: 13px; font-weight: 600; color: {t['text']};"
 
 
 def group_label_style(mode=None):
     t = mode_tokens(mode)
-    return f"font-size: 11px; font-weight: 700; color: {ACCENT_LIGHT}; letter-spacing: 0.6px;"
+    # 13px section headers to match (same Image 3 review -- the old 11px
+    # accent caps were the worst offenders).
+    return f"font-size: 13px; font-weight: 700; color: {ACCENT_LIGHT}; letter-spacing: 0.6px;"
 
 
 def hr_style(mode=None):

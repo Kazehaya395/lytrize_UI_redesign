@@ -1091,13 +1091,14 @@ def test_analysis_redesign():
     b = _Bridge(df)
     page = AnalysisPage(b)
 
-    # 1) Tabs strip: edit / delete / new-chart icons; Generate + Re-Generate
-    #    live in the settings panel (chart_designs.pdf layout).
-    check("analysis shell: edit/delete/new in tabs strip",
-          page.btn_add_chart is not None and page.btn_remove_chart is not None
-          and page.btn_edit_chart is not None
-          and page.btn_add_chart.parent() is page.btn_remove_chart.parent()
-          and page.btn_edit_chart.parent() is page.btn_remove_chart.parent(),
+    # 1) Compact tab bar: no action strip above the tabs (edit/delete live
+    #    only on the card header); Generate + Re-Generate live in the
+    #    settings panel (chart_designs.pdf layout).
+    check("analysis shell: no action strip above chart tabs",
+          not hasattr(page, "tabs_row")
+          and not hasattr(page, "btn_add_chart")
+          and not hasattr(page, "btn_edit_chart")
+          and not hasattr(page, "btn_remove_chart"),
           "")
     # The action row only exists once a type with a settings form is built.
     for i in range(page.analysis_list.count()):

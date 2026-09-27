@@ -181,6 +181,46 @@ class ChartCard(QFrame):
         """Return the current notes text."""
         return self.notes.toPlainText()
 
+    def current_figure(self) -> Any:
+        """Return the figure currently shown on this card (styled)."""
+        return self._fig
+
+    def refresh_view(self) -> None:
+        """Re-push the current figure into the web view.
+
+        Called when the card's tab becomes visible again: a
+        ``QWebEngineView`` inside a hidden ``QTabWidget`` page does not
+        reliably run its pending page load while off-screen, so a chart
+        created while another tab was selected can stay blank until its
+        figure is replayed after the tab is shown. ``Plotly.react`` is
+        in-place, so replaying the already-computed figure is flicker-free.
+        """
+        try:
+            if self._fig is not None and hasattr(self, "plot_view"):
+                self.plot_view.set_figure(self._fig)
+        except Exception:
+            log.debug("ChartCard.refresh_view failed", exc_info=True)
+
+    def current_figure(self) -> Any:
+        """Return the figure currently shown on this card (styled)."""
+        return self._fig
+
+    def refresh_view(self) -> None:
+        """Re-push the current figure into the web view.
+
+        Called when the card's tab becomes visible again: a
+        ``QWebEngineView`` inside a hidden ``QTabWidget`` page does not
+        reliably run its pending page load while off-screen, so a chart
+        created while another tab was selected can stay blank until its
+        figure is replayed after the tab is shown. ``Plotly.react`` is
+        in-place, so replaying the already-computed figure is flicker-free.
+        """
+        try:
+            if self._fig is not None and hasattr(self, "plot_view"):
+                self.plot_view.set_figure(self._fig)
+        except Exception:
+            log.debug("ChartCard.refresh_view failed", exc_info=True)
+
     def set_fullwidth(self, is_full_width: bool) -> None:
         """Set the full-width toggle state without re-emitting the signal
         (used to initialize a card from stored bridge state on refresh)."""
