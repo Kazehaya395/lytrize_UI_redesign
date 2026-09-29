@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from desktop.theme import PAGE_MARGINS
 from desktop.session_bridge import SessionBridge
 from desktop.widgets.dataframe_model import DataFrameModel
+from desktop.widgets.table_index_header import auto_fit_index_header
 from desktop.workers import ImportWorker
 from desktop.pages.column_classifier_panel import ColumnClassifierPanel
 from desktop.pages.column_manager_panel import ColumnManagerPanel
@@ -72,9 +73,14 @@ class UploadPage(QWidget):
         self._build_ui()
         self._connect_signals()
 
-        # If a DataFrame is already loaded, show it
+        # If a DataFrame is already loaded, show it -- through the preview
+        # path, not straight into the model. The combo already reads
+        # "Top 10", so pushing the raw frame rendered all 149,116 rows
+        # behind a "Top 10" label: the very mismatch the compact-index
+        # work is about. _on_preview_mode slices the frame AND re-fits the
+        # gutter, so the two can never disagree.
         if self.bridge.df is not None:
-            self._model.set_dataframe(self.bridge.df)
+            self._on_preview_mode()
             self._update_preview_label()
             self._auto_fit_index_width()
 
@@ -304,8 +310,10 @@ class UploadPage(QWidget):
         self.bridge.set("file_name", path.name)
         self.bridge.set("file_signature", f"{path.name}:{path.stat().st_size}")
 
-        # Update model
-        self._model.set_dataframe(df)
+        # Update model -- through the preview path so the grid always shows
+        # what the combo says (and the gutter is sized to those rows), not
+        # the raw frame.
+        self._on_preview_mode()
         self._update_preview_label()
         self._auto_fit_index_width()
         self.btn_go_analysis.setEnabled(True)
@@ -386,8 +394,14 @@ class UploadPage(QWidget):
         else:
             self._transform_scroll.setVisible(False)
 
-    def _on_preview_mode(self, index: int) -> None:
-        """Handle preview mode change (Top/Bottom/Random/All)."""
+    def _on_preview_mode(self, index: int = -1) -> None:
+        """Handle preview mode change (Top/Bottom/Random/All).
+
+        *index* is the combo's currentIndexChanged argument; it is accepted
+        for the signal connection but deliberately unused (the current text
+        is the source of truth). It defaults so the same method can be
+        called directly to (re)apply the preview after a load/import.
+        """
         df = self.bridge.df
         if df is None:
             return
@@ -405,6 +419,11 @@ class UploadPage(QWidget):
             self._model.set_dataframe(preview)
         except Exception as exc:
             log.warning("Preview mode failed: %s", exc)
+        finally:
+            # The displayed row count just changed (Top/Bottom/Random 10 vs
+            # All rows), so the index gutter has to be re-measured -- this
+            # is what stops a 6-digit-wide gutter on a 10-row preview.
+            self._auto_fit_index_width()
 
     def _on_search(self, text: str) -> None:
         """Debounce entry point: restart the timer on every keystroke
@@ -419,6 +438,7 @@ class UploadPage(QWidget):
         df = self.bridge.df
         if df is None or not text.strip():
             self._model.set_dataframe(df if df is not None else pd.DataFrame())
+            self._auto_fit_index_width()
             return
 
         try:
@@ -428,6 +448,10 @@ class UploadPage(QWidget):
             self._model.set_dataframe(df[mask])
         except Exception as exc:
             log.warning("Search failed: %s", exc)
+        finally:
+            # A search can shrink the result to a handful of rows (or empty
+            # it), so the index gutter has to follow the new row count.
+            self._auto_fit_index_width()
 
     # -- Helpers -------------------------------------------------------------
 
@@ -503,15 +527,17 @@ class UploadPage(QWidget):
         )
 
     def _auto_fit_index_width(self) -> None:
-        """Widen the row-index gutter only as far as the loaded row count's
-        digit width requires.  The base is 36px (fits ~5 digits); datasets
-        with more rows get a few extra pixels so large index numbers in the
-        screenshot no longer crowd the first data column."""
-        n = len(self._model.dataframe())
-        # digits needed for the largest index (max row number = n)
-        digits = max(1, len(str(n)))
-        width = max(36, 26 + digits * 8)
-        self.table.verticalHeader().setFixedWidth(width)
+        """Size the row-index gutter to the rows actually on screen.
+
+        Delegates to the shared helper so every table preview in the app
+        sizes its gutter the same way. The important part is *when* this
+        runs: it must follow the DISPLAYED row count, not the loaded
+        dataset size, otherwise a 149k-row file keeps a 6-digit-wide
+        gutter even in "Top 10" mode (where only "1".."10" are drawn).
+        Every path that swaps the model -- import, preview-mode change,
+        search, per-column filters, transforms -- calls this.
+        """
+        auto_fit_index_header(self.table)
 
     def _build_filter_row(self, df: pd.DataFrame) -> None:
         """Build per-column filter inputs based on DataFrame columns."""
@@ -551,6 +577,8 @@ class UploadPage(QWidget):
                     pass
 
         self._model.set_dataframe(filtered)
+        # Filtered row count changed -> re-measure the index gutter.
+        self._auto_fit_index_width()
 
     # -- Operation feedback -------------------------------------------------
 

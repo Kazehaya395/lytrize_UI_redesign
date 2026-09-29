@@ -437,6 +437,20 @@ class DashboardPage(QWidget):
         self.btn_export_png.clicked.connect(self._on_export_png)
         self.btn_save.clicked.connect(self._on_save)
         self.bridge.charts_changed.connect(self._on_charts_changed)
+        self.bridge.theme_changed.connect(self._on_theme_changed)
+
+    def _on_theme_changed(self, _mode: str) -> None:
+        """Re-colour the chart tiles after a dark<->light switch.
+
+        A chart's canvas is painted by the figure / plot page, not by the app
+        stylesheet, so each open view re-themes and repaints in place
+        (Plotly.react -- no reload, no rebuild, no regeneration).
+        """
+        for card in self._chart_cards.values():
+            try:
+                card.plot_view.apply_theme()
+            except Exception:
+                log.debug("chart theme repaint failed", exc_info=True)
 
     # -- Style controls -------------------------------------------------
 
@@ -968,19 +982,34 @@ class DashboardPage(QWidget):
     # -- Chart management ---------------------------------------------------
 
     def _refresh_charts(self) -> None:
-        """Rebuild the chart cards from the session bridge in a grid layout."""
-        # Remove existing cards
-        for card in self._chart_cards.values():
-            card.deleteLater()
-        self._chart_cards.clear()
+        """Rebuild the chart cards from the session bridge in a grid layout.
 
-        # Clear grid layout
-        while self.charts_layout.count():
-            item = self.charts_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
+        Incremental on purpose: only the cards whose chart disappeared are
+        destroyed, and the surviving ones are re-gridded in place.  A
+        ChartCard owns a ``QWebEngineView``, so rebuilding every tile reloads
+        the plotly.js shell for each chart and flashes the whole grid -- the
+        same "the app reopened itself" bug the Analysis page had on Generate.
+        """
         charts = self.bridge.get("charts", [])
+        wanted = [c[0] for c in charts]
+
+        # Detach every card from the grid (they are re-placed below); drop
+        # only the ones whose chart is gone.
+        for i in reversed(range(self.charts_layout.count())):
+            item = self.charts_layout.itemAt(i)
+            if item is None:
+                continue
+            w = item.widget()
+            if w is None:
+                self.charts_layout.takeAt(i)
+                continue
+            if getattr(w, "uid", None) in wanted:
+                self.charts_layout.removeWidget(w)
+                continue
+            self.charts_layout.takeAt(i)
+            self._chart_cards.pop(getattr(w, "uid", None), None)
+            w.deleteLater()
+
         self.lbl_empty.setVisible(len(charts) == 0)
 
         # layout_mode still reflects Portrait/Landscape (used for export
@@ -1033,26 +1062,39 @@ class DashboardPage(QWidget):
             meta = self.bridge.get_chart_meta(uid)
             note = self.bridge.get_note(uid)
 
-            card = ChartCard(uid, title, fig, chart_type, meta)
-            card.set_note(note)
-            card.delete_requested.connect(self._on_delete_chart)
-            card.note_changed.connect(self._on_note_changed)
-            card.style_changed.connect(self._on_style_changed)
+            card = self._chart_cards.get(uid)
+            if card is None:
+                card = ChartCard(uid, title, fig, chart_type, meta)
+                card.set_note(note)
+                card.delete_requested.connect(self._on_delete_chart)
+                card.note_changed.connect(self._on_note_changed)
+                card.style_changed.connect(self._on_style_changed)
+
+                # Hide edit button (chart config editing is an Analysis-page
+                # concept), but show reorder + full-width controls -- these
+                # are dashboard-grid-specific, the inverse of Analysis page
+                # which shows edit/up/down but has no concept of full-width.
+                card.btn_edit.setVisible(False)
+                card.btn_up.setVisible(True)
+                card.btn_down.setVisible(True)
+                card.move_up_requested.connect(self._on_move_up)
+                card.move_down_requested.connect(self._on_move_down)
+
+                card.btn_fullwidth.setVisible(True)
+                card.fullwidth_toggled.connect(self._on_fullwidth_toggled)
+                self._chart_cards[uid] = card
+            else:
+                # Surviving tile: update it in place (title/notes/figure/
+                # full-width) so its web view and loaded page are kept.
+                card.set_title(title)
+                card.set_note(note)
+                if fig is not card._fig:
+                    card.set_figure(fig)
+
+            # Style is the dashboard's own palette layer: re-applying it to a
+            # retained card is a stylesheet swap on the tile, not a rebuild.
             card.apply_style(self._current_style_dict())
-
-            # Hide edit button (chart config editing is an Analysis-page
-            # concept), but show reorder + full-width controls -- these
-            # are dashboard-grid-specific, the inverse of Analysis page
-            # which shows edit/up/down but has no concept of full-width.
-            card.btn_edit.setVisible(False)
-            card.btn_up.setVisible(True)
-            card.btn_down.setVisible(True)
-            card.move_up_requested.connect(self._on_move_up)
-            card.move_down_requested.connect(self._on_move_down)
-
-            card.btn_fullwidth.setVisible(True)
             card.set_fullwidth(fullwidth_map.get(uid, False))
-            card.fullwidth_toggled.connect(self._on_fullwidth_toggled)
 
             if fullwidth_map.get(uid, False):
                 if col != 0:

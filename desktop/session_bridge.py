@@ -163,10 +163,24 @@ class SessionBridge(QObject):
         }
         notes = dict(self._manager._notes_shadow)
 
+        # charts_to_json only emits chart_type from tuple slot 4, but charts
+        # are stored as bare 3-tuples -- the type lives in a separate
+        # "chart_type_<uid>" key. Rebuild 6-tuples so the type survives
+        # autosave; without it a restored chart has no analysis binding and
+        # re-rendering falls back to guessing.
+        serialisable = []
+        for uid, title, fig in charts:
+            serialisable.append((
+                uid, title, fig,
+                notes.get(uid, ""),
+                self._manager.get(f"chart_type_{uid}", ""),
+                chart_meta.get(uid, {}),
+            ))
+
         db_save_draft(
             user_id=user_id,
             page=self._manager.get("page", "home"),
-            charts_json=charts_to_json(charts, notes=notes, meta_map=chart_meta),
+            charts_json=charts_to_json(serialisable, notes=notes, meta_map=chart_meta),
             file_name=self._manager.get("file_name", ""),
             editing_session_id=self._manager.get("editing_session_id"),
             editing_session_name=self._manager.get("editing_session_name"),
@@ -179,3 +193,100 @@ class SessionBridge(QObject):
             ),
             layout_mode=self._manager.get("layout_mode", "portrait"),
         )
+
+    def restore_draft(self) -> bool:
+        """Reload the last auto-saved draft into the live session.
+
+        Counterpart to :meth:`save_draft`. Autosave runs every 2 minutes and
+        on every Generate, but nothing read the row back, so a close/reopen
+        silently lost the session even though the draft was sitting in
+        ``draft_sessions``.
+
+        Restores the DataFrame from the parquet snapshot plus every chart
+        (figure, title, notes, chart_type, meta) and the assorted page
+        bookkeeping fields. Returns True when at least one chart came back.
+
+        Never raises: a missing or corrupt draft is a normal empty-start
+        condition, and a bad launch must not be blocked by it.
+        """
+        import json
+
+        from services.database_service import get_draft as db_get_draft
+        from services.chart_service import charts_from_json
+
+        user_id = self._manager.get("user_id")
+        if not user_id:
+            return False
+
+        try:
+            draft = db_get_draft(user_id)
+        except Exception as exc:
+            log.warning("restore_draft: get_draft failed: %s", exc)
+            return False
+        if not draft:
+            return False
+
+        # -- DataFrame (separate parquet snapshot, not in the draft row) --
+        if self._manager.df is None:
+            try:
+                df = self._manager.load_df_snapshot(user_id)
+            except Exception as exc:
+                log.warning("restore_draft: load_df_snapshot failed: %s", exc)
+                df = None
+            if df is not None:
+                self._manager.df = df
+
+        # -- Charts: one bulk write so charts_changed fires once and the
+        #    analysis page rebuilds its tabs a single time.
+        try:
+            restored = charts_from_json(draft.get("charts_json") or "")
+        except Exception as exc:
+            log.warning("restore_draft: charts_from_json failed: %s", exc)
+            return False
+        if not restored:
+            return False
+
+        charts: list = []
+        for entry in restored:
+            uid, title, fig = entry[0], entry[1], entry[2]
+            desc = entry[3] if len(entry) > 3 else ""
+            chart_type = entry[4] if len(entry) > 4 else ""
+            meta = entry[5] if len(entry) > 5 else {}
+            charts.append((uid, title, fig))
+            if desc:
+                self._manager.set_note(uid, desc)
+            if chart_type:
+                self._manager.set(f"chart_type_{uid}", chart_type)
+            if meta:
+                self._manager.set(f"chart_meta_{uid}", dict(meta))
+
+        self._manager.set("charts", charts)
+
+        # -- Scalar page bookkeeping, persisted alongside the charts.
+        for key, col in (
+            ("file_name", "file_name"),
+            ("editing_session_id", "editing_session_id"),
+            ("editing_session_name", "editing_session_name"),
+            ("editing_file_name", "editing_file_name"),
+            ("dashboard_title", "dashboard_title"),
+            ("layout_mode", "layout_mode"),
+        ):
+            value = draft.get(col)
+            if value not in (None, ""):
+                self._manager.set(key, value)
+
+        # The active page is restored by the caller (it owns navigation);
+        # keep only the page that actually carries a draft.
+        if draft.get("page"):
+            self._manager.set("draft_page", draft["page"])
+
+        try:
+            kpis = json.loads(draft.get("kpis_json") or "[]")
+        except (ValueError, TypeError):
+            kpis = []
+        if kpis:
+            self._manager.set("kpis", kpis)
+
+        log.info("restore_draft: restored %d chart(s) for user %s",
+                 len(charts), user_id)
+        return True

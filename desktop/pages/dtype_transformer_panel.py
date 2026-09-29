@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from services.transform_service import preview_dtype_conversion, apply_dtype_conversion
 from desktop.workers import TransformWorker
+from desktop.widgets.table_index_header import auto_fit_index_header
 
 log = logging.getLogger(__name__)
 
@@ -70,8 +71,11 @@ class DtypeTransformerPanel(QWidget):
         self.table_dtypes.setMinimumHeight(120)
         # Roomier, centered row-index gutter (UI issue: index numbers were
         # cramped against the first column) and centered cell values.
-        self.table_dtypes.verticalHeader().setFixedWidth(36)
-        self.table_dtypes.verticalHeader().setDefaultAlignment(Qt.AlignCenter)
+        # Sized to the rows actually displayed rather than a hard-coded 36px
+        # (too wide for a 10-row preview, too narrow -- clipping the numbers
+        # -- for a 4+ digit index). See desktop/widgets/table_index_header.py.
+        auto_fit_index_header(self.table_dtypes)
+
         # -- Body: wide dtypes table (left) + transform controls (right) --
         # UI issue: the full-width stacked layout wasted horizontal space
         # ("organise this section with left table & right side drop-down
@@ -152,9 +156,9 @@ class DtypeTransformerPanel(QWidget):
         # controls to shrink out of usability.
         self.table_preview.setMinimumHeight(80)
         self.table_preview.setMaximumHeight(180)
-        # Roomier, centered row-index gutter (was cramped against Before values)
-        self.table_preview.verticalHeader().setFixedWidth(36)
-        self.table_preview.verticalHeader().setDefaultAlignment(Qt.AlignCenter)
+        # Row-index gutter sized to the rows actually shown (the old fixed
+        # 36px clipped a 4+ digit index). See table_index_header.py.
+        auto_fit_index_header(self.table_preview)
         self.table_preview.setVisible(False)
         ctrl_layout.addWidget(self.table_preview)
 

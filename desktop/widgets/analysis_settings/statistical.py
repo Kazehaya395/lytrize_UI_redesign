@@ -4,11 +4,40 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLineEdit, QCheckBox, QPushButton, QLabel, QSizePolicy
 from .base import (AnalysisSettingsBase, section_label, hint_label, cap_widget, multi_select_combo, slider_with_readout, color_swatch, live_preview_label, apply_preview_font, COMPACT_W, PAGE_MARGINS, PAGE_SPACING, ROW_SPACING, HINT_GAP, SECTION_GAP, page_root, section_box, grid_row)
 NONE_SENTINEL = 'None'
-FONTS = ['Inter', 'Source Sans 3', 'Noto Sans', 'DejaVu Sans', 'Lato', 'Ubuntu', 'Arial', 'Calibri', 'Verdana', 'Oswald', 'Barlow Condensed', 'Noto Serif', 'DejaVu Serif', 'EB Garamond', 'Georgia', 'Times New Roman', 'Fira Code', 'DejaVu Sans Mono', 'JetBrains Mono', 'Liberation Mono', 'Courier New', 'Comic Sans MS', 'Impact', 'Trebuchet MS', 'Helvetica', 'Palatino Linotype', 'Candara', 'Corbel', 'Constantia', 'Lucida Console', 'Consolas', 'Sora', 'Cambria']
+# Only offer font families that are actually installed. Offering 33 names when
+# the machine has 5 of them is what made the picker look broken: every missing
+# family silently fell back to the same default, so most choices changed
+# nothing. chart_display.available_fonts() resolves this from fontconfig once
+# and caches it; the static list stays as the ordered wish-list.
+_FONT_WISHLIST = ['Inter', 'Source Sans 3', 'Noto Sans', 'DejaVu Sans',
+                  'Lato', 'Ubuntu', 'Arial', 'Calibri', 'Verdana', 'Oswald',
+                  'Barlow Condensed', 'Noto Serif', 'DejaVu Serif',
+                  'EB Garamond', 'Georgia', 'Times New Roman', 'Fira Code',
+                  'DejaVu Sans Mono', 'JetBrains Mono', 'Liberation Mono',
+                  'Courier New', 'Comic Sans MS', 'Impact', 'Trebuchet MS',
+                  'Helvetica', 'Palatino Linotype', 'Candara', 'Corbel',
+                  'Constantia', 'Lucida Console', 'Consolas', 'Sora',
+                  'Cambria']
+
+
+def _fonts() -> list:
+    """Installed font choices, with the app defaults first when present."""
+    try:
+        from chart_display import available_fonts
+        return available_fonts(prefer=['Inter'])
+    except Exception:
+        return ['DejaVu Sans', 'DejaVu Serif', 'DejaVu Sans Mono']
+
+
 FSTYLES = ['Normal', 'Bold', 'Italic', 'Bold Italic', 'Underline']
 LPOS = ['outside', 'inside', 'auto']
 BMODES = ['group', 'stack', 'relative', 'overlay']
 LPOS_FRIENDLY = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left']
+# Header alignment. Lower-case keys are what chart_display stores; the
+# friendly labels are what the combo shows. Kept in the same style as the
+# other option lists above.
+HALIGNS = ['left', 'center', 'right']
+HALIGN_LABELS = {'left': 'Left', 'center': 'Center', 'right': 'Right'}
 class StatisticalSettings(AnalysisSettingsBase):
     """Generate + Layout + Typography settings for the statistical type."""
     def _build(self):
@@ -20,7 +49,7 @@ class StatisticalSettings(AnalysisSettingsBase):
             self._layout_opts = {}
             self._typo_opts = {}
         self._pending = {'x': None, 'y': [], 'palette': None}
-        for attr in ('_as_slider', '_as_spin', '_axs_slider', '_axs_spin', '_cb_bmode', '_cb_fam', '_cb_fstyle', '_cb_hfont', '_cb_hfstyle', '_cb_legpos', '_cb_lpos', '_ck_grid', '_ck_vals', '_combo_groupby', '_combo_metrics', '_combo_palette', '_gap_slider', '_gap_spin', '_hs_slider', '_hs_spin', '_le_leg', '_le_title', '_le_x', '_le_y', '_ls_slider', '_ls_spin', '_prev1', '_prev2', '_sw_acol', '_sw_hcol', '_sw_lcol', '_sw_tcol', '_ts_slider', '_ts_spin'):
+        for attr in ('_as_slider', '_as_spin', '_axs_slider', '_axs_spin', '_cb_bmode', '_cb_fam', '_cb_fstyle', '_cb_halign', '_cb_hfont', '_cb_hfstyle', '_cb_legpos', '_cb_lpos', '_ck_border', '_ck_grid', '_ck_vals', '_combo_groupby', '_combo_metrics', '_combo_palette', '_gap_slider', '_gap_spin', '_hs_slider', '_hs_spin', '_le_leg', '_le_title', '_le_x', '_le_y', '_ls_slider', '_ls_spin', '_prev1', '_prev2', '_sw_acol', '_sw_hcol', '_sw_lcol', '_sw_tcol', '_ts_slider', '_ts_spin'):
             if not hasattr(self, attr):
                 setattr(self, attr, None)
     def prefill(self, values):
@@ -66,7 +95,8 @@ class StatisticalSettings(AnalysisSettingsBase):
                     w.blockSignals(False)
             except Exception:
                 pass
-        for attr, key in (("_ck_vals", "show_value_labels"), ("_ck_grid", "show_grid")):
+        for attr, key in (("_ck_vals", "show_value_labels"), ("_ck_grid", "show_grid"),
+                          ("_ck_border", "show_border")):
             try:
                 w = getattr(self, attr, None)
                 if w is not None:
@@ -91,6 +121,11 @@ class StatisticalSettings(AnalysisSettingsBase):
                 self._gap_spin.blockSignals(False)
         except Exception:
             pass
+    def _halign_key(self, label):
+        """'Center' -> 'center'; anything unrecognised falls back to 'left'."""
+        text = str(label or '').strip().lower()
+        return text if text in HALIGNS else 'left'
+
     def prefill_typography(self, values):
         try:
             from chart_display import default_typo_opts
@@ -117,6 +152,15 @@ class StatisticalSettings(AnalysisSettingsBase):
                     w.blockSignals(False)
             except Exception:
                 pass
+        try:
+            w = getattr(self, "_cb_halign", None)
+            if w is not None:
+                _a = self._halign_key(self._typo_opts.get("header_align", "left"))
+                w.blockSignals(True)
+                w.setCurrentText(HALIGN_LABELS[_a])
+                w.blockSignals(False)
+        except Exception:
+            pass
         for attr, key in (("_sw_hcol", "header_color"), ("_sw_tcol", "axis_title_color"), ("_sw_acol", "axis_tick_color"), ("_sw_lcol", "legend_item_color")):
             try:
                 w = getattr(self, attr, None)
@@ -296,6 +340,17 @@ class StatisticalSettings(AnalysisSettingsBase):
         self._ck_grid.setChecked(bool(self._layout_opts.get('show_grid', True)))
         self._ck_grid.toggled.connect(lambda v: self._set_layout(show_grid=bool(v)))
         rr.addWidget(self._check_row(self._ck_grid))
+        # Sits directly under "Show grid" (design order) and controls every
+        # frame the chart draws around a key: the legend plate and the colour
+        # bar / colour range.  Checked by default -- that is the look the
+        # charts already had, so this is a control over the existing border,
+        # not a new decoration.
+        self._ck_border = QCheckBox('Show border')
+        self._ck_border.setChecked(bool(self._layout_opts.get('show_border', True)))
+        self._ck_border.setToolTip(
+            'Border around the legend, colour bar / colour range')
+        self._ck_border.toggled.connect(lambda v: self._set_layout(show_border=bool(v)))
+        rr.addWidget(self._check_row(self._ck_border))
         rr.addStretch()
         cl.addWidget(left, stretch=1)
         cl.addWidget(right, stretch=1)
@@ -331,15 +386,24 @@ class StatisticalSettings(AnalysisSettingsBase):
         # -- Column 1: body font (family / style) + its live preview --------
         self._cb_fam = QComboBox()
         cap_widget(self._cb_fam, 220)
-        self._cb_fam.addItems(FONTS)
-        self._cb_fam.setCurrentText(str(self._typo_opts.get('family', 'Inter')))
-        self._cb_fam.currentTextChanged.connect(lambda t: self._set_typo(family=t))
+        fonts = _fonts()
+        self._cb_fam.addItems(fonts)
+        # Inter is the documented default but is not installed everywhere; if it
+        # is missing, setCurrentText() silently leaves the combo on item 0 while
+        # _typo_opts still says "Inter", so the chart would keep asking for a
+        # font that does not exist. Snap the stored value to what is listed.
+        want = str(self._typo_opts.get('family', 'Inter'))
+        if want not in fonts and fonts:
+            want = fonts[0]
+            self._typo_opts['family'] = want
+        self._cb_fam.setCurrentText(want)
+        self._cb_fam.currentTextChanged.connect(lambda t: self._set_typo(discrete=True, family=t))
         bl.addWidget(grid_row('Font family', self._cb_fam, label_w))
         self._cb_fstyle = QComboBox()
         cap_widget(self._cb_fstyle, 220)
         self._cb_fstyle.addItems(FSTYLES)
         self._cb_fstyle.setCurrentText(str(self._typo_opts.get('font_style', 'Normal')))
-        self._cb_fstyle.currentTextChanged.connect(lambda t: self._set_typo(font_style=t))
+        self._cb_fstyle.currentTextChanged.connect(lambda t: self._set_typo(discrete=True, font_style=t))
         bl.addWidget(grid_row('Font style', self._cb_fstyle, label_w))
         self._prev1 = live_preview_label()
         bl.addWidget(self._prev1)
@@ -357,16 +421,35 @@ class StatisticalSettings(AnalysisSettingsBase):
         hl.addWidget(grid_row('Header color', self._sw_hcol, label_w))
         self._cb_hfont = QComboBox()
         cap_widget(self._cb_hfont, 220)
-        self._cb_hfont.addItems(FONTS)
-        self._cb_hfont.setCurrentText(str(self._typo_opts.get('header_family', 'Inter')))
-        self._cb_hfont.currentTextChanged.connect(lambda t: self._set_typo(header_family=t))
+        self._cb_hfont.addItems(fonts)
+        want_h = str(self._typo_opts.get('header_family', 'Inter'))
+        if want_h not in fonts and fonts:
+            want_h = fonts[0]
+            self._typo_opts['header_family'] = want_h
+        self._cb_hfont.setCurrentText(want_h)
+        self._cb_hfont.currentTextChanged.connect(lambda t: self._set_typo(discrete=True, header_family=t))
         hl.addWidget(grid_row('Header font', self._cb_hfont, label_w))
         self._cb_hfstyle = QComboBox()
         cap_widget(self._cb_hfstyle, 220)
         self._cb_hfstyle.addItems(FSTYLES)
         self._cb_hfstyle.setCurrentText(str(self._typo_opts.get('header_font_style', 'Normal')))
-        self._cb_hfstyle.currentTextChanged.connect(lambda t: self._set_typo(header_font_style=t))
+        self._cb_hfstyle.currentTextChanged.connect(lambda t: self._set_typo(discrete=True, header_font_style=t))
         hl.addWidget(grid_row('Header font style', self._cb_hfstyle, label_w))
+        # Header alignment. Sits with the other header controls because it is
+        # a property of the header; the canvas-wide anchors in
+        # chart_display make it auto-adjust to the card width and cover the
+        # legend column as well as the plot.
+        self._cb_halign = QComboBox()
+        cap_widget(self._cb_halign, 220)
+        self._cb_halign.addItems([HALIGN_LABELS[a] for a in HALIGNS])
+        _cur_halign = str(self._typo_opts.get('header_align', 'left') or 'left').strip().lower()
+        if _cur_halign not in HALIGNS:
+            _cur_halign = 'left'
+        self._cb_halign.setCurrentText(HALIGN_LABELS[_cur_halign])
+        self._cb_halign.currentTextChanged.connect(
+            lambda lbl: self._set_typo(
+                header_align=self._halign_key(lbl)))
+        hl.addWidget(grid_row('Header align', self._cb_halign, label_w))
         self._prev2 = live_preview_label()
         hl.addWidget(self._prev2)
         hl.addStretch()
@@ -410,7 +493,14 @@ class StatisticalSettings(AnalysisSettingsBase):
         rl.addStretch()
         self._refresh_previews()
         return root
-    def _set_typo(self, emit=True, **kw):
+    def _set_typo(self, emit=True, discrete=False, **kw):
+        """Update typography options and (optionally) notify listeners.
+
+        ``discrete`` marks a one-shot choice from a combo box rather than a
+        value being dragged: the page uses it to pick a much shorter live
+        preview debounce, since a single deliberate pick should not wait out
+        the slider delay.
+        """
         no_emit = kw.pop('_no_emit', False) if isinstance(kw, dict) else False
         try:
             self._typo_opts.update(kw)
@@ -424,7 +514,8 @@ class StatisticalSettings(AnalysisSettingsBase):
             pass
         if emit and not no_emit:
             try:
-                self.values_changed.emit({'typography': dict(self._typo_opts)})
+                self.values_changed.emit({'typography': dict(self._typo_opts),
+                                          'discrete': bool(discrete)})
             except Exception:
                 pass
     def _refresh_previews(self):

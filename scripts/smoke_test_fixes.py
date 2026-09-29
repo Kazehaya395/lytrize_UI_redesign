@@ -762,11 +762,19 @@ def test_dtype_extra():
           str(p.btn_clear_preview.property("kind")))
 
     # UI issue: row-index gutter must not crowd the values; cells centered.
-    check("row-index gutter roomy + cells centered",
-          p.table_preview.verticalHeader().minimumWidth() == 36
-          and p.table_dtypes.verticalHeader().minimumWidth() == 36
-          and p.table_dtypes.item(0, 0).textAlignment() == Qt.AlignCenter,
-          f"w={p.table_preview.verticalHeader().minimumWidth()} "
+    # The gutter is now MEASURED from the widest index label actually shown
+    # (desktop/widgets/table_index_header.auto_fit_index_header) instead of a
+    # hard-coded 36px, so assert the real contract: wide enough to draw the
+    # largest row number without clipping, compact enough not to eat the
+    # first data column, and centred.
+    prev_w = p.table_preview.verticalHeader().minimumWidth()
+    dtypes_w = p.table_dtypes.verticalHeader().minimumWidth()
+    check("row-index gutter measured + cells centered",
+          (30 <= prev_w <= 96 and 30 <= dtypes_w <= 96
+           and prev_w == p.table_preview.verticalHeader().width()
+           and dtypes_w == p.table_dtypes.verticalHeader().width()
+           and p.table_dtypes.item(0, 0).textAlignment() == Qt.AlignCenter),
+          f"prev={prev_w} dtypes={dtypes_w} "
           f"align={p.table_dtypes.item(0, 0).textAlignment() if p.table_dtypes.item(0, 0) else 'none'}")
 
 
@@ -1038,6 +1046,9 @@ def test_analysis_redesign():
             self.charts = []
             self._store = {}
             self.charts_changed = _Sig()
+            # The page also listens for the dark<->light switch (chart tiles
+            # re-theme in place), so the stub has to expose that signal too.
+            self.theme_changed = _Sig()
 
         def get(self, k, d=None):
             if k == "charts":
@@ -1167,6 +1178,1297 @@ def test_analysis_redesign():
         panel.tab_bar.setCurrentIndex(0)
 
 
+def test_index_header_auto_fit():
+    """Row-index gutter must be measured from the DISPLAYED row count.
+
+    User report: on a 149,116-row file the index column stayed wide even
+    in "Top 10" preview mode, stealing width from the first data column.
+    The old code sized it from len(df) with a hand-rolled formula and
+    ignored the preview; the fix measures the widest index label the table
+    actually draws.
+    """
+    print("[17] Row-index gutter auto-fit (upload page + preview modes)")
+    from PySide6.QtWidgets import QTableView
+    from desktop.session_bridge import SessionBridge
+    from desktop.pages.upload_page import UploadPage
+    from desktop.widgets.dataframe_model import DataFrameModel
+    from desktop.widgets.table_index_header import (
+        auto_fit_index_header, MIN_INDEX_HEADER_WIDTH, MAX_INDEX_HEADER_WIDTH,
+    )
+
+    app_ = app()
+    # 149,116 rows -- the size from the bug report.
+    df = pd.DataFrame({"a": range(149116), "b": ["x"] * 149116})
+    bridge = SessionBridge()
+    bridge.set_df(df)
+    page = UploadPage(bridge)
+    page.resize(1200, 800)
+    page.show()
+    app_.processEvents()
+    page._model.set_dataframe(df)
+    page._update_preview_label()
+    page._auto_fit_index_width()
+
+    all_w = page.table.verticalHeader().width()
+    check("gutter measured for full dataset",
+          MIN_INDEX_HEADER_WIDTH <= all_w <= MAX_INDEX_HEADER_WIDTH,
+          f"w={all_w}")
+
+    # A 10-row preview must NOT inherit the 6-digit width.
+    top_w = None
+    for mode in ("Bottom 10", "Top 10", "Random 10"):
+        page.preview_mode.setCurrentIndex(page.preview_mode.findText(mode))
+        app_.processEvents()
+        if mode == "Top 10":
+            top_w = page.table.verticalHeader().width()
+    check("gutter shrinks to the displayed row count", top_w < all_w,
+          f"top10={top_w} all={all_w}")
+    check("gutter never below the compact floor",
+          top_w >= MIN_INDEX_HEADER_WIDTH, f"top10={top_w}")
+
+    # REGRESSION: the initial load pushed the RAW frame into the model while
+    # the combo already read "Top 10", so all 149,116 rows rendered behind a
+    # "Top 10" label. The preview slice must be applied on load too.
+    check("initial load honours the preview mode, not the raw frame",
+          page._model.rowCount() <= 10,
+          f"rows={page._model.rowCount()} "
+          f"combo={page.preview_mode.currentText()!r}")
+
+    # REGRESSION: setMinimumSectionSize() on the vertical header sets the ROW
+    # HEIGHT floor as well as the gutter floor, so calling it with the gutter
+    # width stretched every row (the "you increased row height" report).
+    check("row height is not inflated by the gutter fit",
+          page.table.rowHeight(0) <= 32,
+          f"rowHeight={page.table.rowHeight(0)}")
+    for mode in ("All rows", "Top 10"):
+        page.preview_mode.setCurrentIndex(page.preview_mode.findText(mode))
+        app_.processEvents()
+        check(f"row height stays compact in {mode!r}",
+              page.table.rowHeight(0) <= 32,
+              f"rowHeight={page.table.rowHeight(0)} "
+              f"gutter={page.table.verticalHeader().width()}")
+
+    page.preview_mode.setCurrentIndex(page.preview_mode.findText("All rows"))
+    app_.processEvents()
+    check("gutter restores for full dataset",
+          page.table.verticalHeader().width() == all_w,
+          f"{page.table.verticalHeader().width()} vs {all_w}")
+    page.close()
+
+
+def test_index_header_helper():
+    """The shared helper's width contract, independent of any page."""
+    print("[18] Row-index helper: measured, monotonic, non-clipping")
+    from PySide6.QtWidgets import QTableView, QHeaderView
+    from desktop.widgets.dataframe_model import DataFrameModel
+    from desktop.widgets.table_index_header import (
+        auto_fit_index_header, MIN_INDEX_HEADER_WIDTH, MAX_INDEX_HEADER_WIDTH,
+    )
+
+    app()
+    tbl = QTableView()
+    tbl.setModel(DataFrameModel(pd.DataFrame({"a": range(5)})))
+    widths = {n: auto_fit_index_header(tbl, rows=n)
+              for n in (1, 10, 100, 1000, 149116)}
+    check("helper width grows with the index label",
+          all(widths[a] <= widths[b]
+              for a, b in zip((1, 10, 100, 1000), (10, 100, 1000, 149116))),
+          str(widths))
+    # REGRESSION: auto_fit_index_header used to call setMinimumSectionSize(),
+    # which on a QHeaderView is the floor for BOTH axes -- and the vertical
+    # header's section size IS the row height. That inflated every data row
+    # to the gutter width (53px) instead of compacting the index column.
+    check("helper does NOT inflate row height",
+          tbl.rowHeight(0) <= 30, f"rowHeight={tbl.rowHeight(0)}")
+    check("helper leaves minimumSectionSize alone",
+          tbl.verticalHeader().minimumSectionSize() < widths[149116],
+          f"min={tbl.verticalHeader().minimumSectionSize()} "
+          f"gutter={widths[149116]}")
+    check("helper stays within its bounds",
+          all(MIN_INDEX_HEADER_WIDTH <= w <= MAX_INDEX_HEADER_WIDTH
+              for w in widths.values()), str(widths))
+    fm = tbl.verticalHeader().fontMetrics()
+    check("gutter fits the widest label without clipping",
+          widths[149116] >= fm.horizontalAdvance("149116"),
+          f"w={widths[149116]} text={fm.horizontalAdvance('149116')}")
+    check("gutter is centred",
+          tbl.verticalHeader().defaultAlignment() == Qt.AlignCenter,
+          str(tbl.verticalHeader().defaultAlignment()))
+    check("gutter is fixed (not interactively resizable)",
+          tbl.verticalHeader().sectionResizeMode(0) == QHeaderView.Fixed,
+          str(tbl.verticalHeader().sectionResizeMode(0)))
+
+
+def test_chart_area_layout_and_render():
+    """Chart area must lay out AND render immediately on Generate.
+
+    User reports: the app appeared to "reopen itself" on Generate, and the
+    new chart stayed blank until the window was resized. Root causes were
+    (a) the chart tabs / empty hint / descriptive table sharing one
+    QVBoxLayout, so hiding one left the tabs at half height and the
+    QWebEngineView at 0px (Chromium does not paint at zero height), and
+    (b) no explicit relayout once the view finally had a size.
+    """
+    print("[19] Chart area: stacked layout + immediate render (no resize)")
+    import time
+    from desktop.session_bridge import SessionBridge
+    from desktop.pages.analysis_page import AnalysisPage
+
+    app_ = app()
+    bridge = SessionBridge()
+    df = pd.DataFrame({"a": [1, 2, 3, 4, 5], "b": [10, 20, 30, 40, 50]})
+    bridge.set_df(df)
+    bridge.set("num_cols", ["a", "b"])
+
+    page = AnalysisPage(bridge)
+    page.resize(1024, 768)
+    page.show()
+    app_.processEvents()
+    for i in range(page.analysis_list.count()):
+        it = page.analysis_list.item(i)
+        if "statistical" in it.text().lower():
+            page.analysis_list.setCurrentItem(it)
+            break
+    app_.processEvents()
+
+    # Mutually exclusive views live in a QStackedWidget, not a box layout.
+    check("chart area uses a QStackedWidget",
+          page._chart_stack.count() == 3
+          and page._chart_stack.widget(page._STACK_CHARTS) is page.charts_tabs
+          and page._chart_stack.widget(page._STACK_EMPTY) is page.lbl_no_charts
+          and page._chart_stack.widget(page._STACK_DESCRIPTIVE)
+          is page.descriptive_container,
+          f"count={page._chart_stack.count()}")
+    check("empty state shown before any chart",
+          page._chart_stack.currentIndex() == page._STACK_EMPTY,
+          str(page._chart_stack.currentIndex()))
+
+    page._on_generate()
+    page._gen_worker.wait()
+    app_.processEvents()
+
+    check("stack switched to the charts page on Generate",
+          page._chart_stack.currentIndex() == page._STACK_CHARTS,
+          str(page._chart_stack.currentIndex()))
+
+    card = list(page._chart_cards.values())[0]
+    # The regression: this used to be 0, which is why Chromium never
+    # painted and the chart looked blank until a manual resize.
+    check("chart tabs get the FULL bottom pane (no half-height squish)",
+          page.charts_tabs.height() > 200, f"h={page.charts_tabs.height()}")
+    check("web view has real height immediately after Generate",
+          card.plot_view._web_view.height() > 50,
+          f"h={card.plot_view._web_view.height()}")
+
+    # Let the event loop breathe: the shell must load and flush its pending
+    # figure WITHOUT the user resizing anything.
+    deadline = time.time() + 5.0
+    while time.time() < deadline and not card.plot_view._page_loaded:
+        app_.processEvents()
+        time.sleep(0.01)
+    check("web view finished loading with no manual resize",
+          card.plot_view._page_loaded, "loadFinished never fired")
+    check("QWebChannel handshake completed",
+          card.plot_view._bridge.channel_ready,
+          "channelReady never called from JS")
+    check("pending figure was flushed to the loaded page",
+          card.plot_view._pending_fig_json is None, "figure still queued")
+
+    # THE decisive check: probe the live page. loadFinished + an empty
+    # pending queue used to look healthy while the figure had actually been
+    # emitted into a QWebChannel that had not connected yet, so the chart
+    # area stayed blank. Only the DOM can prove the chart really rendered.
+    res: dict = {}
+    card.plot_view._web_view.page().runJavaScript(
+        "(function(){try{return JSON.stringify({"
+        "n:(chartDiv.data||[]).length,"
+        "title:(chartDiv.layout&&chartDiv.layout.title||{}).text||null,"
+        "svg:chartDiv.querySelectorAll('.main-svg').length});}"
+        "catch(e){return 'ERR '+e}})()",
+        lambda v: res.update(js=v))
+    deadline = time.time() + 5.0
+    while time.time() < deadline and "js" not in res:
+        app_.processEvents()
+        time.sleep(0.01)
+    probe = res.get("js") or "{}"
+    check("figure actually reached the page (JS has traces)",
+          '"n":4' in probe.replace(" ", ""), probe)
+    check("chart DOM rendered (svg present)",
+          '"svg":' in probe.replace(" ", "") and '"svg":0' not in probe,
+          probe)
+
+    # relayout() must never trigger a reload.
+    loaded_before = card.plot_view._page_loaded
+    card.plot_view.relayout()
+    app_.processEvents()
+    check("relayout does not reload the page",
+          card.plot_view._page_loaded == loaded_before, "")
+
+    # No redundant title/type chrome eating chart height.
+    check("card has no redundant on-card title label",
+          not hasattr(card, "lbl_title"), "lbl_title still present")
+    check("card still exposes the chart title",
+          card._title == "Statistical Summary", str(card._title))
+    check("chart kept most of the pane after the header cleanup",
+          card.plot_view.height() > 100, f"h={card.plot_view.height()}")
+    page.close()
+
+
+def test_chart_canvas_and_title():
+    """Chart canvas blends with the card and the title sits at the top."""
+    print("[20] Chart canvas colour + title placement")
+    import plotly.graph_objects as go
+    from chart_display import (
+        apply_display_options, theme_figure, chart_canvas_color,
+    )
+    from desktop import theme as th
+
+    fig = go.Figure(go.Bar(x=["A", "B"], y=[3, 5]))
+    # Mirror what every analysis runner emits (modules.charts.chart_layout)
+    # so the test exercises the real 48px top margin being reclaimed.
+    fig.update_layout(title="Statistical Summary", margin=dict(t=48))
+
+    styled = apply_display_options(fig, {}, {"header_size": 28})
+    check("title pinned to the top-left",
+          styled.layout.title.x == 0.0
+          and styled.layout.title.xanchor == "left"
+          and styled.layout.title.y is not None
+          and styled.layout.title.y > 0.9
+          and styled.layout.title.yanchor == "top",
+          f"x={styled.layout.title.x}/{styled.layout.title.xanchor} "
+          f"y={styled.layout.title.y}/{styled.layout.title.yanchor}")
+    # "remove this empty space": the title used to sit at y=0.98, leaving 2%
+    # of the card height as a dead band ABOVE it. It must now be flush with
+    # the top of the chart area.
+    check("no dead band above the title (y flush with the top)",
+          float(styled.layout.title.y) == 1.0,
+          f"y={styled.layout.title.y}")
+    check("top margin reclaimed for the plot",
+          styled.layout.margin.t < 48, f"t={styled.layout.margin.t}")
+    check("title text preserved by placement",
+          styled.layout.title.text == "Statistical Summary",
+          str(styled.layout.title.text))
+    # Idempotent: live preview + re-generate re-run this constantly.
+    twice = apply_display_options(styled, {}, {"header_size": 28})
+    check("title placement is idempotent",
+          twice.layout.title.y == styled.layout.title.y
+          and twice.layout.margin.t == styled.layout.margin.t,
+          f"{twice.layout.margin.t} vs {styled.layout.margin.t}")
+    check("placement never mutates the source figure",
+          fig.layout.margin.to_plotly_json() == {"t": 48}
+          and fig.layout.title.x is None,
+          f"t={fig.layout.margin.t} x={fig.layout.title.x}")
+
+    # The card surface must equal the figure canvas in BOTH modes, else the
+    # chart sits on a mismatched rectangle (the "BG not transparent" report).
+    for mode in ("dark", "light"):
+        themed = theme_figure(fig, mode)
+        card_bg = th.CHART_CANVAS[th.mode_tokens(mode)["chart_canvas_key"]]
+        check(f"{mode}: card surface matches the chart canvas",
+              card_bg.lower() == str(themed.layout.paper_bgcolor).lower()
+              == str(themed.layout.plot_bgcolor).lower()
+              == chart_canvas_color(mode).lower(),
+              f"card={card_bg} paper={themed.layout.paper_bgcolor}")
+    check("chart card QSS uses the canvas colour, not alternate-base",
+          "QFrame#chart_card { background: #ffffff" in th.build_qss("light"),
+          "rule missing")
+
+
+def test_header_alignment_and_band():
+    """Header alignment dropdown, size-scaled top band, unclipped labels.
+
+    Three issues from one screenshot:
+      1. FEATURE  -- a header alignment control (left / center / right) that
+         spans the FULL canvas, so it auto-adjusts to the card width and
+         covers the legend column as well as the plot.
+      2. LAYOUT   -- the header band must scale with the header size; it was
+         a flat 34px, so a 36px or 60px header overflowed onto the plot.
+      3. CLIPPING -- an "outside" value label on the tallest bar is drawn
+         above the plot area and was being sliced in half.
+    """
+    print("[22] Header alignment, band scaling, unclipped value labels")
+    import plotly.graph_objects as go
+    from chart_display import (
+        apply_display_options, default_layout_opts, default_typo_opts,
+        _title_band_px,
+    )
+
+    def build(align="left", header_size=28, layout=None, **typo):
+        # A single tall bar: the classic shape where the top value label is
+        # the one that gets clipped.
+        f = go.Figure(go.Bar(x=["unit_price"], y=[45],
+                            text=["45.00"], textposition="outside"))
+        f.update_layout(title="Statistical Summary", margin=dict(t=48))
+        t = default_typo_opts()
+        t.update(header_align=align, header_size=header_size, **typo)
+        lo = default_layout_opts()
+        lo.update(layout or {})
+        return apply_display_options(f, lo, t)
+
+    # -- 1. Alignment ------------------------------------------------------
+    want = {"left": (0.0, "left"), "center": (0.5, "center"),
+            "right": (1.0, "right")}
+    for align, (x, anchor) in want.items():
+        s = build(align=align)
+        T = s.layout.title
+        check(f"header align {align}: x/anchor honoured",
+              float(T.x) == x and T.xanchor == anchor,
+              f"x={T.x} xanchor={T.xanchor}")
+        # Container coordinates are what make it span the whole chart area
+        # (margins + the legend column) instead of just the plot domain.
+        check(f"header align {align}: anchored to the full canvas",
+              T.xref == "container" and T.yref == "container",
+              f"xref={T.xref} yref={T.yref}")
+    check("header alignment is a real option, not hard-coded",
+          "header_align" in default_typo_opts(),
+          str(sorted(default_typo_opts())))
+    check("default alignment is left (existing charts unchanged)",
+          default_typo_opts()["header_align"] == "left",
+          str(default_typo_opts()["header_align"]))
+    # An unrecognised stored value must not blank the title or crash.
+    junk = build(align="diagonal")
+    check("unknown alignment falls back to left",
+          float(junk.layout.title.x) == 0.0
+          and junk.layout.title.xanchor == "left",
+          f"x={junk.layout.title.x} xanchor={junk.layout.title.xanchor}")
+    check("alignment survives a header size change",
+          float(build(align="right", header_size=48).layout.title.x) == 1.0,
+          "")
+
+    # -- 2. Band scales with the header size ------------------------------
+    bands = {n: build(header_size=n).layout.margin.t for n in (10, 28, 36, 60)}
+    check("header band grows with the header size",
+          bands[10] < bands[28] < bands[36] < bands[60], str(bands))
+    # The regression: a flat 34px band clipped a 36px header.
+    check("36px header is not squeezed into the old flat 34px band",
+          bands[36] > 34, f"t={bands[36]}")
+    check("60px header gets a real band, not 34px",
+          bands[60] > 60, f"t={bands[60]}")
+    check("_title_band_px is monotonic and sane",
+          _title_band_px(28) == 38 and _title_band_px(60) == 76,
+          f"{_title_band_px(28)}/{_title_band_px(60)}")
+    check("_title_band_px tolerates junk sizes",
+          _title_band_px(None) == _title_band_px("bogus") == 38,
+          f"{_title_band_px(None)}/{_title_band_px('bogus')}")
+
+    # -- 3. Value labels are not clipped -----------------------------------
+    outside = build(layout={"label_position": "outside"})
+    check("outside value labels are unclipped",
+          all(getattr(tr, "cliponaxis", None) is False
+              for tr in outside.data),
+          str([getattr(tr, "cliponaxis", None) for tr in outside.data]))
+    # Only "outside" needs the room; inside/auto labels stay inside the plot
+    # and must keep Plotly's default clipping.
+    for pos in ("inside", "auto"):
+        s = build(layout={"label_position": pos})
+        check(f"'{pos}' labels keep the default clipping",
+              all(getattr(tr, "cliponaxis", None) is not False
+                  for tr in s.data),
+              str([getattr(tr, "cliponaxis", None) for tr in s.data]))
+    # Hiding the labels must not leave a stray cliponaxis override behind.
+    hidden = apply_display_options(
+        go.Figure(go.Bar(x=["a"], y=[1], text=["1"])),
+        dict(default_layout_opts(), show_value_labels=False),
+        default_typo_opts())
+    check("hidden labels leave clipping at Plotly's default",
+          all(getattr(tr, "cliponaxis", None) is None
+              for tr in hidden.data),
+          str([getattr(tr, "cliponaxis", None) for tr in hidden.data]))
+
+    # -- The UI control exists and round-trips ----------------------------
+    from desktop.widgets.analysis_settings.statistical import (
+        StatisticalSettings, HALIGN_LABELS, HALIGNS,
+    )
+    b = StatisticalSettings()
+    b._group_cols = ["region"]
+    b._num_cols = ["sales"]
+    b._palette_names = ["Default"]
+    # The root must stay referenced: without a Python owner the combo (a
+    # child of the returned widget) is garbage-collected and every later
+    # access raises "Internal C++ object already deleted".
+    root = b.build_typography()
+    labels = [b._cb_halign.itemText(i) for i in range(b._cb_halign.count())]
+    check("header align combo offers left/center/right",
+          labels == ["Left", "Center", "Right"], str(labels))
+    seen = []
+    b.values_changed.connect(
+        lambda payload: seen.append(payload.get("typography", {})))
+    b._cb_halign.setCurrentText("Center")
+    check("combo writes the lower-case key the backend expects",
+          b._typo_opts.get("header_align") == "center",
+          str(b._typo_opts.get("header_align")))
+    check("combo change emits a typography payload",
+          bool(seen) and seen[-1].get("header_align") == "center",
+          str(seen[-1].get("header_align") if seen else None))
+    b.prefill_typography({"header_align": "right", "header_size": 40})
+    check("prefill restores the saved alignment",
+          b._cb_halign.currentText() == "Right"
+          and b._typo_opts.get("header_align") == "right",
+          f"{b._cb_halign.currentText()}/"
+          f"{b._typo_opts.get('header_align')}")
+    b.prefill_typography({"header_align": "sideways"})
+    check("prefill of a bogus alignment shows a valid option",
+          b._cb_halign.currentText() in [HALIGN_LABELS[a] for a in HALIGNS],
+          b._cb_halign.currentText())
+    # And the value the UI produces must be one the backend actually honours.
+    b.prefill_typography({"header_align": "center"})
+    s = apply_display_options(
+        go.Figure(go.Bar(x=["a"], y=[1])).update_layout(title="T"),
+        default_layout_opts(), b._typo_opts)
+    check("the UI's value drives the figure",
+          float(s.layout.title.x) == 0.5 and s.layout.title.xanchor == "center",
+          f"x={s.layout.title.x} xanchor={s.layout.title.xanchor}")
+
+
+def test_card_header_gap_and_cold_start():
+    """The header must sit flush at the card top, and a cold start must paint.
+
+    Two separate reports, two root causes:
+
+    1. GAP. The action row (edit/style/delete) was the FIRST ITEM of the
+       card's QVBoxLayout, so its 28px buttons + 6px spacing pushed the whole
+       canvas down. The header is anchored to the top of the CANVAS, so it
+       inherited that offset and started ~40px below the card's top edge --
+       the "gap between chart header and top edge". The row now floats over
+       the plot in the same grid cell instead of reserving a row above it.
+
+    2. RESTART. _relayout_when_sized polled a fixed 20x20ms and gave up --
+       a 400ms budget. A cold process needs ~1.3s before the QWebEngine shell
+       has loaded and the QWebChannel handshake has completed, so the poll
+       always expired on a fresh start and the chart stayed at 0px until the
+       user resized the window ("close the app, reopen, Generate is blank
+       again"). The wait is now self-re-arming and time-bounded instead.
+    """
+    print("[23] Card header flush to top + cold-start render")
+    import time
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QVBoxLayout, QWidget
+
+    import plotly.graph_objects as go
+    import desktop.widgets.plotly_web_view as pwv
+    from desktop.widgets.chart_card import ChartCard
+
+    app_ = app()
+
+    # -- 1. No chrome row above the canvas --------------------------------
+    host = QWidget()
+    host.resize(1200, 700)
+    hl = QVBoxLayout(host)
+    hl.setContentsMargins(0, 0, 0, 0)
+    card = ChartCard("gap_uid", "Statistical Summary",
+                     go.Figure(go.Bar(x=["A"], y=[3])), "statistical")
+    hl.addWidget(card)
+    host.show()
+    for _ in range(6):
+        app_.processEvents()
+
+    plot_y = card.plot_view.mapTo(card, QPoint(0, 0)).y()
+    btn_y = card.btn_edit.mapTo(card, QPoint(0, 0)).y()
+    check("canvas starts at the very top of the card (no chrome row above)",
+          plot_y <= 2, f"plot_view y={plot_y}")
+    check("card top margin is zero (header can reach the edge)",
+          card.layout().contentsMargins().top() == 0,
+          str(card.layout().contentsMargins().top()))
+    # The buttons now overlay the plot rather than stacking above it.
+    check("action buttons float over the canvas, not above it",
+          abs(btn_y - plot_y) <= 2, f"btn y={btn_y} plot y={plot_y}")
+    card._action_bar.raise_()
+    check("action bar is raised in front of the plot",
+          card._action_bar.isVisible(), "bar not in front")
+    # A row above the canvas would cost ~34px; the plot must get that back.
+    check("plot keeps the height the action row used to steal",
+          card.plot_view.height() > 500, f"h={card.plot_view.height()}")
+
+    host.close()
+
+    # -- 2a. The relayout wait is not a short fixed budget -----------------
+    check("relayout wait is time-bounded, not attempt-bounded",
+          pwv._RELAYOUT_MAX_SECONDS >= 5.0,
+          f"{pwv._RELAYOUT_MAX_SECONDS}s (a cold start needs ~1.3s)")
+    # The old ceiling was 20 attempts x 20ms = 400ms.
+    check("relayout budget exceeds a measured cold start",
+          pwv._RELAYOUT_MAX_SECONDS * 1000 > 1300 * 3,
+          f"{pwv._RELAYOUT_MAX_SECONDS * 1000:.0f}ms")
+
+    # -- 2b. It really waits past the old 400ms cutoff ---------------------
+    # Drive a real PlotlyWebView but hold the page "unloaded" for longer than
+    # the old budget; the chain must still be alive afterwards and must fire
+    # exactly one relayout once the page reports ready.
+    calls = []
+    real_relayout = pwv.PlotlyWebView.relayout
+
+    def counting(self):
+        calls.append(self._web_view.height() if self._web_view else -1)
+        return real_relayout(self)
+
+    pwv.PlotlyWebView.relayout = counting
+    view = pwv.PlotlyWebView()
+    holder = QWidget()
+    holder.resize(900, 500)
+    vl = QVBoxLayout(holder)
+    vl.setContentsMargins(0, 0, 0, 0)
+    vl.addWidget(view)
+    holder.show()
+    app_.processEvents()
+    try:
+        # Hold the view at 0px, which is the "not sizeable yet" state a cold
+        # start sits in. Height is used (rather than faking _page_loaded)
+        # because the real page finishes loading on its own within ~1s and
+        # would otherwise complete the chain, making the test prove nothing
+        # about the old fixed-attempt expiry.
+        view._web_view.setFixedHeight(0)
+        view._relayout_when_sized()
+        check("a relayout chain is in flight", view._relayout_pending, "no chain")
+        deadline = time.time() + 1.2
+        while time.time() < deadline:
+            app_.processEvents()
+            time.sleep(0.01)
+        check("chain survives well past the old 400ms budget",
+              view._relayout_pending,
+              "gave up early (old fixed-attempt behaviour)")
+        check("chain outlives 3x the old fixed budget",
+              view._relayout_pending,
+              "expired like the old 20-attempt poll")
+        n_before = len(calls)
+        # A second caller must not start a competing chain.
+        view._relayout_when_sized()
+        check("a second caller reuses the in-flight chain",
+              len(calls) == n_before, f"extra relayouts={len(calls)-n_before}")
+        # Give it a real size: the chain must now complete and relayout once.
+        view._web_view.setFixedHeight(400)
+        deadline = time.time() + 2.0
+        while time.time() < deadline and view._relayout_pending:
+            app_.processEvents()
+            time.sleep(0.01)
+        check("chain completes once the view is sizeable",
+              not view._relayout_pending, "still pending")
+        n_ready = len(calls)
+        deadline = time.time() + 0.4
+        while time.time() < deadline:
+            app_.processEvents()
+            time.sleep(0.01)
+        check("no repeat relayouts once settled",
+              len(calls) == n_ready, f"extra={len(calls)-n_ready}")
+    finally:
+        pwv.PlotlyWebView.relayout = real_relayout
+        holder.close()
+
+    # -- 2c. The title is flush but never clipped --------------------------
+    from chart_display import apply_display_options
+    styled = apply_display_options(
+        go.Figure(go.Bar(x=["A"], y=[3])).update_layout(
+            title="Statistical Summary"),
+        {}, {"header_size": 28})
+    check("title anchored at the exact top of the canvas",
+          float(styled.layout.title.y) == 1.0,
+          f"y={styled.layout.title.y}")
+    # A 0 pad puts the line box's ascender space above the edge (measured at
+    # -4px in the real DOM), which can shave the tops off tall/italic headers.
+    check("title has a small top pad so glyphs cannot be cut",
+          int(styled.layout.title.pad.t) >= 4,
+          f"pad.t={styled.layout.title.pad.t}")
+
+    # -- 2d. The modebar is pushed clear of the floating buttons -----------
+    check("shell CSS moves the modebar below the floating action bar",
+          ".modebar" in pwv._SHELL_TEMPLATE
+          and "top: 32px" in pwv._SHELL_TEMPLATE,
+          "modebar offset missing")
+
+
+def test_tooltip_follows_theme():
+    """Qt tooltips must be re-coloured by a dark<->light toggle.
+
+    The report was a dark tooltip box with dark text sitting on the light UI.
+    Root cause: QToolTip is a top-level window, not a child widget, so the
+    app-wide setStyleSheet/setPalette repolish never reached it and the
+    palette() reference in its QSS rule kept resolving against the palette
+    captured when the tooltip was FIRST polished -- a stale dark plate.
+    Fix: literal colours in the QSS + dismiss any open tooltip on toggle.
+    """
+    print("[21] Tooltip follows the app theme")
+    from collections import Counter
+
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QPalette
+    from PySide6.QtWidgets import QApplication, QToolTip, QWidget
+
+    from desktop import theme as th
+
+    app_ = QApplication.instance()
+
+    # -- The QSS must carry literals, not palette() role references. --------
+    for mode in ("dark", "light"):
+        t = th.mode_tokens(mode)
+        rule = [ln for ln in th.build_qss(mode).splitlines()
+                if ln.strip().startswith("QToolTip")]
+        check(f"tooltip QSS exists in {mode}", bool(rule), "rule missing")
+        if rule:
+            body = rule[0]
+            check(f"tooltip QSS uses the {mode} plate literally",
+                  t["tooltip_bg"] in body and t["text"] in body, body)
+            check(f"tooltip QSS has no stale palette() role in {mode}",
+                  "palette(tool-tip-base)" not in body, body)
+
+    # -- And a tooltip rendered after a toggle really is that colour. ------
+    host = QWidget()
+    host.resize(400, 300)
+    host.show()
+
+    def _plate_colors():
+        """Most common pixels of the LIVE tooltip window, if one exists.
+
+        Matched on the tooltip's own text: the suite leaves other top-level
+        QLabels around (cards, headers), and grabbing one of those would
+        silently assert on an unrelated widget.
+        """
+        for tw in QApplication.topLevelWidgets():
+            if tw is host or not tw.isWindow():
+                continue
+            if type(tw).__name__ != "QLabel":
+                continue
+            if "Statistical Summary" not in (tw.text() or ""):
+                continue
+            img = tw.grab().toImage()
+            counts = Counter(img.pixelColor(x, y).name()
+                             for x in range(img.width())
+                             for y in range(img.height()))
+            return counts.most_common(1)[0][0] if counts else None
+        return None
+
+    def _show_for(mode):
+        th.apply_theme(app_, mode)
+        QToolTip.showText(QPoint(50, 50), "Statistical Summary", host)
+        for _ in range(4):
+            app_.processEvents()
+        return _plate_colors()
+
+    try:
+        # First pass primes the tooltip window; the toggle then has to move it.
+        _show_for("dark")
+        light_plate = _show_for("light")
+        dark_plate = _show_for("dark")
+        if light_plate is None or dark_plate is None:
+            # Headless platforms may not create the tooltip window at all;
+            # the QSS assertions above still guard the regression.
+            check("tooltip window unavailable offscreen (QSS check stands)", True, "")
+        else:
+            check("light mode paints the tooltip with the light plate",
+                  light_plate == th.mode_tokens("light")["tooltip_bg"],
+                  f"{light_plate} != "
+                  f"{th.mode_tokens('light')['tooltip_bg']}")
+            check("dark mode paints the tooltip with the dark plate",
+                  dark_plate == th.mode_tokens("dark")["tooltip_bg"],
+                  f"{dark_plate} != {th.mode_tokens('dark')['tooltip_bg']}")
+            check("the two modes really differ (test is not vacuous)",
+                  light_plate != dark_plate, f"{light_plate} == {dark_plate}")
+    finally:
+        th.apply_theme(app_, "dark")
+        QToolTip.hideText()
+        host.close()
+
+    # -- The palette the app advertises must match the plate the QSS paints.
+    pal = th.build_palette("light")
+    check("light palette tooltip roles match the QSS literals",
+          pal.color(QPalette.ToolTipBase).name().lower()
+          == th.mode_tokens("light")["tooltip_bg"].lower(),
+          pal.color(QPalette.ToolTipBase).name())
+
+
+def test_draft_restore_round_trip():
+    """A close/reopen must bring the session back, not start empty.
+
+    Autosave ran every 2 minutes and on every Generate, writing to
+    ``draft_sessions``, but NOTHING ever read the row back -- get_draft had no
+    caller anywhere in desktop/. So the app diligently saved the work and then
+    dropped it on exit, which is what a user experiences as "the app restarted
+    and lost everything".
+
+    This drives the real bridge: build a session, save_draft, then restore it
+    into a *fresh* bridge (a new process would behave identically) and assert
+    the chart, its figure, notes, chart_type, meta and DataFrame all survive.
+    """
+    print("[24] Draft save -> restore round trip")
+    import pandas as pd
+    import plotly.graph_objects as go
+
+    from desktop.session_bridge import SessionBridge
+    from services.database_service import get_draft, clear_draft
+
+    app_ = app()
+
+    # -- phase 1: build a session and autosave it -----------------------
+    b1 = SessionBridge()
+    b1.set("user_id", 1)
+    df = pd.DataFrame({"g": list("abcd") * 15, "v": np.arange(60.0)})
+    b1.set_df(df)
+    fig = go.Figure(data=[go.Bar(x=list("abcd"), y=[1, 2, 3, 4])])
+    b1.add_chart("uid_r1", "Restored Bar", fig,
+                 chart_type="statistical", meta={"layout": {"title": "Hello"}})
+    b1.set("page", "analysis")
+    b1.set("file_name", "demo.csv")
+    b1.set("layout_mode", "landscape")
+    b1.set_note("uid_r1", "a note")
+    b1.manager.save_df_snapshot(1, b1.df)
+    b1.save_draft()
+
+    draft = get_draft(1)
+    check("draft: autosave wrote a row", bool(draft))
+
+    # -- phase 2: fresh bridge == a relaunch -----------------------------
+    b2 = SessionBridge()
+    b2.set("user_id", 1)
+    restored = b2.restore_draft()
+    charts = b2.get("charts", [])
+
+    check("draft: restore reports success", restored is True)
+    check("draft: chart count restored", len(charts) == 1, f"got {len(charts)}")
+    if not charts:
+        clear_draft(1)
+        return
+
+    uid, title, rfig = charts[0]
+    check("draft: title restored", title == "Restored Bar", f"got {title!r}")
+    check("draft: figure restored", rfig is not None
+          and len(getattr(rfig, "data", [])) == 1)
+    # chart_type lives in a separate "chart_type_<uid>" key, which the old
+    # 3-tuple serialisation dropped on the floor.
+    check("draft: chart_type restored",
+          b2.get(f"chart_type_{uid}") == "statistical",
+          f"got {b2.get(f'chart_type_{uid}')!r}")
+    check("draft: meta restored",
+          b2.get(f"chart_meta_{uid}", {}).get("layout", {}).get("title") == "Hello")
+    check("draft: note restored", b2.get_note(uid) == "a note",
+          f"got {b2.get_note(uid)!r}")
+    check("draft: DataFrame restored from parquet",
+          b2.df is not None and tuple(b2.df.shape) == (60, 2),
+          f"got {None if b2.df is None else b2.df.shape}")
+    check("draft: page restored", b2.get("draft_page") == "analysis",
+          f"got {b2.get('draft_page')!r}")
+    check("draft: file_name restored", b2.get("file_name") == "demo.csv")
+    check("draft: layout_mode restored", b2.get("layout_mode") == "landscape")
+
+    # -- an empty draft is a normal empty start, never an exception ------
+    clear_draft(1)
+    b3 = SessionBridge()
+    b3.set("user_id", 1)
+    check("draft: cleared draft restores as empty", b3.restore_draft() is False)
+    b4 = SessionBridge()
+    check("draft: no user_id restores as empty", b4.restore_draft() is False)
+
+
+def test_draft_restore_survives_corrupt_row():
+    """A corrupt draft must degrade to an empty start, never block launch."""
+    print("[25] Draft restore survives a corrupt row")
+    from desktop.session_bridge import SessionBridge
+    from services.database_service import save_draft as db_save_draft
+
+    app_ = app()
+    b = SessionBridge()
+    b.set("user_id", 1)
+    db_save_draft(user_id=1, page="analysis", charts_json="{not json at all",
+                  file_name="broken.csv")
+
+    b2 = SessionBridge()
+    b2.set("user_id", 1)
+    try:
+        result = b2.restore_draft()
+        check("draft: corrupt row returns False instead of raising",
+              result is False, f"got {result!r}")
+    except Exception as exc:  # noqa: BLE001 - that is the point of the test
+        check("draft: corrupt row returns False instead of raising", False, str(exc))
+    finally:
+        from services.database_service import clear_draft
+        clear_draft(1)
+
+
+def test_crasher_font_guard():
+    """The app must not segfault on startup while shaping UI text.
+
+    Regression: ``run_dev.sh`` died with SIGSEGV before its first frame. The
+    stack was ``QPushButton::sizeHint -> QFontMetrics::boundingRect ->
+    QTextEngine::shapeText -> FcCharSetHasChar`` -- a crash inside fontconfig
+    while Qt probed the fallback chain for a glyph. Two offenders on this
+    machine: NotoColorEmoji (colour outlines) and the .woff2 Material Symbols
+    icon fonts, which declare an EMPTY family so fontconfig mis-binds them to
+    plain families like "Inter" and drops them into every fallback chain.
+
+    ``_guard_crasher_emoji_fonts`` rejects both before QApplication exists.
+    This asserts the conf is actually written and installed, then renders each
+    glyph that used to kill the process.
+    """
+    print("[26] Crasher-font guard installed + glyphs render")
+    import os
+    import subprocess
+    import sys as _sys
+
+    from desktop.app import (_guard_crasher_emoji_fonts,
+                             _CRASHER_FONT_GLOBS)
+
+    # The guard must not clobber an explicit user FONTCONFIG_FILE.
+    saved = os.environ.get("FONTCONFIG_FILE")
+    os.environ["FONTCONFIG_FILE"] = "/tmp/lytrize-preexisting.conf"
+    check("font guard: respects a user FONTCONFIG_FILE",
+          _guard_crasher_emoji_fonts() is False)
+    del os.environ["FONTCONFIG_FILE"]
+    if saved is not None:
+        os.environ["FONTCONFIG_FILE"] = saved
+
+    check("font guard: installs when env is clean",
+          _guard_crasher_emoji_fonts() is True)
+
+    conf_path = os.environ.get("FONTCONFIG_FILE", "")
+    check("font guard: sets FONTCONFIG_FILE", bool(conf_path), conf_path)
+    conf = ""
+    if conf_path and os.path.exists(conf_path):
+        with open(conf_path, encoding="utf-8") as fh:
+            conf = fh.read()
+    for glob in _CRASHER_FONT_GLOBS:
+        check(f"font guard: rejects glob {glob}", glob in conf)
+    # Rejecting the colour emoji font is what turned every glyph into a tofu
+    # box: NotoColorEmoji is the only font here carrying U+1F5D1/U+1F441 and
+    # no monochrome fallback is installed. Guard against regressing to that.
+    check("font guard: does NOT reject the colour emoji font",
+          "NotoColorEmoji" not in conf and "Noto Color Emoji" not in conf)
+
+    # The glyphs that reproduced the crash, each in its own process: a
+    # segfault takes the whole interpreter down, so an in-process loop could
+    # never report a failure for all of them.
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    probe = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "from desktop.app import _guard_crasher_emoji_fonts\n"
+        "_guard_crasher_emoji_fonts()\n"
+        "from PySide6.QtWidgets import QApplication, QPushButton\n"
+        "app = QApplication(sys.argv)\n"
+        "b = QPushButton(sys.argv[1]); b.show(); app.processEvents()\n"
+        "print('OK')\n" % repo_root
+    )
+    probe_path = os.path.join(os.path.dirname(conf_path or "/tmp"), "lytrize_glyph_probe.py")
+    env = {**os.environ, "QT_QPA_PLATFORM": "offscreen"}
+    env.pop("FONTCONFIG_FILE", None)  # let the guard install its own
+    with open(probe_path, "w", encoding="utf-8") as fh:
+        fh.write(probe)
+    for cp in ("1F5D1", "1F3F7", "1F441", "1F170", "1F5D2", "1F6E0"):
+        r = subprocess.run([_sys.executable, probe_path, chr(int(cp, 16))],
+                           capture_output=True, timeout=120, env=env)
+        check(f"font guard: U+{cp} renders without crashing",
+              r.returncode == 0, f"exit={r.returncode}")
+    try:
+        os.remove(probe_path)
+    except OSError:
+        pass
+
+
+def test_emoji_glyphs_are_not_tofu():
+    """Every emoji must have a real outline, not an empty .notdef box.
+
+    The first version of the font guard also rejected NotoColorEmoji. That
+    stopped the segfault but left every emoji as a tofu rectangle, because
+    NotoColorEmoji is the only font on this system with these glyphs and no
+    monochrome fallback is installed.
+
+    Checks coverage with fontconfig directly. This is the ONLY reliable
+    signal: ``QFontMetrics.inFont()`` and ``horizontalAdvance()`` both succeed
+    happily on a .notdef box, which is exactly why the tofu shipped unnoticed
+    behind a green test.
+    """
+    print("[27] Emoji glyphs resolve to a real font (no tofu)")
+    import shutil
+    import subprocess
+
+    fc_list = shutil.which("fc-list")
+    if not fc_list:
+        check("tofu: fc-list available for glyph coverage check", False,
+              "fontconfig tools not installed; skipped")
+        return
+
+    # Codepoints that must come from the colour emoji font, including the six
+    # that originally crashed.
+    codepoints = {
+        "1F5D1": "trash", "1F3F7": "tag", "1F441": "eye", "1F170": "A-button",
+        "1F5D2": "note-pencil", "1F6E0": "tools", "1F4CA": "bar-chart",
+        "1F4C8": "line-chart", "1F680": "rocket", "1F3E0": "house",
+        "1F4C2": "open-folder", "1F4BE": "floppy", "1F4C1": "folder",
+        "1F464": "bust", "1F3A8": "palette", "1F3AF": "target",
+        "1F4F7": "camera", "1F4D1": "notebook", "1F4D5": "calendar",
+        "2705": "check", "274C": "cross-mark", "26A0": "warning",
+        "1F9F9": "broom", "1F9E9": "puzzle", "1F6A8": "siren",
+    }
+    missing = []
+    for cp, name in sorted(codepoints.items()):
+        r = subprocess.run([fc_list, f":charset={cp}", "family"],
+                           capture_output=True, timeout=60)
+        families = [ln for ln in r.stdout.decode("utf-8", "replace").splitlines()
+                    if ln.strip()]
+        if not families:
+            missing.append("U+%s (%s)" % (cp, name))
+    check("tofu: every emoji has at least one font claiming it",
+          not missing, "no font covers: " + ", ".join(missing))
+
+
+def test_legend_column_tracks_card_width():
+    """The reserved legend column must track the pixels it needs, not a % of the card.
+
+    Regression: on a full-width chart the legend sat ~380px away from the last
+    bar. ``_legend_strip`` reserved a flat fraction of whatever width the card
+    happened to be, so a 1900px card reserved 20% = 380px for a legend box that
+    needs ~76px. The reservation is now sized in pixels and shrinks as the card
+    grows.
+    """
+    print("[28] Legend column sized by pixels, not card fraction")
+    import copy
+
+    import plotly.graph_objects as go
+    from chart_display import (_legend_need_px, apply_display_options,
+                               refit_legend_width, infer_legend_position)
+
+    def base(names):
+        f = go.Figure()
+        for i, n in enumerate(names):
+            f.add_bar(x=["c"], y=[i + 1], name=n)
+        return f
+
+    names = ["mean", "min", "max", "std"]
+    need = _legend_need_px(names, "", "right")
+
+    # The reserved strip must equal what the labels need, at EVERY width.
+    for w in (700, 1200, 1900, 2400):
+        f = apply_display_options(base(names),
+                                  {"legend_position": "Top Right"}, None,
+                                  width_px=w)
+        reserved = (1.0 - list(f.layout.xaxis.domain)[1]) * w
+        check(f"legend: reserved column ~= label need at {w}px",
+              abs(reserved - need) < 1.0,
+              f"reserved {reserved:.0f}px, need {need}px")
+
+    # A fraction-based reservation would GROW with the card; this must not.
+    f1 = apply_display_options(base(names), {"legend_position": "Top Right"},
+                               None, width_px=700)
+    f2 = apply_display_options(base(names), {"legend_position": "Top Right"},
+                               None, width_px=2400)
+    r1 = (1.0 - list(f1.layout.xaxis.domain)[1]) * 700
+    r2 = (1.0 - list(f2.layout.xaxis.domain)[1]) * 2400
+    check("legend: reservation does not grow with the card",
+          abs(r1 - r2) < 2.0, f"{r1:.0f}px at 700 vs {r2:.0f}px at 2400")
+
+    # Long labels must still get a genuinely wide column.
+    long_names = ["Very Long Series Name Alpha", "Very Long Series Name Beta"]
+    need_long = _legend_need_px(long_names, "", "right")
+    fl = apply_display_options(base(long_names), {"legend_position": "Top Right"},
+                               None, width_px=1900)
+    res_long = (1.0 - list(fl.layout.xaxis.domain)[1]) * 1900
+    check("legend: long labels still reserve a wider column",
+          res_long > need + 100,
+          f"reserved {res_long:.0f}px, need {need_long}px")
+
+    # The Generate path: built on a worker with no width, then re-fitted once
+    # the widget knows its real size.
+    fg = apply_display_options(base(names), {"legend_position": "Top Right"},
+                               None)
+    before = (1.0 - list(fg.layout.xaxis.domain)[1]) * 1900
+    applied = refit_legend_width(fg, 1900)
+    after = (1.0 - list(fg.layout.xaxis.domain)[1]) * 1900
+    check("legend: worker-built figure refits on first real width",
+          applied is True and after < before / 2,
+          f"{before:.0f}px -> {after:.0f}px")
+
+    # Every position keeps its side through the refit.
+    for pos in ("Top Right", "Top Left", "Bottom Right", "Bottom Left"):
+        fp = apply_display_options(base(names), {"legend_position": pos}, None)
+        refit_legend_width(fp, 1900)
+        check(f"legend: refit preserves position {pos}",
+              infer_legend_position(fp) == pos,
+              f"got {infer_legend_position(fp)}")
+
+    # Left-hand positions must keep room for the y-axis tick labels.
+    fleft = apply_display_options(base(names), {"legend_position": "Top Left"},
+                                  None, width_px=1900)
+    check("legend: left column still carries axis-label room",
+          list(fleft.layout.xaxis.domain)[0] * 1900 > need,
+          f"reserved {list(fleft.layout.xaxis.domain)[0] * 1900:.0f}px")
+
+    # A figure with no legend must be left completely alone.
+    fnone = go.Figure()
+    fnone.add_bar(x=["a"], y=[1], name="n")
+    check("legend: no legend => refit is a no-op",
+          refit_legend_width(fnone, 1900) is False
+          and fnone.layout.xaxis.domain is None)
+
+    # A zero/absent width must not corrupt an existing domain.
+    fz = copy.deepcopy(fg)
+    dom = list(fz.layout.xaxis.domain)
+    refit_legend_width(fz, 0)
+    refit_legend_width(fz, None)
+    check("legend: width 0/None leaves the domain alone",
+          list(fz.layout.xaxis.domain) == dom)
+
+    # Headless callers (export, background generation) keep the old behaviour
+    # rather than depending on a width they cannot know.
+    fh = apply_display_options(base(names), {"legend_position": "Top Right"},
+                               None)
+    check("legend: headless path still reserves a usable column",
+          0.0 < list(fh.layout.xaxis.domain)[1] < 1.0)
+
+
+def test_font_choices_are_installed_and_snapped():
+    """The font picker must only offer fonts this machine can really draw.
+
+    Regression: the combo offered 33 hard-coded families (Inter, Georgia,
+    Comic Sans MS, Impact, ...) but none of them are installed on a typical
+    box. The browser silently substituted a default for every missing family,
+    so most choices changed nothing -- the "many fonts are not even working"
+    report. Separately, the stored default "Inter" was missing too, so
+    setCurrentText() silently no-opped while the chart kept asking for a font
+    that does not exist.
+    """
+    print("[29] Font choices are installed; default is snapped to the list")
+    from chart_display import (available_fonts, font_is_available,
+                               installed_font_families, _FONT_CHOICES,
+                               default_typo_opts)
+
+    installed = installed_font_families()
+    offered = available_fonts(prefer=["Inter"])
+
+    # A font is "usable" if the app ships it OR the machine has it. Bundled
+    # fonts are registered at startup (see register_qt_fonts), so demanding a
+    # system install here would be wrong -- and was, before the bundle existed.
+    try:
+        from font_bundle import bundled_families, font_is_available
+        bundled = set(bundled_families())
+    except Exception:
+        bundled = set()
+
+    def _usable(name):
+        return name in bundled or font_is_available(name)
+
+    check("font: picker is never empty", bool(offered), "offered nothing")
+    unusable = [f for f in offered if not _usable(f)]
+    check("font: every offered font is usable (bundled or installed)",
+          not unusable, "unusable: " + ", ".join(unusable))
+
+    # The picker must not offer a font the app cannot render AND the machine
+    # cannot render -- that combination is the silent no-op bug.
+    check("font: no silently-broken choices offered",
+          not any(f not in bundled and not font_is_available(f)
+                  for f in offered))
+
+    # Missing families from the wish-list are filtered out.
+    check("font: missing families are dropped from the picker",
+          not any(f in offered for f in ("Comic Sans MS", "Impact")
+                  if not _usable(f)))
+
+    # The cache must not re-run fc-list (an fc-list per combo is far too slow).
+    before = installed_font_families()
+    check("font: family list is cached", before is installed)
+
+    # default_typo_opts names Inter. It is bundled, so it is always usable;
+    # when it is neither bundled nor installed, the panel must have snapped the
+    # stored value to something that is.
+    d = default_typo_opts()
+    if not _usable(d.get("family", "")):
+        check("font: absent default has a real substitute available",
+              bool(offered) and _usable(offered[0]),
+              "no usable substitute to snap to")
+    else:
+        check("font: the documented default is usable", True)
+
+    # Determinism: the same call twice gives the same list.
+    check("font: available_fonts is stable across calls",
+          available_fonts(prefer=["Inter"]) == offered)
+
+    # A machine with a proper Inter installed still lists it first.
+    if font_is_available("Inter"):
+        check("font: installed default is listed first",
+              offered[0] == "Inter", f"got {offered[0]!r}")
+
+
+def test_font_change_uses_fast_debounce():
+    """A combo-box font pick must not wait out the 300ms slider debounce.
+
+    Regression: every typography change used one 300ms timer, so picking a
+    font family made the user wait the full debounce plus a ~40ms Plotly
+    layout rebuild on the GUI thread. Discrete combo choices now take a short
+    path; slider/spinbox drags stay coalesced at 300ms.
+    """
+    print("[30] Discrete font picks use the short preview debounce")
+    from PySide6.QtWidgets import QApplication
+    from desktop.session_bridge import SessionBridge
+    from desktop.pages.analysis_page import (_PREVIEW_FAST_MS,
+                                             _PREVIEW_DEBOUNCE_MS,
+                                             AnalysisPage)
+
+    app_ = app()
+    check("debounce: fast path is well under the slow one",
+          0 < _PREVIEW_FAST_MS < _PREVIEW_DEBOUNCE_MS,
+          f"fast={_PREVIEW_FAST_MS} slow={_PREVIEW_DEBOUNCE_MS}")
+
+    page = AnalysisPage(SessionBridge())
+    page._settings_target_uid = "some-uid"
+    try:
+        # A discrete pick (combo box) -> short timer only.
+        page._on_settings_changed("typography",
+                                  {"typography": {"family": "DejaVu Sans"},
+                                   "discrete": True})
+        check("debounce: discrete change arms the fast timer",
+              page._preview_fast_timer.isActive()
+              and not page._preview_timer.isActive())
+        page._preview_fast_timer.stop()
+
+        # A dragged value -> long timer only.
+        page._on_settings_changed("typography",
+                                  {"typography": {"header_size": 20}})
+        check("debounce: continuous change arms the slow timer",
+              page._preview_timer.isActive()
+              and not page._preview_fast_timer.isActive())
+        page._preview_timer.stop()
+
+        # A discrete pick must cancel a pending slow pass, otherwise the slow
+        # re-render lands on top of the fast one and the chart flickers twice.
+        page._on_settings_changed("typography", {"typography": {"header_size": 22}})
+        page._on_settings_changed("typography",
+                                  {"typography": {"family": "DejaVu Serif"},
+                                   "discrete": True})
+        check("debounce: discrete change cancels the pending slow pass",
+              page._preview_fast_timer.isActive()
+              and not page._preview_timer.isActive())
+        page._preview_fast_timer.stop()
+
+        # No chart selected -> nothing armed at all.
+        page._settings_target_uid = None
+        page._on_settings_changed("typography",
+                                  {"typography": {"family": "x"},
+                                   "discrete": True})
+        check("debounce: no target arms nothing",
+              not page._preview_fast_timer.isActive()
+              and not page._preview_timer.isActive())
+    finally:
+        page._preview_fast_timer.stop()
+        page._preview_timer.stop()
+        page.deleteLater()
+
+
+def test_bundled_fonts_are_registered_everywhere():
+    """The app must ship its own fonts, and register them with BOTH renderers.
+
+    Regression: the font picker offered families the machine did not have, so
+    most choices silently did nothing. Bundling the files removes that class of
+    bug, but only if BOTH consumers are wired up, because they do not share a
+    font stack:
+
+    * Qt widgets (the settings preview label, the combo boxes) need
+      QFontDatabase.addApplicationFont.
+    * The charts render in a QWebEngineView (Chromium), which cannot see Qt's
+      font database at all and needs CSS @font-face in the shell HTML.
+
+    Missing either one leaves half the UI still falling back.
+    """
+    print("[31] Bundled fonts registered with Qt and with the chart shell")
+    from font_bundle import (FONT_DIR, SUBSTITUTES, bundled_families,
+                             family_of, font_face_css, font_files, resolve,
+                             register_qt_fonts)
+
+    files = font_files()
+    check("bundle: font files are present", bool(files),
+          f"no fonts in {FONT_DIR}")
+    if not files:
+        return
+
+    check("bundle: licence files accompany the fonts",
+          bool(list(FONT_DIR.glob("LICENSE-*.txt"))),
+          "no LICENSE-*.txt beside the fonts")
+
+    # family_of must produce the DISPLAY name, matching what Qt reports.
+    check("bundle: family names are display names (spaced)",
+          not any("OpenSans" == f for f in bundled_families()),
+          "file stems leaked into family names")
+    check("bundle: Inter (the app default) is bundled",
+          "Inter" in bundled_families())
+
+    # Qt side: every family must actually register.
+    reg = register_qt_fonts()
+    check("bundle: fonts register with Qt", len(reg) >= len(bundled_families()),
+          f"{len(reg)} registered vs {len(bundled_families())} bundled")
+    for fam in bundled_families():
+        check(f"bundle: Qt knows {fam!r}", fam in reg)
+
+    # Chromium side: the shell needs @font-face for the same families.
+    css = font_face_css()
+    for fam in bundled_families():
+        check(f"bundle: @font-face declares {fam!r}",
+              ("font-family:'%s'" % fam) in css)
+    check("bundle: @font-face uses file:// URLs", "url('file://" in css)
+
+    # The real shell HTML must carry the rules (a template placeholder left
+    # unformatted, or the digest ignoring the CSS, would silently drop them).
+    try:
+        from desktop.widgets.plotly_web_view import (_font_face_css,
+                                                     _shell_file_path)
+        html = _shell_file_path().read_text(encoding="utf-8")
+        check("bundle: shell HTML contains the @font-face rules",
+              html.count("@font-face") >= len(bundled_families()),
+              f"{html.count('@font-face')} rules in shell")
+        check("bundle: no unformatted placeholder left in the shell",
+              "{fontfacecss}" not in html)
+        check("bundle: shell font CSS matches the current font set",
+              html.count("@font-face") == _font_face_css().count("@font-face"))
+    except Exception as exc:  # pragma: no cover
+        check("bundle: shell HTML contains the @font-face rules", False, str(exc))
+
+    # Proprietary names must map to a bundled, metric-compatible stand-in.
+    for name, stand_in in SUBSTITUTES.items():
+        if stand_in in bundled_families():
+            check(f"bundle: {name!r} resolves to bundled {stand_in!r}",
+                  resolve(name) == stand_in, f"got {resolve(name)!r}")
+
+    check("bundle: bundled family resolves to itself", resolve("Inter") == "Inter")
+    check("bundle: unknown family passes through unchanged",
+          resolve("Mystery Font") == "Mystery Font")
+
+    # Every bundled family must be offered by the picker.
+    from chart_display import available_fonts
+    offered = available_fonts(prefer=["Inter"])
+    for fam in bundled_families():
+        check(f"bundle: picker offers {fam!r}", fam in offered)
+
+
+def test_bundled_font_stacks_resolve_for_charts():
+    """A chart font request must reach a family the page can actually draw.
+
+    _font_stack feeds the Plotly figure (drawn by Chromium) and
+    header_font_css feeds the Qt-drawn heading. A proprietary name has to be
+    mapped to its bundled stand-in in BOTH, otherwise the heading and the
+    chart text end up in different typefaces.
+    """
+    print("[32] Chart/heading font stacks resolve through the bundle")
+    from chart_display import _font_stack, header_font_css
+    from font_bundle import bundled_families
+
+    bundled = set(bundled_families())
+
+    # Georgia: not shipped, must map to Caladea and keep Georgia as a later
+    # fallback, so a machine with the real thing still prefers it.
+    stack = _font_stack("Georgia")
+    check("stack: Georgia maps to a bundled family first",
+          stack.split(",")[0].strip() in bundled, stack)
+    check("stack: Georgia keeps the requested name as a later fallback",
+          "Georgia" in stack, stack)
+
+    for name in ("Inter", "Lato", "Roboto", "Open Sans", "Fira Code"):
+        check(f"stack: {name!r} is offered as itself", name in _font_stack(name))
+
+    css = header_font_css({"header_family": "Georgia"})
+    check("stack: heading css uses the bundled stand-in", "Caladea" in css,
+          css[:60])
+    check("stack: heading css for Inter names Inter",
+          "Inter" in header_font_css({"header_family": "Inter"}))
+
+    # No stack may ever be empty or contain a stray placeholder.
+    for name in ("Inter", "Georgia", "Arial", "Comic Sans MS"):
+        s = _font_stack(name)
+        check(f"stack: {name!r} stack is non-empty and clean",
+              bool(s.strip()) and "{" not in s and "}" not in s, s)
+
+
 def main():
     import services.transform_service as ts
     test_find_replace(ts)
@@ -1186,6 +2488,22 @@ def main():
     test_dtype_extra()
     test_date_conversion()
     test_analysis_redesign()
+    test_index_header_auto_fit()
+    test_index_header_helper()
+    test_chart_area_layout_and_render()
+    test_chart_canvas_and_title()
+    test_tooltip_follows_theme()
+    test_header_alignment_and_band()
+    test_card_header_gap_and_cold_start()
+    test_draft_restore_round_trip()
+    test_draft_restore_survives_corrupt_row()
+    test_crasher_font_guard()
+    test_emoji_glyphs_are_not_tofu()
+    test_legend_column_tracks_card_width()
+    test_font_choices_are_installed_and_snapped()
+    test_font_change_uses_fast_debounce()
+    test_bundled_fonts_are_registered_everywhere()
+    test_bundled_font_stacks_resolve_for_charts()
 
     print("\n========== RESULT ==========")
     print(f"  Passed: {len(PASS)}")

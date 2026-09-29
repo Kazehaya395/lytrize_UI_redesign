@@ -32,6 +32,7 @@ from services.transform_service import (
     date_diff_column, extract_date_part, add_column_op, moving_average_column,
 )
 from desktop.workers import TransformWorker
+from desktop.widgets.table_index_header import auto_fit_index_header
 
 log = logging.getLogger(__name__)
 
@@ -150,8 +151,9 @@ class ColumnManagerPanel(QWidget):
         self.table_preview.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.table_preview.verticalHeader().setDefaultSectionSize(28)
         # Table styling handled by global _tables_qss
-        self.table_preview.verticalHeader().setFixedWidth(36)
-        self.table_preview.verticalHeader().setDefaultAlignment(Qt.AlignCenter)
+        # Centered row-index gutter sized to the rows actually shown (the
+        # old fixed 36px was arbitrary). See table_index_header.py.
+        auto_fit_index_header(self.table_preview)
         self.table_preview.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table_preview.setMinimumHeight(220)
         right_lay.addWidget(self.table_preview, stretch=1)
@@ -526,6 +528,8 @@ class ColumnManagerPanel(QWidget):
                     from PySide6.QtGui import QColor
                     item.setBackground(QColor(16, 185, 129, 50))
                 self.table_preview.setItem(r, c, item)
+        # Row count just changed -> re-measure the index gutter.
+        auto_fit_index_header(self.table_preview)
 
     def _validate_formula(self, formula: str) -> Optional[str]:
         """Return a user-friendly error message if *formula* is invalid, or

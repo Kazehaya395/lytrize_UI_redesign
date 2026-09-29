@@ -161,6 +161,119 @@ def test_apply_display_options(df):
     nogrp2 = apply_display_options(nogrp, default_layout_opts(), None)
     check("no-group chart applies without error", len(nogrp2.data) > 0, "")
 
+    # -- "Show border" (Layout tab, under "Show grid") --------------------
+    import plotly.graph_objects as go
+    bordered = apply_display_options(base, {"show_border": True}, None)
+    borderless = apply_display_options(base, {"show_border": False}, None)
+    check("layout: Show border ON -> legend frame drawn",
+          int(bordered.layout.legend.borderwidth or 0) == 1,
+          str(bordered.layout.legend.borderwidth))
+    check("layout: Show border OFF -> legend frame removed",
+          int(borderless.layout.legend.borderwidth or 0) == 0,
+          str(borderless.layout.legend.borderwidth))
+    check("layout: Show border defaults to ON (keeps the previous look)",
+          int(apply_display_options(base, default_layout_opts(), None)
+              .layout.legend.borderwidth or 0) == 1, "")
+    # The colour bar / colour range is reached by the same toggle.
+    heat = go.Figure(go.Heatmap(z=[[1, 2], [3, 4]],
+                                colorbar=dict(borderwidth=1, bordercolor="#123456")))
+    check("layout: Show border OFF -> colour bar frame removed",
+          int(apply_display_options(heat, {"show_border": False}, None)
+              .data[0].colorbar.borderwidth or 0) == 0, "")
+    check("layout: Show border ON -> colour bar frame drawn",
+          int(apply_display_options(heat, {"show_border": True}, None)
+              .data[0].colorbar.borderwidth or 0) == 1, "")
+
+    # -- Legend column adapts to the labels that will be painted ----------
+    short_lbl = go.Figure()
+    long_lbl = go.Figure()
+    for nm in ("Mean", "Min"):
+        short_lbl.add_trace(go.Bar(x=["a"], y=[1], name=nm))
+    for nm in ("Very Long Series Name Alpha", "Very Long Series Name Beta"):
+        long_lbl.add_trace(go.Bar(x=["a"], y=[1], name=nm))
+    d_short = list(apply_display_options(short_lbl, {"legend_position": "Top Left"},
+                                         None).layout.xaxis.domain)[0]
+    d_long = list(apply_display_options(long_lbl, {"legend_position": "Top Left"},
+                                        None).layout.xaxis.domain)[0]
+    check("legend: reserved column grows with long labels", d_long > d_short,
+          f"short={d_short:.3f} long={d_long:.3f}")
+
+    # -- Theme layer (light mode needs its own canvas + text colours) -----
+    # Themed from a figure that carries the Typography defaults, since those
+    # are exactly the dark-mode values the theme is expected to re-map.
+    from chart_display import theme_figure
+    themed_src = plain
+    light = theme_figure(themed_src, "light")
+    dark = theme_figure(themed_src, "dark")
+    check("theme: light canvas is white",
+          light.layout.paper_bgcolor == "#ffffff"
+          and light.layout.plot_bgcolor == "#ffffff",
+          f"{light.layout.paper_bgcolor}/{light.layout.plot_bgcolor}")
+    check("theme: dark canvas stays dark",
+          dark.layout.paper_bgcolor == "#0f172a", str(dark.layout.paper_bgcolor))
+    check("theme: dark default tick colour flips for light mode",
+          str(light.layout.xaxis.tickfont.color) == "#475569",
+          str(light.layout.xaxis.tickfont.color))
+    check("theme: dark mode keeps its tick colour",
+          str(dark.layout.xaxis.tickfont.color) == "#94a3b8",
+          str(dark.layout.xaxis.tickfont.color))
+    check("theme: light mode gives the legend a light plate",
+          str(light.layout.legend.bgcolor).startswith("rgba(255, 255, 255"),
+          str(light.layout.legend.bgcolor))
+    # The legend TEXT sits on that plate, so it has to follow the mode too.
+    # It did not: only the plate was re-tinted, so light mode drew the
+    # near-white default (#e2e8f0) labels on a white plate -- invisible.
+    check("theme: light mode re-tints the legend item text",
+          str(light.layout.legend.font.color) == "#334155",
+          str(light.layout.legend.font.color))
+    check("theme: light mode re-tints the legend title text",
+          str(light.layout.legend.title.font.color) == "#334155",
+          str(light.layout.legend.title.font.color))
+    check("theme: dark mode keeps the legend item text",
+          str(dark.layout.legend.font.color) == "#e2e8f0",
+          str(dark.layout.legend.font.color))
+    # A user-picked legend colour is not a dark DEFAULT, so it must survive.
+    check("theme: user-picked legend colour survives the light switch",
+          str(theme_figure(apply_display_options(
+              base, None, {"legend_item_color": "#ff00ff"}),
+              "light").layout.legend.font.color) == "#ff00ff", "")
+
+    # Colour-bar tick labels / title are drawn on the canvas too. An
+    # UNSET colour falls back to Plotly's own mid-grey template value, which
+    # is illegible in one mode or the other, so the theme has to supply one.
+    from chart_display import CHART_THEME
+    for mode, want in (("dark", CHART_THEME["dark"]["tick_text"]),
+                       ("light", CHART_THEME["light"]["tick_text"])):
+        cb_fig = theme_figure(go.Figure(go.Heatmap(z=[[1, 2]])), mode)
+        check(f"theme: {mode} colorbar ticks get a readable colour",
+              str(cb_fig.data[0].colorbar.tickfont.color).lower() == want.lower(),
+              str(cb_fig.data[0].colorbar.tickfont.color))
+        check(f"theme: {mode} colorbar title gets a readable colour",
+              str(cb_fig.data[0].colorbar.title.font.color).lower() == want.lower(),
+              str(cb_fig.data[0].colorbar.title.font.color))
+    # ... and an explicit dark default on the bar is remapped, not blanked.
+    cb_dark = go.Figure(go.Heatmap(
+        z=[[1, 2]], colorbar=dict(tickfont=dict(color="#94a3b8"),
+                                  title=dict(font=dict(color="#cbd5e1")))))
+    cb_light = theme_figure(cb_dark, "light")
+    check("theme: light mode flips an explicit colorbar tick colour",
+          str(cb_light.data[0].colorbar.tickfont.color) == "#475569",
+          str(cb_light.data[0].colorbar.tickfont.color))
+    check("theme: light mode flips an explicit colorbar title colour",
+          str(cb_light.data[0].colorbar.title.font.color) == "#334155",
+          str(cb_light.data[0].colorbar.title.font.color))
+    check("theme: value labels flip for light mode",
+          str(theme_figure(go.Figure(go.Bar(x=["a"], y=[1],
+                                            textfont=dict(color="white"))),
+                           "light").data[0].textfont.color) == "#1e293b", "")
+    # A colour the user picked is not a dark DEFAULT, so it must survive.
+    custom = apply_display_options(base, None, {"axis_tick_color": "#00ff00"})
+    check("theme: user-picked colour survives the light switch",
+          str(theme_figure(custom, "light").layout.xaxis.tickfont.color) == "#00ff00",
+          str(theme_figure(custom, "light").layout.xaxis.tickfont.color))
+    check("theme: never mutates the source figure",
+          base.to_json() == base_snapshot, "")
+
 
 # -----------------------------------------------------------------------
 # 2. Worker integration
@@ -374,9 +487,10 @@ def test_page_flows(page, b):
     check("preview: card figure title updated",
           card1._fig.layout.title.text == "My Custom Title",
           str(card1._fig.layout.title.text))
-    check("preview: card header label updated",
-          card1.lbl_title.text() == "My Custom Title",
-          card1.lbl_title.text())
+    check("preview: card title/tooltip updated",
+          card1._title == "My Custom Title"
+          and card1.toolTip() == "My Custom Title",
+          f"{card1._title!r} / {card1.toolTip()!r}")
     check("preview: meta layout persisted",
           b.get_chart_meta(uid1).get("layout", {}).get("title")
           == "My Custom Title",
@@ -560,7 +674,8 @@ def test_settings_tabs_fit_design(df):
                       str(_rows(stacks[0])))
                 check("layout: display rows in the right column (design)",
                       _rows(stacks[1]) == ["Show value labels", "Label pos",
-                                           "Bar mode", "Bar gap", "Show grid"],
+                                           "Bar mode", "Bar gap", "Show grid",
+                                           "Show border"],
                       str(_rows(stacks[1])))
         scroll = panel.row1.widget(idx)
         check(f"{name}: fits the default pane (no scrolling)",
@@ -572,9 +687,9 @@ def test_settings_tabs_fit_design(df):
     order += boxes
     check("layout: design rows present",
           all(t in order for t in ("Show value labels", "Label pos", "Bar mode",
-                                   "Bar gap", "Show grid")), str(order))
+                                   "Bar gap", "Show grid", "Show border")), str(order))
     check("layout: checkbox rows carry their own label",
-          boxes == ["Show value labels", "Show grid"], str(boxes))
+          boxes == ["Show value labels", "Show grid", "Show border"], str(boxes))
     typo = [w.text() for w in panel.body_typo.findChildren(QLabel)]
     check("typography: design rows present",
           all(t in typo for t in
@@ -621,6 +736,14 @@ def test_settings_tabs_fit_design(df):
     bldr._ck_grid.setChecked(False)
     check("live: Show grid widget -> xaxis.showgrid off",
           _live().layout.xaxis.showgrid is False, "")
+    bldr._ck_border.setChecked(False)
+    check("live: Show border widget -> legend frame off",
+          int(_live().layout.legend.borderwidth or 0) == 0,
+          str(card._fig.layout.legend.borderwidth))
+    bldr._ck_border.setChecked(True)
+    check("live: Show border widget -> legend frame back on",
+          int(_live().layout.legend.borderwidth or 0) == 1,
+          str(card._fig.layout.legend.borderwidth))
     bldr._cb_legpos.setCurrentText("Bottom Left")
     check("live: Legend position widget -> legend moved",
           (float(_live().layout.legend.x), float(_live().layout.legend.y)) == (0.0, 0.0),
@@ -673,6 +796,154 @@ def test_settings_tabs_fit_design(df):
           bldr._cb_legpos.currentText())
 
 
+# -----------------------------------------------------------------------
+# 6. Generate / Re-Generate must not rebuild the chart tiles
+# -----------------------------------------------------------------------
+
+def test_incremental_refresh(df):
+    """Guards the "the app closed and reopened itself" Generate bug.
+
+    Every ChartCard owns a QWebEngineView; rebuilding the tiles makes each
+    one reload the plotly.js shell and repaint from scratch, which reads as
+    the whole chart area flashing.  Re-Generate has to reuse the SAME card
+    (and therefore the same loaded web view) and only push the new figure,
+    so the number of views built is pinned here.
+    """
+    print("== AnalysisPage: chart tiles are reused on refresh ==")
+    from desktop.session_bridge import SessionBridge
+    import desktop.widgets.chart_card as _cc
+    from desktop.pages.analysis_page import AnalysisPage
+
+    created = []
+
+    class _CountingView(_cc.PlotlyWebView):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            created.append(self)
+
+    real_view = _cc.PlotlyWebView
+    _cc.PlotlyWebView = _CountingView
+    try:
+        b = SessionBridge()
+        b.set_df(df)
+        page = AnalysisPage(b)
+        _select_analysis(page, "statistical")
+
+        _set_form(page, "region", ["sales"])
+        page._on_generate()
+        _drain(page)
+        uid = page._settings_target_uid
+        card = page._chart_cards.get(uid)
+        check("reuse: first Generate builds one view", len(created) == 1,
+              str(len(created)))
+
+        # Change a LAYOUT option (still one chart) and Re-Generate in place.
+        bldr = page.config_panel._builder
+        bldr._set_layout(title="Reuse Title")
+        check("reuse: a change enables Re-Generate",
+              page.config_panel.regenerate_button().isEnabled(), "")
+        page._on_regenerate()
+        _drain(page)
+        check("reuse: Re-Generate still holds one chart",
+              len(b.get("charts", [])) == 1, str(len(b.get("charts", []))))
+        check("reuse: Re-Generate keeps the same ChartCard",
+              page._chart_cards.get(uid) is card, "")
+        check("reuse: Re-Generate builds NO extra web view", len(created) == 1,
+              str(len(created)))
+        bfig = None
+        for c_uid, _t, c_fig in b.get("charts", []):
+            if c_uid == uid:
+                bfig = c_fig
+        check("reuse: the re-generated figure reached the card",
+              bfig is not None and card._fig is bfig, "")
+        check("reuse: Re-Generate leaves the form clean (gate off)",
+              not page.config_panel.is_dirty()
+              and not page.config_panel.regenerate_button().isEnabled(), "")
+
+        # A genuinely new chart still needs (and gets) its own tile.
+        _set_form(page, "region", ["profit"])
+        page._on_generate()
+        _drain(page)
+        check("reuse: a brand-new chart adds exactly one view",
+              len(created) == 2, str(len(created)))
+
+        # And deleting a chart disposes only that tile.
+        victim = next(u for u in list(page._chart_cards))
+        page.bridge.remove_chart(victim)
+        page._refresh_charts()
+        check("reuse: deleted chart's tile is dropped",
+              victim not in page._chart_cards and victim not in page._tab_order,
+              str(list(page._chart_cards)))
+        check("reuse: other tiles survive the delete",
+              len(page._chart_cards) == len(page._tab_order)
+              and len(page._chart_cards) == 1, str(list(page._chart_cards)))
+    finally:
+        _cc.PlotlyWebView = real_view
+
+
+def test_dashboard_reuse(df):
+    """The dashboard grid reuses its tiles the same way (same web-view rules)."""
+    print("== DashboardPage: grid tiles are reused ==")
+    import plotly.graph_objects as go
+    from desktop.session_bridge import SessionBridge
+    import desktop.widgets.chart_card as _cc
+    from desktop.pages.dashboard_page import DashboardPage
+
+    created = []
+
+    class _CountingView(_cc.PlotlyWebView):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            created.append(self)
+
+    real_view = _cc.PlotlyWebView
+    _cc.PlotlyWebView = _CountingView
+    try:
+        b = SessionBridge()
+        b.set_df(df)
+        for uid in ("d1", "d2"):
+            b.add_chart(uid, f"Chart {uid}",
+                        go.Figure(go.Bar(x=["a", "b"], y=[1, 2], name=uid)),
+                        chart_type="statistical", meta={})
+        page = DashboardPage(b)
+        check("dashboard: one view per chart on build", len(created) == 2,
+              str(len(created)))
+        before = dict(page._chart_cards)
+        page._refresh_charts()
+        check("dashboard: refresh reuses every tile",
+              all(page._chart_cards.get(k) is v for k, v in before.items())
+              and len(created) == 2, str(len(created)))
+        b.add_chart("d3", "Chart d3",
+                    go.Figure(go.Bar(x=["a"], y=[3], name="d3")),
+                    chart_type="statistical", meta={})
+        page._refresh_charts()
+        check("dashboard: a new chart adds one view, keeps the rest",
+              len(created) == 3 and page._chart_cards["d1"] is before["d1"],
+              str(len(created)))
+        b.remove_chart("d2")
+        page._refresh_charts()
+        check("dashboard: delete drops only that tile",
+              "d2" not in page._chart_cards and len(page._chart_cards) == 2,
+              str(sorted(page._chart_cards)))
+        # A theme switch repaints the tiles where they are.
+        pv = page._chart_cards["d1"].plot_view
+        from desktop import theme as _t
+        try:
+            _t.apply_theme(QApplication.instance(), "light")
+            b.theme_changed.emit("light")
+            for _ in range(5):
+                QApplication.processEvents()
+            check("dashboard: theme switch repaints tiles in place",
+                  pv._render_fig.layout.paper_bgcolor == "#ffffff"
+                  and len(created) == 3,
+                  str(pv._render_fig.layout.paper_bgcolor))
+        finally:
+            _t.apply_theme(QApplication.instance(), "dark")
+            b.theme_changed.emit("dark")
+    finally:
+        _cc.PlotlyWebView = real_view
+
+
 def main() -> int:
     # Chart deletes ask first via QMessageBox.question(), which blocks for
     # user input that never arrives in an offscreen run -- the delete-flow
@@ -689,6 +960,8 @@ def main() -> int:
     test_page_flows(_page, _b)
     test_reload(df, _b)
     test_settings_tabs_fit_design(df)
+    test_incremental_refresh(df)
+    test_dashboard_reuse(df)
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

@@ -31,6 +31,7 @@ from services.transform_service import (
     numeric_clean, apply_column_update, VALIDATION_PATTERNS,
 )
 from desktop.workers import TransformWorker
+from desktop.widgets.table_index_header import auto_fit_index_header
 
 log = logging.getLogger(__name__)
 
@@ -188,13 +189,14 @@ class DataCleanerPanel(QWidget):
 
         root.addWidget(self.tabs, stretch=1)
 
-        # Roomier, centered row-index gutters on every preview table (UI
-        # issue: index numbers were cramped against the Before column).
+        # Centered row-index gutters on every preview table, sized to the
+        # rows actually displayed (the old fixed 36px was arbitrary: too
+        # wide for a 10-row preview, too narrow for a 4+ digit index).
+        # Re-fitted on every fill in _fill_preview_table / _show_failures.
         for tbl in (self.table_text_preview, self.table_find_preview,
                     self.table_failures, self.table_str_preview,
                     self.table_num_preview):
-            tbl.verticalHeader().setFixedWidth(36)
-            tbl.verticalHeader().setDefaultAlignment(Qt.AlignCenter)
+            auto_fit_index_header(tbl)
 
         # Cap input-bar widths on every static tab (see INPUT_MAX_WIDTH).
         cap_input_widths(self.tabs)
@@ -717,6 +719,8 @@ class DataCleanerPanel(QWidget):
                 item = QTableWidgetItem(str(row.iloc[0]))
                 item.setTextAlignment(Qt.AlignCenter)
                 self.table_failures.setItem(i, 0, item)
+            # Row count just changed -> re-measure the index gutter.
+            auto_fit_index_header(self.table_failures)
         except (re.error, KeyError):
             pass
 
@@ -1117,6 +1121,8 @@ class DataCleanerPanel(QWidget):
                 item = QTableWidgetItem(val)
                 item.setTextAlignment(Qt.AlignCenter)
                 table.setItem(i, j, item)
+        # Row count just changed -> re-measure the index gutter.
+        auto_fit_index_header(table)
 
     # -- Worker helpers ------------------------------------------------------
 

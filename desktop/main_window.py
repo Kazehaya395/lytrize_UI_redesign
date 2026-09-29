@@ -67,6 +67,11 @@ class MainWindow(QMainWindow):
         self._auto_save_timer.timeout.connect(self._auto_save_draft)
         self._auto_save_timer.start(2 * 60 * 1000)  # 2 minutes
 
+        # Restore the last auto-saved draft. Deferred to the event loop so the
+        # window is already up: restoring rebuilds the analysis tabs, and doing
+        # that during __init__ meant painting them into a not-yet-shown window.
+        QTimer.singleShot(0, self._restore_draft_if_any)
+
     # -- UI construction ----------------------------------------------------
 
     def _load_logo(self) -> "QPixmap | None":
@@ -378,6 +383,33 @@ class MainWindow(QMainWindow):
                 self.bridge.user_changed.emit(guest["id"])
         except Exception as exc:
             log.warning("get_or_create_guest_user failed: %s", exc)
+
+    def _restore_draft_if_any(self) -> None:
+        """Restore the auto-saved draft and navigate back to its page.
+
+        Runs once from a zero-delay timer after the window is up. Guards on
+        ``_draft_restored`` so a later rebuild/re-entry can never re-apply a
+        stale draft over live work. A failure here is logged and swallowed:
+        an unreadable draft must degrade to a normal empty start, never block
+        launch.
+        """
+        if getattr(self, "_draft_restored", False):
+            return
+        self._draft_restored = True
+
+        try:
+            restored = self.bridge.restore_draft()
+        except Exception as exc:
+            log.warning("Draft restore failed, starting empty: %s", exc)
+            return
+
+        if not restored:
+            return
+
+        page = self.bridge.get("draft_page", "")
+        if page and page != "home" and page in self.pages:
+            self.navigate_to(page)
+        self.status.showMessage("Restored your last session", 4000)
 
     # -- Slots ---------------------------------------------------------------
 

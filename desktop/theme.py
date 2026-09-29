@@ -59,6 +59,14 @@ DANGER_RGBA_HOVER = "rgba(239,68,68,0.20)"
 WARNING_RGBA = "rgba(245,158,11,0.12)"
 WARNING_RGBA_BORDER = "rgba(245,158,11,0.30)"
 
+# Chart canvas colours, mirroring chart_display.CHART_THEME[*]["canvas"].
+# The ChartCard's surface has to equal the figure's paper/plot background
+# so the chart does not sit on a mismatched rectangle. See _cards_qss().
+CHART_CANVAS = {
+    "dark": "#0f172a",
+    "light": "#ffffff",
+}
+
 # Theme palettes. Keep the same KEYS in both dicts so a mode switch is a
 # pure value swap.
 THEMES = {
@@ -82,6 +90,7 @@ THEMES = {
         "accent_selected_fill": "#2d2a5e",
         "index_bg": "#1e1b4b",
         "index_text": "#a5b4fc",
+        "chart_canvas_key": "dark",
         "success": "#10b981",
         "success_hover": "#34d399",
         "danger": "#ef4444",
@@ -114,7 +123,11 @@ THEMES = {
         "border_subtle": "#e2e8f0",
         "text": "#0f172a",
         "text_muted": "#475569",
-        "text_faint": "#94a3b8",
+        # Light-mode "faint" text (placeholders, disabled states, hint
+        # labels) must stay readable on the near-white surfaces: #94a3b8
+        # was ~2.3:1 against #ffffff (the "unreadable tiles" report), while
+        # slate-500 clears 4.5:1 AA.
+        "text_faint": "#64748b",
         "text_bright": "#4f46e5",
         "brand": "#475569",
         "header_bg": "#4f46e5",
@@ -124,6 +137,7 @@ THEMES = {
         "accent_selected_fill": "#d6daff",
         "index_bg": "#e8ebff",
         "index_text": "#4f46e5",
+        "chart_canvas_key": "light",
         "success": "#059669",
         "success_hover": "#10b981",
         "danger": "#dc2626",
@@ -263,9 +277,14 @@ QLabel[class="iconEmoji"] {{ font-size: 18px; }}
     qss += _lists_qss()
     qss += _tabs_qss()
     qss += _groupbox_qss()
-    qss += _cards_qss()
+    # mode is threaded explicitly: the chart-card rule below resolves a
+    # per-mode colour, and reading the module-global _current_mode instead
+    # would make build_qss("light") emit the DARK canvas whenever it is
+    # called for a mode other than the currently-applied one (which is
+    # exactly what a theme toggle preview / test does).
+    qss += _cards_qss(mode)
     qss += _scroll_split_qss()
-    qss += _chrome_qss()
+    qss += _chrome_qss(mode)
     qss += _misc_qss()
     return qss
 
@@ -343,12 +362,30 @@ QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; color:
 """
 
 
-def _cards_qss():
+def _cards_qss(mode=None):
+    t = mode_tokens(mode)
+    # The chart card is the surface the Plotly canvas is painted onto, so
+    # it has to use the SAME colour the figure's paper/plot background
+    # resolves to (chart_display.CHART_THEME[*]["canvas"]). It used to use
+    # palette(alternate-base) = card_bg, which in dark mode is #111c33
+    # against a #0f172a canvas -- a visible lighter rectangle framing the
+    # chart. Matching the canvas makes the card read as one seamless
+    # surface (the "BG should be transparent" report). The values are
+    # duplicated from chart_display on purpose: the QSS is a static string
+    # built per mode, and importing the backend module here would create a
+    # desktop -> backend dependency for two hex values. Keep them in sync.
+    chart_canvas = CHART_CANVAS[t["chart_canvas_key"]]
     return f"""
-QFrame#chart_card, QFrame#kpi_card, QFrame#stat_card {{ background: palette(alternate-base); border: 1px solid palette(midlight); border-radius: 10px; }}
+QFrame#kpi_card, QFrame#stat_card {{ background: palette(alternate-base); border: 1px solid palette(midlight); border-radius: 10px; }}
+QFrame#chart_card {{ background: {chart_canvas}; border: 1px solid palette(midlight); border-radius: 10px; }}
 QLabel#welcome_banner {{ background: palette(alternate-base); border: 1px solid palette(midlight); border-radius: 8px; padding: 16px; color: palette(window-text); }}
 QFrame#welcome_banner {{ background: palette(alternate-base); border: 1px solid palette(midlight); border-radius: 8px; }}
 QFrame#config_panel {{ background: palette(alternate-base); border: 1px solid palette(midlight); border-radius: 8px; }}
+/* Analysis-page chart-settings tile: it previously had NO background rule
+   at all, so it painted fully transparent (the window colour bled through
+   and the settings form read as "see-through" -- worst in light mode).
+   Give it the same opaque card surface as the other panels. */
+QFrame#analysis_config_panel {{ background: palette(alternate-base); border: 1px solid palette(midlight); border-radius: 8px; }}
 QFrame#user_card {{ background: palette(alternate-base); border: 1px solid palette(midlight); border-radius: 10px; }}
 """
 
@@ -368,7 +405,17 @@ QTabBar::tab { padding: 6px 10px; }
 """
 
 
-def _chrome_qss():
+def _chrome_qss(mode=None):
+    # QToolTip is styled with LITERAL colours, not palette() role references.
+    # The tooltip is a short-lived top-level window created by QToolTip on
+    # hover: it is NOT a child of any widget, so the app-wide
+    # setStyleSheet/setPalette repolish on a mode toggle never reaches it and
+    # palette() keeps resolving against the palette captured when the tooltip
+    # was first polished. The visible result was a DARK plate with LIGHT text
+    # in light mode (and vice versa). A literal is baked into the new QSS, so
+    # the next tooltip built after a toggle is correct, and an already-open
+    # one is repainted by the re-polish that the stylesheet swap does trigger.
+    t = mode_tokens(mode)
     return f"""
 QScrollBar:vertical {{ background: palette(window); width: 12px; margin: 0; }}
 QScrollBar::handle:vertical {{ background: palette(mid); border-radius: 6px; min-height: 24px; }}
@@ -378,13 +425,17 @@ QScrollBar:horizontal {{ background: palette(window); height: 12px; margin: 0; }
 QScrollBar::handle:horizontal {{ background: palette(mid); border-radius: 6px; min-width: 24px; }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: none; }}
-QToolTip {{ background: palette(tool-tip-base); color: palette(window-text); border: 1px solid palette(mid); padding: 4px 8px; border-radius: 4px; }}
+QToolTip {{ background: {t["tooltip_bg"]}; color: {t["text"]}; border: 1px solid {t["border"]}; padding: 4px 8px; border-radius: 4px; }}
 QMenu {{ background: palette(base); color: palette(window-text); border: 1px solid palette(mid); padding: 4px; border-radius: 6px; }}
 QMenu::item {{ padding: 6px 20px; border-radius: 4px; }}
 QMenu::item:selected {{ background: {ACCENT_RGBA_SELECTED}; }}
 QMenu::separator {{ height: 1px; background: palette(midlight); margin: 4px 8px; }}
 QMessageBox, QDialog {{ background: palette(window); color: palette(window-text); }}
 QTextEdit, QPlainTextEdit {{ background: palette(base); color: palette(window-text); border: 1px solid palette(mid); border-radius: 6px; selection-background-color: {ACCENT}; }}
+/* Analysis-note tile inside each chart card: explicit opaque surface +
+   12px body so the notes area never inherits a transparent/oversized
+   look from the card (light mode used to wash it out). */
+QTextEdit#chart_notes {{ background: palette(base); color: palette(window-text); border: 1px solid palette(mid); border-radius: 6px; padding: 6px; font-size: 12px; selection-background-color: {ACCENT}; }}
 """
 
 
@@ -425,6 +476,16 @@ def apply_theme(app, mode=None):
     app.setPalette(build_palette(mode))
     app.setStyleSheet(build_qss(mode))
     _last_applied_qss_mode = mode
+    # A tooltip that is ON SCREEN at the moment of the toggle is a top-level
+    # window that the stylesheet swap cannot re-polish, so it keeps painting
+    # the previous mode's plate until it closes. Dismissing it means the user
+    # never sees a dark box over a light UI (the tooltip simply reappears, in
+    # the new colours, if the cursor is still hovering).
+    try:
+        from PySide6.QtWidgets import QToolTip
+        QToolTip.hideText()
+    except Exception:
+        pass
 
 
 
@@ -458,8 +519,13 @@ def label_style(mode=None):
 def group_label_style(mode=None):
     t = mode_tokens(mode)
     # 13px section headers to match (same Image 3 review -- the old 11px
-    # accent caps were the worst offenders).
-    return f"font-size: 13px; font-weight: 700; color: {ACCENT_LIGHT}; letter-spacing: 0.6px;"
+    # accent caps were the worst offenders). Colour follows the mode:
+    # ACCENT_LIGHT (#818cf8) is a dark-mode colour -- on light-mode white
+    # surfaces it drops to ~2.5:1 contrast and the chart-settings section
+    # headers read as washed out / transparent. text_bright is #a5b4fc in
+    # dark (same look as before) and #4f46e5 in light (4.5:1+).
+    accent = ACCENT_LIGHT if (mode or _current_mode) == "dark" else t["text_bright"]
+    return f"font-size: 13px; font-weight: 700; color: {accent}; letter-spacing: 0.6px;"
 
 
 def hr_style(mode=None):

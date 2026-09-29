@@ -46,9 +46,9 @@ QPushButton[kind="regenerate"] {
     border-radius: 8px; padding: 8px 16px; font-weight: 600;
 }
 QPushButton[kind="regenerate"]:enabled {
-    background: rgba(97, 99, 223, 18); border: 1px dashed #6163df; color: #6163df;
+    background: rgba(97, 99, 223, 36); border: 1px dashed #6163df; color: #6163df;
 }
-QPushButton[kind="regenerate"]:hover { background: rgba(97, 99, 223, 40); }
+QPushButton[kind="regenerate"]:hover { background: rgba(97, 99, 223, 80); }
 QPushButton[kind="regenerate"]:disabled { border: 1px dashed #94a3b8; color: #94a3b8; }
 """
 

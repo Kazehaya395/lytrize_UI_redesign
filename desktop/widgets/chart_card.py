@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QTextEdit, QFrame, QSizePolicy, QDialog, QDialogButtonBox,
 )
 
@@ -58,24 +58,38 @@ class ChartCard(QFrame):
         self._style = dict(self._meta.get("display_options", {}))
 
         self.setObjectName("chart_card")
+        # No title label on the card, so the full (often long, elided in
+        # the tab) chart title lives on the tile's tooltip.
+        self.setToolTip(title)
 
         self._build_ui()
 
     # -- UI construction ----------------------------------------------------
 
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(8)
+        # A QGridLayout whose first cell holds BOTH the plot and the action
+        # bar (see the end of this method). The bar used to be the first item
+        # of a QVBoxLayout, so its 28px buttons + 6px spacing pushed the whole
+        # canvas down and the chart header -- anchored to the very top of the
+        # canvas -- started ~40px below the card's top edge. That dead band is
+        # the "gap between header and top edge" in the report. Overlaying the
+        # bar instead lets the plot fill the card; the Plotly modebar is
+        # nudged down in CSS (PlotlyWebView._SHELL_TEMPLATE) so the two never
+        # overlap.
+        layout = QGridLayout(self)
+        layout.setContentsMargins(8, 0, 8, 8)
+        layout.setSpacing(6)
 
-        # -- Header row: title + actions --
+        # -- Action row (right-aligned) --
+        # No title label and no "Type: ..." subtitle here: on the Analysis
+        # page the tab already names the chart ("Statistical 1") and the
+        # Plotly canvas renders the configured chart title, so a third copy
+        # above the plot was pure duplicated chrome eating chart height. The
+        # full title is still exposed via self._title / tooltip() for the
+        # tab bar and tooltips, so nothing is lost.
         header = QHBoxLayout()
-        header.setSpacing(6)
-
-        self.lbl_title = QLabel(self._title)
-        self.lbl_title.setProperty("class", "cardTitle")
-        self.lbl_title.setWordWrap(True)
-        header.addWidget(self.lbl_title, stretch=1)
+        header.setSpacing(4)
+        header.addStretch(1)
 
         self.btn_up = QPushButton("⬆")
         self.btn_up.setFixedSize(28, 28)
@@ -125,16 +139,6 @@ class ChartCard(QFrame):
         )
         header.addWidget(self.btn_fullwidth)
 
-        layout.addLayout(header)
-
-        # -- Chart type label --
-        if self._chart_type:
-            friendly = _TYPE_NAME.get(self._chart_type,
-                                      self._chart_type.replace("_", " ").title())
-            type_lbl = QLabel(f"Type: {friendly}")
-            type_lbl.setProperty("class", "faint"); type_lbl.setStyleSheet("font-size: 11px;")
-            layout.addWidget(type_lbl)
-
         # -- Plotly view --
         self.plot_view = PlotlyWebView()
         # No hard-coded floor — Expanding policy + parent layout stretch
@@ -143,15 +147,46 @@ class ChartCard(QFrame):
         if self._style:
             self._fig = apply_chart_style(self._base_fig, self._style, self._chart_type)
         self.plot_view.set_figure(self._fig)
-        layout.addWidget(self.plot_view, stretch=1)
+        # The plot owns grid cell (0,0); the action row is pinned into the SAME
+        # cell, top-right, so it floats over the canvas instead of reserving a
+        # row above it (which is what opened the gap under the header).
+        bar = QWidget()
+        hb = QHBoxLayout(bar)
+        hb.setContentsMargins(0, 0, 0, 0)
+        hb.setSpacing(4)
+        self._reparent_buttons(bar, hb)
+        layout.addWidget(self.plot_view, 0, 0)
+        layout.addWidget(bar, 0, 0, Qt.AlignTop | Qt.AlignRight)
+        # Widgets sharing a grid cell are z-ordered by insertion; the bar is
+        # added second so it is already in front, and raise_() makes that
+        # explicit and survives later re-layouts of the plot.
+        bar.raise_()
+        self._action_bar = bar
 
         # -- Notes editor --
         self.notes = QTextEdit()
+        self.notes.setObjectName("chart_notes")
         self.notes.setPlaceholderText("Add analysis notes…")
         self.notes.setMaximumHeight(80)
-        self.notes.setStyleSheet("font-size: 12px; padding: 6px;")
+        # Styling lives in the global QSS (QTextEdit#chart_notes) so the
+        # tile re-resolves its palette colours on every theme switch --
+        # a widget-level sheet would freeze the build-time colours and
+        # leave the notes unreadable after toggling to light mode.
         self.notes.textChanged.connect(self._on_notes_changed)
-        layout.addWidget(self.notes)
+        layout.addWidget(self.notes, 1, 0)
+
+    def _reparent_buttons(self, bar: QWidget, hb: QHBoxLayout) -> None:
+        """Move the action buttons into the floating overlay bar.
+
+        Kept separate from _build_ui so the button definitions (and their
+        order) stay in one readable block; this only relocates the widgets
+        that were added to the old `header` layout.
+        """
+        for btn in (self.btn_fullwidth, self.btn_up, self.btn_down,
+                    self.btn_edit, self.btn_style, self.btn_delete):
+            # Re-adding a widget to another layout removes it from the first,
+            # so the old `header` layout is left empty and collapses to 0.
+            hb.addWidget(btn)
 
     # -- Public API ----------------------------------------------------------
 
@@ -167,9 +202,17 @@ class ChartCard(QFrame):
             self.plot_view.set_figure(self._fig)
 
     def set_title(self, title: str) -> None:
-        """Update the displayed title."""
+        """Record the chart's title.
+
+        There is no on-card title label any more (see _build_ui) -- the
+        title is rendered by the Plotly canvas and shown in the tab label
+        / tooltip. Keep it on the instance so the owning page can read it
+        back and refresh the tab tooltip, and mirror it onto the card's
+        own tooltip so hovering the tile still reveals the full title
+        (it can be long and is elided in the tab).
+        """
         self._title = title
-        self.lbl_title.setText(title)
+        self.setToolTip(title)
 
     def set_note(self, text: str) -> None:
         """Set the notes text without triggering the change signal."""
@@ -238,14 +281,15 @@ class ChartCard(QFrame):
         """
         card_bg = style.get("ex_card", "#0f172a")
         border = style.get("ex_border", "#1e293b")
-        text_color = style.get("ex_text", "#e2e8f0")
         self.setStyleSheet(
             f"QFrame#chart_card {{ background: {card_bg}; border: 1px solid {border};"
             f"  border-radius: 10px; }}"
         )
-        self.lbl_title.setStyleSheet(
-            f"font-size: 14px; font-weight: 600; color: {text_color};"
-        )
+        # Text color used to be pushed onto the (now removed) title label.
+        # The chart's own typography is themed through chart_display
+        # (PlotlyWebView -> theme_figure) instead, so a dashboard export
+        # re-skin only needs to move the card surface + border; forcing the
+        # web view to re-theme is done via apply_theme().
 
     # -- Slots ---------------------------------------------------------------
 

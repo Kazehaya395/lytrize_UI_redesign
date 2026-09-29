@@ -34,6 +34,13 @@ from services.chart_service import PALETTES, apply_hover_format
 
 log = logging.getLogger(__name__)
 
+# Live-preview debounce. Sliders/spinboxes stream values while dragging, so
+# they stay coalesced; a combo box is one deliberate pick and must feel
+# instant. Both apply the same ~40ms Plotly layout rebuild on the GUI thread,
+# so the short path is safe -- there is no flood behind it to coalesce.
+_PREVIEW_DEBOUNCE_MS = 300
+_PREVIEW_FAST_MS = 40
+
 # id -> friendly display name, built from the same list the analysis-type
 # picker on the left already uses -- so tab labels ("Pie Chart 1") stay
 # consistent with what the user actually selected, not a re-derived guess.
@@ -95,12 +102,26 @@ class AnalysisPage(QWidget):
         self._settings_target_uid: Optional[str] = None  # chart the settings form is bound to
         self._refreshing_charts = False                # suppress tab-change binding during rebuilds
         self._bridge_write_guard = False               # suppress charts_changed rebuild during live preview
+        self._bulk_bridge_write = False                # suppress charts_changed rebuild during Generate/Re-Generate (one refresh at the end)
+        self._pending_select_uid: str | None = None      # chart to select on the next refresh (Generate/Re-Generate target)
 
         # Debounced live preview for Layout/Typography edits (design:
         # "changes appear instantly on the chart").
+        #
+        # Two intervals, because the two kinds of edit feel nothing alike.
+        # Dragging a slider fires a flood of changes and each re-render is
+        # ~40ms of Plotly layout rebuilding on the GUI thread, so those stay
+        # debounced. A combo box (font family, legend position, bar mode) is a
+        # single deliberate pick, and making the user wait 300ms to see it was
+        # the "font style change is laggy" report -- so discrete choices apply
+        # almost immediately instead.
+        self._preview_fast_timer = QTimer(self)
+        self._preview_fast_timer.setSingleShot(True)
+        self._preview_fast_timer.setInterval(_PREVIEW_FAST_MS)
+        self._preview_fast_timer.timeout.connect(self._apply_live_preview)
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
-        self._preview_timer.setInterval(300)
+        self._preview_timer.setInterval(_PREVIEW_DEBOUNCE_MS)
         self._preview_timer.timeout.connect(self._apply_live_preview)
 
         self._build_ui()
@@ -188,10 +209,31 @@ class AnalysisPage(QWidget):
         # "New chart" action as the bar's top-right corner widget -- so the
         # chart keeps every pixel the old separate 42px icon row used to
         # take (chart_designs.pdf: one compact strip above the tile).
+        #
+        # The three mutually-exclusive views (empty state / chart tabs /
+        # descriptive table) live in a QStackedWidget, NOT stacked in one
+        # QVBoxLayout. Toggling setVisible() on siblings in a box layout was
+        # the root cause of the Generate "reopen" flash: hiding one child
+        # re-runs the layout, and because the pages were rebuilt while
+        # repaints were disabled, charts_tabs was left at HALF the pane
+        # height -- and the ChartCard's fixed-height header + notes ate the
+        # rest, leaving the QWebEngineView with height == 0. Chromium
+        # suspends painting at zero height, so loadFinished never fired and
+        # the freshly generated chart stayed blank until the user resized
+        # something. A QStackedWidget gives the active page the full pane
+        # unconditionally and switches it with a single atomic call.
         bottom = QWidget()
+        self._chart_stack = QStackedWidget()
+        self._chart_stack.setContentsMargins(0, 0, 0, 0)
         bl = QVBoxLayout(bottom)
         bl.setContentsMargins(0, 0, 0, 0)
         bl.setSpacing(0)
+        bl.addWidget(self._chart_stack)
+
+        # Stack page order is fixed; _show_chart_area() picks the index.
+        self._STACK_EMPTY = 0
+        self._STACK_CHARTS = 1
+        self._STACK_DESCRIPTIVE = 2
 
         self.charts_tabs = QTabWidget()
         self.charts_tabs.setTabsClosable(True)
@@ -207,22 +249,21 @@ class AnalysisPage(QWidget):
         self.charts_tabs.tabCloseRequested.connect(self._on_tab_close)
         self.charts_tabs.currentChanged.connect(self._on_tab_changed)
 
-        # Compact tab bar: edit/delete live only on the card header, and
-        # new charts come from Generate, so no action strip sits above the
-        # tabs -- the chart keeps the full pane below the bar.
-        bl.addWidget(self.charts_tabs, stretch=1)
+        # No-charts placeholder. Added FIRST so the stack's initial page
+        # (and the _STACK_EMPTY == 0 constant) agree -- addWidget order IS
+        # the page order, so the blocks below must be added in index order.
+        self.lbl_no_charts = QLabel("No charts yet. Configure an analysis and click Generate.")
+        self.lbl_no_charts.setAlignment(Qt.AlignCenter)
+        self.lbl_no_charts.setProperty("class", "faint"); self.lbl_no_charts.setStyleSheet("font-size: 13px; padding: 40px;")
+        self._chart_stack.addWidget(self.lbl_no_charts)  # _STACK_EMPTY = 0
+
+        self._chart_stack.addWidget(self.charts_tabs)  # _STACK_CHARTS = 1
 
         # Descriptive-only full-area table view.
         self.descriptive_container = QWidget()
         self.descriptive_container_layout = QVBoxLayout(self.descriptive_container)
         self.descriptive_container_layout.setContentsMargins(0, 0, 0, 0)
-        bl.addWidget(self.descriptive_container, stretch=1)
-
-        # No-charts placeholder.
-        self.lbl_no_charts = QLabel("No charts yet. Configure an analysis and click Generate.")
-        self.lbl_no_charts.setAlignment(Qt.AlignCenter)
-        self.lbl_no_charts.setProperty("class", "faint"); self.lbl_no_charts.setStyleSheet("font-size: 13px; padding: 40px;")
-        bl.addWidget(self.lbl_no_charts, stretch=1)
+        self._chart_stack.addWidget(self.descriptive_container)  # _STACK_DESCRIPTIVE = 2
 
         self._v_split.addWidget(bottom)
         self._v_split.setStretchFactor(0, 0)
@@ -235,10 +276,10 @@ class AnalysisPage(QWidget):
         splitter.addWidget(right_panel)
         splitter.setSizes([220, 800])
 
-        # Initial view: nothing selected yet -> nothing in the bottom pane.
-        self.charts_tabs.setVisible(False)
-        self.descriptive_container.setVisible(False)
-        self.lbl_no_charts.setVisible(False)
+        # Initial view: nothing selected yet -> show the empty state.
+        # (A QStackedWidget shows its first page by default, and _STACK_EMPTY
+        # is index 0, so the empty hint is already the visible page.)
+        self._chart_stack.setCurrentIndex(self._STACK_EMPTY)
 
     # -- Signal connections -------------------------------------------------
 
@@ -253,6 +294,34 @@ class AnalysisPage(QWidget):
         self.config_panel.regenerate_requested.connect(self._on_regenerate)
         self.config_panel.settings_changed.connect(self._on_settings_changed)
         self.bridge.charts_changed.connect(self._on_charts_changed)
+        self.bridge.theme_changed.connect(self._on_theme_changed)
+
+    def _on_theme_changed(self, _mode: str) -> None:
+        """Re-apply the per-widget token styles on a dark<->light switch.
+
+        Section/hint labels inside the chart-settings form are styled with
+        widget-level setStyleSheet() (group_label_style/label_style), which
+        freezes the colours captured at build time -- the global QSS
+        re-polish does NOT reach them. Without this, toggling to light mode
+        left the settings text painted in the old dark palette (near-white
+        on white = the "transparent/unreadable tiles" report). restyle_tree
+        re-resolves those roles against the current mode; colour swatches
+        are re-tinted the same way.
+        """
+        try:
+            from desktop.widgets.analysis_settings.base import restyle_tree
+            restyle_tree(self.config_panel)
+        except Exception:
+            log.debug("theme restyle of settings panel failed", exc_info=True)
+        # The charts themselves have to follow the mode too: their canvas is
+        # painted by the figure/plot page, not by the app's QSS, so each open
+        # view re-themes and repaints in place (Plotly.react -- no reload, no
+        # flash, no regeneration needed).
+        for card in self._chart_cards.values():
+            try:
+                card.plot_view.apply_theme()
+            except Exception:
+                log.debug("chart theme repaint failed", exc_info=True)
 
     # -- Analysis selection -------------------------------------------------
 
@@ -449,11 +518,38 @@ class AnalysisPage(QWidget):
         """Switch the bottom pane between the chart tabs, the descriptive
         table, and the empty-state hint. New charts come from the
         Generate button in the settings panel.
+
+        One atomic ``setCurrentIndex`` on the QStackedWidget -- never a
+        set of setVisible() calls on box-layout siblings. The active page
+        is laid out at the full pane size the moment it is selected, which
+        is what gives a freshly generated QWebEngineView a real height (and
+        therefore a real first paint) without the user touching a splitter.
         """
         has = len(self.bridge.get("charts", [])) > 0
-        self.charts_tabs.setVisible(not descriptive)
-        self.descriptive_container.setVisible(descriptive)
-        self.lbl_no_charts.setVisible(not descriptive and not has)
+        if descriptive:
+            target = self._STACK_DESCRIPTIVE
+        elif has:
+            target = self._STACK_CHARTS
+        else:
+            target = self._STACK_EMPTY
+        self._sync_stack(target)
+
+    def _sync_stack(self, target: int) -> None:
+        """Point the stacked chart area at *target* and force a layout pass.
+
+        ``QStackedWidget.setCurrentIndex`` only marks the layout dirty; the
+        new page keeps its previous (often zero) size until Qt runs the
+        next layout pass. Since chart generation can complete while the
+        event loop is busy, activate the stack's layout explicitly so the
+        selected page -- and every QWebEngineView inside it -- has its real
+        geometry before the pending figure is pushed to Chromium.
+        """
+        if self._chart_stack.currentIndex() != target:
+            self._chart_stack.setCurrentIndex(target)
+        try:
+            self._chart_stack.layout().activate()
+        except Exception:
+            log.debug("chart stack layout activation failed", exc_info=True)
 
     def _collect_widget_values(self) -> dict:
         return self.config_panel.collect_values()
@@ -475,9 +571,18 @@ class AnalysisPage(QWidget):
         Layout/Typography edits live-apply to the bound chart tile
         (debounced); any change marks the form dirty, which -- together
         with having a chart selected -- is the Re-Generate gate.
+
+        ``discrete`` picks the short debounce: a combo box changed once by a
+        deliberate click, so there is no flood to coalesce and no reason to
+        make the user wait out the slider debounce before the chart updates.
         """
         if kind in ("layout", "typography") and self._settings_target_uid:
-            self._preview_timer.start()
+            if payload.get("discrete"):
+                self._preview_timer.stop()      # cancel a pending slow pass
+                self._preview_fast_timer.start()
+            else:
+                self._preview_fast_timer.stop()
+                self._preview_timer.start()
         self._update_regen_state()
 
     def _update_regen_state(self) -> None:
@@ -499,9 +604,22 @@ class AnalysisPage(QWidget):
             return
         layout = self.config_panel.collect_layout()
         typo = self.config_panel.collect_typography()
+        # The live card knows how wide it actually is. Passing that in sizes
+        # the reserved legend column to the pixels the labels need, instead of
+        # a flat fraction of the card -- which is what left a wide gap between
+        # the plot and the legend on a full-width chart.
+        width_px = None
+        try:
+            pv = card.plot_view
+            wv = getattr(pv, "_web_view", None)
+            if wv is not None and wv.width() > 0:
+                width_px = wv.width()
+        except Exception:
+            width_px = None
         try:
             from chart_display import apply_display_options
-            new_fig = apply_display_options(card._base_fig, layout, typo)
+            new_fig = apply_display_options(card._base_fig, layout, typo,
+                                            width_px=width_px)
         except Exception:
             log.exception("live preview failed for %s", uid)
             return
@@ -529,7 +647,10 @@ class AnalysisPage(QWidget):
 
         card._fig = new_fig
         if final_title is not None:
-            card.lbl_title.setText(final_title)
+            # No on-card title label any more; set_title records the title
+            # and refreshes the tile tooltip (the tab label/tooltip below
+            # and the Plotly canvas carry the visible copies).
+            card.set_title(final_title)
         card.plot_view.set_figure(new_fig)
 
         # Keep the tab's tooltip (and the settings header) in sync when an
@@ -602,6 +723,13 @@ class AnalysisPage(QWidget):
             "layout": dict(self._collect_layout),
             "typography": dict(self._collect_typo),
         }
+        # Batch the bridge writes below: each add/replace emits charts_changed,
+        # and without this guard every emit rebuilds all tabs + rebinds the
+        # settings form (Generate looked like the app "reopened itself";
+        # Re-Generate could rebuild mid-batch and blank the chart). One
+        # explicit _refresh_charts() at the end is the only rebuild.
+        self._pending_select_uid = self._gen_target if self._gen_mode == "regen" and self._gen_target else (new_charts[0][0] if new_charts else None)
+        self._bulk_bridge_write = True
         # An explicit Layout title is what the figure shows (the worker
         # applied it), so the chart's stored title/tab label must match it
         # instead of the runner's default title.
@@ -631,12 +759,22 @@ class AnalysisPage(QWidget):
                                       meta=dict(meta))
             select_uid = new_charts[0][0]
 
+        self._bulk_bridge_write = False
         self._refresh_charts()
         if select_uid:
+            # The refresh above already restored selection to the pending
+            # target and bound the form to it (trailing bind); selecting
+            # again is a no-op in that case. No forced rebuild here: the
+            # form already shows the values just used, and a full panel
+            # teardown/rebuild is exactly the "app reopened itself" flash.
             self._select_chart_tab(select_uid)
-            # Force re-bind so the form reflects the stored state of the
-            # chart now on screen (clears dirty -> Re-Generate disabled).
-            self._bind_selected_chart_settings(force=True)
+        # The chart now matches the form, so the form is no longer dirty and
+        # Re-Generate goes back to disabled. This used to happen as a side
+        # effect of the settings form being torn down and re-bound with every
+        # refresh; the chart tiles are reused now, the bind is a no-op, and
+        # the gate has to be cleared explicitly or the button would stay
+        # enabled (looking like unsaved changes) right after a Re-Generate.
+        self.config_panel.reset_dirty()
         self._update_regen_state()
         self.bridge.save_draft()
 
@@ -671,13 +809,18 @@ class AnalysisPage(QWidget):
         tabs are torn down/re-added, then re-syncs the settings form with
         the surviving selection once done.
         """
-        if self._bridge_write_guard:
+        if self._bridge_write_guard or self._bulk_bridge_write:
             return
+        # Freeze repaints/resize propagation while tabs are torn down and
+        # re-added: without this the vertical splitter collapses to zero for
+        # one frame and springs back -- the visible "reopen" bounce.
+        self.setUpdatesEnabled(False)
         self._refreshing_charts = True
         try:
             self._refresh_charts_locked()
         finally:
             self._refreshing_charts = False
+            self.setUpdatesEnabled(True)
         if self._active_analysis and self._active_analysis != "descriptive":
             self._bind_selected_chart_settings()
 
@@ -686,22 +829,32 @@ class AnalysisPage(QWidget):
         # chart doesn't always bounce the view back to the first tab --
         # tracked by uid, not index, since index alone doesn't survive
         # charts being added/removed/reordered.
-        prev_uid = None
+        pending = self._pending_select_uid
+        self._pending_select_uid = None
+        prev_uid = pending
         cur_idx = self.charts_tabs.currentIndex()
-        if 0 <= cur_idx < len(self._tab_order):
+        if prev_uid is None and 0 <= cur_idx < len(self._tab_order):
             prev_uid = self._tab_order[cur_idx]
 
-        for card in self._chart_cards.values():
-            card.deleteLater()
-        self._chart_cards.clear()
-
-        while self.charts_tabs.count():
-            w = self.charts_tabs.widget(0)
-            self.charts_tabs.removeTab(0)
-            if w:
-                w.deleteLater()
-
         charts = self.bridge.get("charts", [])
+        wanted = [c[0] for c in charts]
+
+        # Drop the cards whose chart is gone -- and ONLY those.  A ChartCard
+        # owns a QWebEngineView, and destroying/recreating one reloads the
+        # whole plotly.js shell and repaints the chart from scratch; doing
+        # that to every card on the page (which is what this used to do) is
+        # the "the app closed and reopened itself" flash on Generate.
+        # Reusing the surviving tiles turns every later update into an
+        # in-place Plotly.react().
+        for uid in [u for u in list(self._chart_cards) if u not in wanted]:
+            stale = self._chart_cards.pop(uid, None)
+            if stale is None:
+                continue
+            stale_idx = self.charts_tabs.indexOf(stale)
+            if stale_idx >= 0:
+                self.charts_tabs.removeTab(stale_idx)
+            stale.deleteLater()
+
         self._tab_order = []
         type_counter: dict = {}
         restore_idx = 0
@@ -710,40 +863,84 @@ class AnalysisPage(QWidget):
             meta = self.bridge.get_chart_meta(uid)
             note = self.bridge.get_note(uid)
 
-            card = ChartCard(uid, title, fig, chart_type, meta)
-            card.set_note(note)
-            card.delete_requested.connect(self._on_delete_chart)
-            card.edit_requested.connect(self._on_edit_chart)
-            # Analysis cards keep only edit + delete on the header: style
-            # lives in the Layout/Typography tabs, reorder via tab drag.
-            for _btn in (card.btn_up, card.btn_down, card.btn_style):
-                _btn.setVisible(False)
-            card.note_changed.connect(self._on_note_changed)
+            card = self._chart_cards.get(uid)
+            if card is None:
+                card = ChartCard(uid, title, fig, chart_type, meta)
+                card.set_note(note)
+                card.delete_requested.connect(self._on_delete_chart)
+                card.edit_requested.connect(self._on_edit_chart)
+                # Analysis cards keep only edit + delete on the header: style
+                # lives in the Layout/Typography tabs, reorder via tab drag.
+                for _btn in (card.btn_up, card.btn_down, card.btn_style):
+                    _btn.setVisible(False)
+                card.note_changed.connect(self._on_note_changed)
 
-            label = self._chart_tab_label(title, chart_type, type_counter)
-            idx = self.charts_tabs.addTab(card, label)
-            self.charts_tabs.setTabToolTip(idx, title or label)
-            # Compact per-chart tab: keep short stable labels (see
-            # _chart_tab_label) so N charts of one analysis can't widen the
-            # strip into the chart area.
+                # Compact per-chart tab: keep short stable labels (see
+                # _chart_tab_label) so N charts of one analysis can't widen
+                # the strip into the chart area.
+                label = self._chart_tab_label(title, chart_type, type_counter)
+                self.charts_tabs.addTab(card, label)
+                self._chart_cards[uid] = card
+            else:
+                # Existing tile: refresh it in place.  The tab keeps the
+                # label/number it was created with (stable under the user's
+                # cursor), so the counter is advanced without renaming it.
+                self._chart_tab_label(title, chart_type, type_counter)
+                card.set_title(title)
+                card.set_note(note)
+                # Only re-push when the bridge actually holds a different
+                # figure than the one on screen (a live preview already left
+                # the same object on the card, and a needless re-push would
+                # cost a full Plotly.react for nothing).
+                if fig is not card._fig:
+                    card.set_figure(fig)
+
+            tab_idx = self.charts_tabs.indexOf(card)
+            if tab_idx >= 0:
+                self.charts_tabs.setTabToolTip(
+                    tab_idx, title or self.charts_tabs.tabText(tab_idx))
             self._tab_order.append(uid)
-            self._chart_cards[uid] = card
-            if uid == prev_uid:
+            if prev_uid is not None and uid == prev_uid:
                 restore_idx = i
 
-        # Keep chart-area visibility in sync (descriptive shows the table).
+        # Re-order the tabs to match the bridge order by MOVING them: a tab
+        # move keeps its page (and its already-loaded web view) alive, while
+        # removeTab+addTab would drop the page and force a reload.
+        for pos, uid in enumerate(self._tab_order):
+            card = self._chart_cards.get(uid)
+            if card is None:
+                continue
+            cur = self.charts_tabs.indexOf(card)
+            if cur >= 0 and cur != pos:
+                self.charts_tabs.tabBar().moveTab(cur, pos)
+
         descriptive = self._active_analysis == "descriptive"
-        self.charts_tabs.setVisible(not descriptive)
-        self.lbl_no_charts.setVisible((not descriptive) and len(charts) == 0)
+        # Keep chart-area visibility in sync (descriptive shows the table).
+        # Uses the same single stacked-page switch as _show_chart_area so
+        # the newly created/selected tab is laid out at the full pane size
+        # right away -- the tab's QWebEngineView must have real geometry
+        # before its pending figure is pushed, or Chromium holds the render
+        # until the user happens to resize something.
+        self._show_chart_area(descriptive)
 
         if charts:
             self.charts_tabs.setCurrentIndex(restore_idx)
+            # The selected page is now current: re-run the stack layout so
+            # the QTabWidget and its ChartCards pick up their real sizes in
+            # this same call stack, before the event loop gets to paint.
+            try:
+                self._chart_stack.layout().activate()
+            except Exception:
+                log.debug("chart stack layout activation failed", exc_info=True)
 
     def _on_charts_changed(self, charts) -> None:
         """Handle charts_changed signal from the bridge."""
-        if self._bridge_write_guard:
-            # Our own live-preview write-through: the card was already
-            # updated in place, no teardown needed.
+        if self._bridge_write_guard or self._bulk_bridge_write:
+            # Our own write-through (live preview) or an in-flight
+            # Generate/Re-Generate batch: the card was/will be updated by the
+            # page itself -- a rebuild here would tear down the new tab and
+            # rebind the settings form mid-flight (the Generate 'reopen'
+            # flicker / Re-Generate blank-chart bugs).
             return
         self._refresh_charts()
 
@@ -861,9 +1058,21 @@ class AnalysisPage(QWidget):
     def _select_chart_tab(self, uid: str) -> None:
         """Select the tab whose chart uid matches (after a refresh)."""
         try:
-            self.charts_tabs.setCurrentIndex(self._tab_order.index(uid))
+            idx = self._tab_order.index(uid)
         except ValueError:
-            pass
+            return
+        if idx == self.charts_tabs.currentIndex():
+            return
+        # Programmatic switch: suppress the currentChanged -> full settings
+        # rebuild (the caller binds explicitly once afterwards). Without
+        # this, every Generate/Re-Generate rebound the form twice -- the
+        # visible "reopen" flicker of the whole top panel.
+        self._refreshing_charts = True
+        try:
+            self.charts_tabs.setCurrentIndex(idx)
+        finally:
+            self._refreshing_charts = False
+        self._bind_selected_chart_settings()
 
     def _on_note_changed(self, uid: str, text: str) -> None:
         """Handle note changes from a chart card."""

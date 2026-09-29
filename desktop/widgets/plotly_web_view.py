@@ -25,18 +25,26 @@ Design notes (why this file looks the way it does):
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QUrl, QObject, Signal, Slot
+from PySide6.QtCore import Qt, QUrl, QObject, QTimer, Signal, Slot
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QSizePolicy
 from PySide6.QtGui import QPixmap
 
 from desktop import theme as _theme_mod
 
 log = logging.getLogger(__name__)
+
+# Ceiling for the self-re-arming "wait until the view is sizeable" poll in
+# _relayout_when_sized. Deliberately far larger than any real cold start
+# (~1.3s measured): the point is that the wait adapts to the machine, and this
+# only stops a permanently 0-height widget from polling forever.
+_RELAYOUT_MAX_SECONDS = 30.0
 
 
 def _get_plotlyjs_source() -> str:
@@ -64,6 +72,21 @@ def _plotlyjs_source() -> str:
 _SHELL_FILE_PATH: Optional[Path] = None
 
 
+def _font_face_css() -> str:
+    """CSS @font-face rules for the bundled fonts, for the chart shell.
+
+    Chromium does not see fonts registered with Qt, so the app's own font files
+    have to be offered to the page explicitly. Returns an empty string when no
+    fonts are bundled, so the shell still builds.
+    """
+    try:
+        from font_bundle import font_face_css
+        return font_face_css()
+    except Exception as exc:
+        log.debug("bundled font CSS unavailable: %s", exc)
+        return ""
+
+
 def _shell_file_path() -> Path:
     """Write the chart shell HTML (with Plotly.js inlined) to a shared temp
     file, once per process, and return its path.
@@ -75,15 +98,29 @@ def _shell_file_path() -> Path:
     process share this one file since the shell content is identical;
     per-widget state (which figure is shown) is sent afterwards over the
     QWebChannel bridge, not baked into the file.
+
+    The filename carries a short digest of the template so editing the shell
+    (CSS, JS) cannot be defeated by the file left in the temp dir by a
+    PREVIOUS run of the app -- without it, a stale shell kept serving the
+    old markup (e.g. the old opaque body background) until the temp
+    directory happened to be cleared.
     """
     global _SHELL_FILE_PATH
     if _SHELL_FILE_PATH is not None and _SHELL_FILE_PATH.exists():
         return _SHELL_FILE_PATH
 
-    shell_html = _SHELL_TEMPLATE.format(plotlyjs=_plotlyjs_source())
+    shell_html = _SHELL_TEMPLATE.format(plotlyjs=_plotlyjs_source(),
+                                        fontfacecss=_font_face_css())
+    # Digest the TEMPLATE only (not the inlined plotly.js, which is ~4.5MB
+    # and would cost a needless full re-hash on every start). The bundled-font
+    # CSS is folded in too: swapping or adding a font in app_assets/fonts must
+    # produce a NEW shell file, otherwise a stale one from a previous run
+    # keeps serving the old @font-face set.
+    digest_src = _SHELL_TEMPLATE + _font_face_css()
+    digest = hashlib.sha1(digest_src.encode("utf-8")).hexdigest()[:10]
     tmp_dir = Path(tempfile.gettempdir()) / "lytrize_chart_shell"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    path = tmp_dir / "chart_shell.html"
+    path = tmp_dir / f"chart_shell_{digest}.html"
     path.write_text(shell_html, encoding="utf-8")
     _SHELL_FILE_PATH = path
     return path
@@ -96,8 +133,24 @@ _SHELL_TEMPLATE = """
 <script>{plotlyjs}</script>
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 <style>
-  html, body {{ margin:0; padding:0; background:#0f172a; height:100%; }}
+  /* Bundled fonts (app_assets/fonts). The charts are drawn by Chromium, which
+     has its own font stack and cannot see fonts registered with Qt, so the
+     families the app ships are handed to the page explicitly here. Without
+     this the chart silently substituted a system default and most font
+     choices produced no visible change. */
+  {fontfacecss}
+  /* Transparent by design: the figure's own paper/plot background is what
+     paints the chart canvas (chart_display.theme_figure), and the
+     surrounding widget/card shows through. A hard-coded body colour here
+     would frame the plot in a rectangle that does not match the card. */
+  html, body {{ margin:0; padding:0; background:transparent; height:100%; }}
   #chart {{ width:100%; height:100%; }}
+  /* The ChartCard floats its own action buttons (edit/style/delete) over the
+     canvas's top-right corner so the chart can start at the very top of the
+     card. Plotly draws its own modebar in that same corner, so push the
+     modebar down by one button row (28px + a small gap) to keep the two from
+     overlapping. Purely positional -- it does not affect the figure. */
+  .modebar {{ top: 32px !important; }}
 </style>
 </head>
 <body>
@@ -134,11 +187,34 @@ class _ChartBridge(QObject):
     """Qt/JS bridge: pushes new figure JSON into the already-loaded page."""
 
     figureReady = Signal(str)
-    _channel_ready = False
+    # Emitted once the JS side has finished constructing the QWebChannel
+    # and connected ``figureReady`` to its render function. Until this
+    # fires, a ``figureReady`` emit has no listener and is silently lost --
+    # which is why a freshly generated chart could stay blank forever.
+    channelConnected = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._channel_ready = False
 
     @Slot()
     def channelReady(self):  # exposed to JS via slot-like call
         self._channel_ready = True
+        self.channelConnected.emit()
+
+    @property
+    def channel_ready(self) -> bool:
+        return self._channel_ready
+
+    def reset_channel(self) -> None:
+        """Mark the channel as not-yet-connected.
+
+        Called when a page load STARTS: the outgoing document (and its JS
+        ``figureReady`` subscription) is about to be torn down, so the
+        Python-side flag must go back to False or a figure pushed during
+        the reload would be emitted into a dead channel.
+        """
+        self._channel_ready = False
 
 
 class PlotlyWebView(QWidget):
@@ -166,8 +242,17 @@ class PlotlyWebView(QWidget):
         self._channel = None
         self._bridge: Optional[_ChartBridge] = None
         self._page_loaded = False
+        self._shell_url: Optional[QUrl] = None
         self._pending_fig_json: Optional[str] = None
-        self._current_fig = None
+        self._current_fig = None      # figure as handed in by the caller (un-themed)
+        self._render_fig = None       # the themed copy actually pushed to JS
+        self._pending_bg: Optional[str] = None
+        # True while a "wait until sizeable" relayout chain is in flight, so
+        # overlapping callers (set_figure + showEvent) share one chain.
+        self._relayout_pending = False
+        # True once the legend column has been re-sized against this view's
+        # real pixel width (charts arrive built on a worker with no width).
+        self._refit_applied = False
 
         try:
             from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -178,19 +263,35 @@ class PlotlyWebView(QWidget):
             self._layout.addWidget(self._web_view)
             self._use_web_engine = True
 
+            # Let the page paint through onto the widget surface so the
+            # chart blends into the ChartCard instead of sitting on an
+            # opaque rectangle of its own (the "BG should be transparent"
+            # report). The page's own background is themed per mode in
+            # _apply_page_background, so a transparent widget background
+            # only shows the card where the figure itself is transparent.
+            try:
+                self._web_view.page().setBackgroundColor(Qt.GlobalColor.transparent)
+            except Exception:
+                log.debug("web page background transparency failed", exc_info=True)
+
             self._bridge = _ChartBridge()
+            self._bridge.channelConnected.connect(self._on_channel_connected)
             self._channel = QWebChannel()
             self._channel.registerObject("bridge", self._bridge)
             self._web_view.page().setWebChannel(self._channel)
 
             shell_path = _shell_file_path()
+            # Keep the shell URL: showEvent re-uses it to kick the deferred
+            # load for a tab that was created while hidden.
+            self._shell_url = QUrl.fromLocalFile(str(shell_path))
+            self._web_view.loadStarted.connect(self._on_load_started)
             self._web_view.loadFinished.connect(self._on_load_finished)
-            self._web_view.load(QUrl.fromLocalFile(str(shell_path)))
+            self._web_view.load(self._shell_url)
         except ImportError:
             log.info("QWebEngine not available, using static PNG fallback")
             self._fallback_label = QLabel()
             self._fallback_label.setAlignment(Qt.AlignCenter)
-            self._fallback_label.setStyleSheet("background: %s;" % _theme_mod.resolve_color("border_subtle"))
+            self._fallback_label.setStyleSheet("background: %s;" % self._canvas_bg())
             self._layout.addWidget(self._fallback_label)
 
     # -- Qt resize forwarding --------------------------------------------
@@ -204,46 +305,7 @@ class PlotlyWebView(QWidget):
         until the next set_figure() call. Plotly.Plots.resize() tells
         the JS chart to re-fit to its container's current pixel size."""
         super().resizeEvent(event)
-        if self._use_web_engine and self._web_view is not None:
-            try:
-                self._web_view.page().runJavaScript(
-                    "if(window.Plotly){Plotly.Plots.resize(document.getElementById('chart'))}"
-                )
-            except Exception as exc:  # pragma: no cover — JS runtime
-                log.debug("Plotly resize forward failed: %s", exc)
-
-    def showEvent(self, event):  # noqa: N802 — Qt override signature
-        """Re-push the current figure when this widget becomes visible.
-
-        Root-cause fix for "only the last created/edited chart shows, other
-        tabs are blank": a ``QWebEngineView`` living inside a hidden
-        ``QTabWidget`` page does not reliably run its pending page load while
-        it is off-screen, so ``_on_load_finished`` never fires for that tab
-        and the figure sent by ``set_figure()`` sits in ``_pending_fig_json``
-        forever. The freshly generated chart always worked because generation
-        selects its tab (making it visible, so its page loads); switching
-        back to an older chart's tab showed a blank view.
-
-        On first show after construction this forces the pending shell load;
-        on later shows (tab re-selected) it re-emits the current figure so a
-        tab whose page loaded while hidden repaints at the correct size.
-        ``set_figure()`` during generation stays the single write path --
-        this only *replays* the latest figure, never recomputes anything.
-        """
-        super().showEvent(event)
-        if not self._use_web_engine or self._web_view is None:
-            return
-        try:
-            if not self._page_loaded:
-                # Kick the deferred shell load for a tab that was hidden
-                # since construction; the pending figure flushes from
-                # _on_load_finished as usual.
-                self._web_view.load(self._shell_url)
-            elif self._current_fig is not None:
-                import plotly.io as pio
-                self._bridge.figureReady.emit(pio.to_json(self._current_fig))
-        except Exception as exc:  # pragma: no cover — JS bridge runtime
-            log.debug("Plotly showEvent re-push failed: %s", exc)
+        self.relayout()
 
     def showEvent(self, event):  # noqa: N802 — Qt override signature
         """Re-push the current figure when this widget becomes visible.
@@ -267,26 +329,213 @@ class PlotlyWebView(QWidget):
             return
         try:
             if not self._page_loaded:
-                self._web_view.load(self._shell_url)
-            elif self._current_fig is not None:
+                # Shell not up yet: (re)kick the load. ``_shell_url`` is set
+                # in __init__; guard anyway so a partially constructed widget
+                # can never raise AttributeError out of an event handler.
+                if self._shell_url is not None:
+                    self._web_view.load(self._shell_url)
+            elif self._render_fig is not None:
                 import plotly.io as pio
-                self._bridge.figureReady.emit(pio.to_json(self._current_fig))
+                self._apply_page_background()
+                self._bridge.figureReady.emit(pio.to_json(self._render_fig))
+            # Becoming visible is exactly when a hidden-tab chart needs to
+            # re-measure against its now-real container size.
+            self._relayout_when_sized()
         except Exception as exc:  # pragma: no cover — JS bridge runtime
             log.debug("Plotly showEvent re-push failed: %s", exc)
 
+    def relayout(self) -> None:
+        """Tell Plotly to re-fit to the current widget size, right now.
+
+        ``responsive: true`` only re-fits the chart when the *browser*
+        fires a resize event. A QWebEngineView that was laid out at 0px
+        (inside a not-yet-activated page, or a collapsed tab) and then
+        given a real size by a later layout pass does not always produce
+        that event, so the chart can stay unsized/blank until the user
+        happens to drag something. Calling Plotly.Plots.resize() directly
+        closes that gap without reloading the page.
+
+        Cheap and idempotent -- Plotly recomputes from the live container
+        dimensions -- so it is safe to call after any layout change.
+        """
+        if not self._use_web_engine or self._web_view is None:
+            return
+        try:
+            # A card that was first shown at 0px (a hidden tab, a collapsed
+            # pane) is only now getting a real width, and the figure it holds
+            # was sized for a guess. Re-derive the legend column against the
+            # pixels we actually have before asking Plotly to re-fit, then push
+            # the corrected figure. Guarded by _refit_applied so this happens
+            # once per figure, not on every resize tick.
+            if not self._refit_applied and self._render_fig is not None:
+                if self._refit_legend_to_width(self._render_fig):
+                    import plotly.io as _pio
+                    self._bridge.figureReady.emit(_pio.to_json(self._render_fig))
+        except Exception as exc:  # pragma: no cover — JS runtime
+            log.debug("legend refit on relayout failed: %s", exc)
+        try:
+            self._web_view.page().runJavaScript(
+                "if(window.Plotly){Plotly.Plots.resize(document.getElementById('chart'))}"
+            )
+        except Exception as exc:  # pragma: no cover — JS runtime
+            log.debug("Plotly relayout failed: %s", exc)
+
+    def _relayout_when_sized(self) -> None:
+        """Re-fit the chart as soon as the view is genuinely usable.
+
+        A freshly created card is laid out before its stack page becomes
+        current, so the first real size arrives one event-loop turn later --
+        and on a COLD start much later than that: the QWebEngine shell has to
+        boot, load ~4.5MB of inlined Plotly.js and finish the QWebChannel
+        handshake first (measured at ~1.3s from Generate on this machine).
+
+        The old version polled 20x20ms and then gave up, i.e. a 400ms budget
+        that expires long before a cold start is ready. When that happened the
+        chart stayed laid out at 0px and only appeared after the user happened
+        to resize the window -- the "close the app, reopen, Generate is blank
+        again" report. It re-armed on some paths but not all, so the window
+        between the poll expiring and the next manual resize was a real hole.
+
+        Instead of a fixed number of attempts, keep polling on a timer that
+        re-arms itself until the view is both loaded AND taller than zero
+        (bounded only by a generous ceiling so a genuinely 0-height widget
+        cannot spin forever), then relayout once and stop. The re-arm makes
+        the fix independent of how slow the start is, which is what makes it
+        hold across restarts rather than only on a warm process.
+        """
+        if not self._use_web_engine or self._web_view is None:
+            return
+
+        # One chain per widget: a second caller (e.g. showEvent firing while
+        # set_figure is still polling) must not start a competing chain.
+        if self._relayout_pending:
+            return
+        self._relayout_pending = True
+        started = time.monotonic()
+
+        def _try() -> None:
+            try:
+                ready = (self._page_loaded and self._web_view is not None
+                         and self._web_view.height() > 0)
+            except RuntimeError:
+                # Widget destroyed underneath us (card deleted mid-flight).
+                self._relayout_pending = False
+                return
+            if ready:
+                self._relayout_pending = False
+                self.relayout()
+                return
+            # Still not ready. Ceiling is generous (30s) and only exists so a
+            # permanently hidden/0-height widget cannot poll forever.
+            if time.monotonic() - started > _RELAYOUT_MAX_SECONDS:
+                self._relayout_pending = False
+                log.debug("relayout gave up: view never became sizeable")
+                return
+            QTimer.singleShot(20, _try)
+
+        QTimer.singleShot(0, _try)
+
     # -- Internal --------------------------------------------------------
+
+    def _canvas_bg(self) -> str:
+        """Canvas colour for the current app theme (self-contained figure)."""
+        try:
+            from chart_display import chart_canvas_color
+            return str(chart_canvas_color(_theme_mod.current_mode()))
+        except Exception:
+            return "#0f172a"
+
+    def _apply_page_background(self) -> None:
+        """Make the page behind the chart transparent.
+
+        The shell HTML is written once per process and shared by every chart
+        widget, so it carries no mode-specific background (its CSS is now
+        ``background:transparent`` for exactly this reason). Clearing the
+        inline styles here is belt-and-braces for a page that was reloaded
+        from an older cached shell, and keeps the first paint correct.
+
+        The canvas colour is NOT re-applied to the body any more: the
+        figure's own ``paper_bgcolor``/``plot_bgcolor`` (set by
+        ``chart_display.theme_figure``) already paints the plot area, and
+        the ChartCard surface is styled to the same colour, so a body
+        colour here would only re-introduce the mismatched frame.
+        """
+        if not self._use_web_engine or self._web_view is None:
+            return
+        bg = self._canvas_bg()
+        if not self._page_loaded:
+            # Shell not ready yet: remember it and apply from
+            # _on_load_finished, so the first paint is already correct.
+            self._pending_bg = bg
+            return
+        try:
+            self._web_view.page().runJavaScript(
+                "document.documentElement.style.background='transparent';"
+                "if(document.body){document.body.style.background='transparent';}"
+            )
+        except Exception as exc:  # pragma: no cover — JS runtime
+            log.debug("Plotly canvas background failed: %s", exc)
+
+    def _on_load_started(self) -> None:
+        """A new document is on its way: the old channel is about to die.
+
+        The JS side unsubscribes ``figureReady`` the instant the document
+        goes away, so the Python-side ready flag has to be cleared NOW --
+        otherwise a figure set during the reload is emitted into a channel
+        with no listener and the chart comes up blank.
+        """
+        self._page_loaded = False
+        if self._bridge is not None:
+            self._bridge.reset_channel()
 
     def _on_load_finished(self, ok: bool) -> None:
         self._page_loaded = ok
-        if ok and self._pending_fig_json is not None:
-            self._bridge.figureReady.emit(self._pending_fig_json)
-            self._pending_fig_json = None
+        if not ok:
+            return
+        if self._pending_bg is not None:
+            self._pending_bg = None
+            self._apply_page_background()
+        # The figure is flushed from _on_channel_connected, NOT here:
+        # loadFinished only means the document parsed -- the QWebChannel
+        # handshake happens a tick later, so emitting now drops the
+        # figure on the floor and the chart stays blank.
+        if self._bridge is not None and not self._bridge.channel_ready:
+            return
+        self._flush_pending_figure()
+        # The shell has loaded; if the widget only just received a real
+        # size (a card added to a tab that became current now), Plotly
+        # still has to be told to measure itself. Without this the first
+        # chart of a freshly generated tab can stay blank until the user
+        # resizes the window.
+        self._relayout_when_sized()
 
     def _push_figure(self, fig_json: str) -> None:
-        if self._page_loaded and self._bridge is not None:
+        """Hand *fig_json* to the page, or queue it until the page can take it.
+
+        Both the document load AND the QWebChannel handshake must be done
+        before ``figureReady`` has a listener. Emitting after only
+        loadFinished silently discards the figure, which is the root cause
+        of "chart generated but nothing appears".
+        """
+        if (self._page_loaded and self._bridge is not None
+                and self._bridge.channel_ready):
             self._bridge.figureReady.emit(fig_json)
         else:
             self._pending_fig_json = fig_json
+
+    def _flush_pending_figure(self) -> None:
+        """Deliver the queued figure once the channel is actually live."""
+        if self._pending_fig_json is None or self._bridge is None:
+            return
+        if not (self._page_loaded and self._bridge.channel_ready):
+            return
+        self._bridge.figureReady.emit(self._pending_fig_json)
+        self._pending_fig_json = None
+
+    def _on_channel_connected(self) -> None:
+        """JS finished the QWebChannel handshake -- deliver anything queued."""
+        self._flush_pending_figure()
+        self._relayout_when_sized()
 
     # -- Public API --------------------------------------------------------
 
@@ -297,21 +546,83 @@ class PlotlyWebView(QWidget):
         in JS; every call after that does an in-place ``Plotly.react``, so
         repeated updates (e.g. after a filter or style change) don't reload
         the page or restart the JS runtime.
+
+        The figure is re-coloured for the current app theme on the way in
+        (``chart_display.theme_figure``): the canvas, gridlines, hover label
+        and every colour that was chosen to sit on a dark canvas follow the
+        mode.  The caller's own figure object is never mutated, so the copy
+        kept in the session/export path keeps its own colours.
         """
         if fig is None:
             return
         self._current_fig = fig
+        render_fig = self._themed(fig)
+        # The figure was built without knowing how wide this card ended up
+        # (Generate runs on a worker thread), so re-size the reserved legend
+        # column against the live view before pushing. No-op when the view has
+        # no width yet; the first sizeable pass re-runs this via relayout().
+        if self._use_web_engine:
+            render_fig = self._refit_legend_to_width(render_fig)
+        self._render_fig = render_fig
 
         if self._use_web_engine:
+            self._apply_page_background()
             try:
                 import plotly.io as pio
-                fig_json = pio.to_json(fig)
-                self._push_figure(fig_json)
+                self._push_figure(pio.to_json(render_fig))
             except Exception as exc:
                 log.error("Failed to serialize Plotly figure: %s", exc)
-                self._render_static(fig)
+                self._render_static(render_fig)
+            # A figure pushed while the view still has no real size renders
+            # at 0x0; re-fit as soon as the layout gives it one.
+            self._relayout_when_sized()
         else:
-            self._render_static(fig)
+            self._render_static(render_fig)
+
+    def _themed(self, fig):
+        """Return the mode-appropriate COPY of *fig* (never the original)."""
+        try:
+            from chart_display import theme_figure
+            return theme_figure(fig, _theme_mod.current_mode())
+        except Exception:
+            log.debug("chart theming failed; rendering the figure as-is",
+                      exc_info=True)
+            return fig
+
+    def _refit_legend_to_width(self, fig):
+        """Re-derive the reserved legend column against the REAL view width.
+
+        Figures are generated on a worker thread, which has no view and
+        therefore no width, so the legend column falls back to a flat fraction
+        of an assumed card. On a full-width chart that reserved a few hundred
+        px for a legend box that needs ~76px -- the "big gap between chart and
+        legend" report.
+
+        The figure is built once, but this view knows its own width by the time
+        it paints, so the domain is recomputed here against those pixels.
+        Charts with no reserved legend column are left untouched.
+        """
+        if fig is None or not self._use_web_engine or self._web_view is None:
+            return fig
+        try:
+            from chart_display import refit_legend_width
+            if refit_legend_width(fig, self._web_view.width()):
+                self._refit_applied = True
+        except Exception:
+            log.debug("legend width refit skipped", exc_info=True)
+        return fig
+
+    def apply_theme(self) -> None:
+        """Re-colour and repaint the current figure after a dark<->light switch.
+
+        In place by design: ``set_figure`` renders through ``Plotly.react``,
+        so a theme toggle repaints every open chart without reloading the web
+        view -- a reload is what flashes the whole chart area.
+        """
+        if self._current_fig is None:
+            self._apply_page_background()
+            return
+        self.set_figure(self._current_fig)
 
     def _render_static(self, fig) -> None:
         """Fallback: render figure as static PNG (no QWebEngine available)."""
@@ -331,6 +642,8 @@ class PlotlyWebView(QWidget):
     def clear(self) -> None:
         """Clear the current content."""
         self._current_fig = None
+        self._render_fig = None
+        self._pending_fig_json = None
         if self._use_web_engine and self._web_view is not None:
             self._push_figure('{"data": [], "layout": {}}')
         elif self._fallback_label is not None:
