@@ -211,33 +211,78 @@ LEGEND_AXIS_MARGIN = 96
 # the plate (measured at 700px: ~130 label pixels dimmed by the plate).
 #   chrome  = plate padding + swatch + legend title
 #   char    = per-character width of a legend item (11px Inter, rounded up)
-#   axis    = room for the tick labels next to the axis (left side only)
+#   axis    = room for the tick labels that share the column.  Measured from the
+#             figure by ``_axis_label_need_px`` (see ``reserve_legend_column``);
+#             this is only the fallback for callers that pass no figure.
 _LEGEND_CHAR_PX = 8
 _LEGEND_CHROME_PX = 44
 _LEGEND_AXIS_PX = 30
+# Gap kept between the legend plate and the axis furniture beside it.  The tick
+# labels are measured (see ``_axis_label_need_px``) but the plate has a border
+# and its own padding, so without a separating gap the two still touch.
+_LEGEND_AXIS_GAP_PX = 16
 # Plot width the estimate is calibrated against.  Deliberately smaller than a
 # typical card so the estimate errs on the generous side at small widths; the
 # strip is a fraction, so this only has to be the right order of magnitude.
-_LEGEND_REF_WIDTH = 500
+_LEGEND_REF_WIDTH = 300
+
+# ---------------------------------------------------------------------------
+# The compact / dashboard rule: a vertical legend column stops being the right
+# answer once the card is narrow.
+#
+# A dashboard packs 2-3 charts per row and every card auto-sizes to the number
+# of visuals on screen, so a chart can easily be handed a 380-700px card. On the
+# Categorical dual-axis figure the legend column needs ~260px of that (long
+# series names + the y tick labels + the rotated y-axis title, all sharing the
+# strip). That is 35-70% of the plot area: the bars get crushed and the legend
+# still sits on top of the axis. This is the *position not dynamically adjusted
+# as per viewpoint area* report -- the layout was sized for a full-width preview
+# pane and then carried, unchanged, into a compact grid tile.
+#
+# So the orientation is now CHOSEN from the pixels available rather than fixed:
+# below this share of the plot area a side column can take, the legend switches
+# to a horizontal band across the top/bottom edge (which reserves HEIGHT, not
+# width, so the plot keeps its full width and stays readable). Above it the
+# vertical column is kept, because there is room and it is what the user picked
+# on a wide card.
+LEGEND_COLUMN_MAX_SHARE = 0.34
+# A horizontal legend row, and the gap under it. One row of 11px items is ~20px
+# tall; the constant is deliberately generous so a wrapped second row still
+# fits inside the band that was reserved for it.
+_LEGEND_ROW_PX = 22
+_LEGEND_BAND_GAP_PX = 10
+# Cap on how much vertical space a horizontal band may claim. Past this the
+# plot area stops being worth protecting, so the column is used instead.
+LEGEND_BAND_MAX_SHARE = 0.30
 
 
-def _legend_need_px(names, legend_title="", side="left"):
+def _legend_need_px(names, legend_title="", side="left", axis_px=None):
     """Pixels the reserved legend column actually has to be, for these labels.
 
     This is the real measurement the fraction below is derived from: plate
     padding + swatch + the longest label actually drawn, plus room for the
-    axis tick labels when the column is on the left.
+    axis tick labels that share the column.
+
+    ``axis_px`` is that tick-label allowance, measured from the figure by the
+    caller.  It is a parameter rather than being recomputed here because this
+    function only sees label strings, not the axes they are competing with.
+    When it is not supplied the flat fallback constants apply.
     """
     longest = 0
     for n in list(names or []) + ([legend_title] if legend_title else []):
         longest = max(longest, len(str(n)))
     need = _LEGEND_CHROME_PX + _LEGEND_CHAR_PX * longest
-    if side == "left":
-        need += _LEGEND_AXIS_PX
+    if axis_px is None:
+        # No figure to measure: keep the historic allowance on the left, and
+        # still give the right a gap so a secondary axis is never painted over.
+        need += _LEGEND_AXIS_PX if side == "left" else _LEGEND_AXIS_GAP_PX
+    else:
+        need += max(0, int(axis_px))
     return need
 
 
-def _legend_strip(names, legend_title="", side="left", width_px=None):
+def _legend_strip(names, legend_title="", side="left", width_px=None,
+                  axis_px=None):
     """Fraction of the plot width to reserve for a legend with these labels.
 
     A pure fraction of the card width is what produced the "big gap between
@@ -250,13 +295,42 @@ def _legend_strip(names, legend_title="", side="left", width_px=None):
     Without a width (headless callers, export) the old fixed-fraction
     behaviour is kept, so nothing depends on a size it cannot know.
     """
-    need = _legend_need_px(names, legend_title, side)
+    need = _legend_need_px(names, legend_title, side, axis_px)
     if width_px and width_px > 0:
         # Never wider than the label needs, never so thin the box cannot fit.
         frac = need / float(width_px)
         return max(0.0, min(LEGEND_STRIP_MAX, frac))
     return max(LEGEND_STRIP_MIN,
                min(LEGEND_STRIP_MAX, need / float(_LEGEND_REF_WIDTH)))
+
+
+def _legend_axis_title_px(fig, side):
+    """Pixels the rotated y-axis TITLE takes on *side*, or 0 when it has none.
+
+    The tick labels are not the only axis furniture in the strip. Plotly also
+    draws the (rotated) axis title outboard of them, and with no `automargin`
+    that title sits in the same reserved column -- so a column sized for the
+    box + ticks still had the title painted under the legend plate. A 16px
+    title is ~22px of horizontal thickness.
+    """
+    try:
+        name = "yaxis2" if side == "right" else "yaxis"
+        ax = getattr(fig.layout, name, None)
+        if ax is None:
+            return 0
+        title = getattr(ax, "title", None)
+        if title is None or not str(getattr(title, "text", "") or "").strip():
+            return 0
+        size = 16
+        try:
+            size = int(getattr(title.font, "size", None) or 16)
+        except Exception:
+            pass
+        # Rotated 90deg, so it is the title's THICKNESS (not its length) that
+        # occupies the column: ~1.35em plus Plotly's default standoff.
+        return int(round(size * 1.35)) + 5
+    except Exception:
+        return 0
 
 
 def legend_anchor(legend_position):
@@ -269,9 +343,166 @@ def legend_anchor(legend_position):
     return _LEGEND_ANCHORS.get(str(legend_position or "").strip())
 
 
+# Nominal height a reserved band is expressed against, when converting the
+# measured pixel need into a ``yaxis.domain`` fraction. Only the ratio matters
+# (the band is a share of the plot height), so this just has to be a plausible
+# card height.
+_LEGEND_BAND_REF_HEIGHT = 400
+
+
+def plan_legend_layout(fig, legend_position, names=None, legend_title="",
+                       width_px=None):
+    """Decide HOW the legend is laid out for the pixels this card really has.
+
+    Returns a dict describing the plan, or None when the position is unknown:
+
+        {"mode": "column", "side": ..., "need_px": int, "strip": float}
+        {"mode": "band", "side": ..., "top": bool, "band_px": int,
+         "rows": int, "need_px": int}
+
+    "column" is the historical behaviour -- a vertical strip carved out of
+    ``xaxis.domain``. "band" is the compact fallback -- a horizontal legend in
+    a reserved strip along the top/bottom edge, costing the plot HEIGHT rather
+    than width.
+
+    The choice is made from the measured pixel need against the plot area that
+    will actually exist, so one figure lays out as a column on a wide preview
+    pane and as a band on a compact dashboard tile. That is what "position
+    should adjust as per the viewport area" asks for. With no ``width_px``
+    there is nothing to adapt to, so the column is kept and every headless
+    caller (export, background generation) keeps its current output.
+    """
+    place = legend_anchor(legend_position)
+    if not place:
+        return None
+    side = place[0]
+    try:
+        m = fig.layout.margin.to_plotly_json() or {}
+    except Exception:
+        m = {}
+    key = "l" if side == "left" else "r"
+    # Measure against the margins that WILL exist, i.e. after the legend's own
+    # side is widened -- otherwise the plot area is over-estimated and the
+    # column comes out short by the margin.
+    probe = dict(m)
+    probe[key] = max(int(probe.get(key) or 0), int(LEGEND_AXIS_MARGIN))
+    area = _plot_area_width(probe, width_px)
+    axis_px = _legend_axis_need_px(fig, side)
+    need = _legend_need_px(names, legend_title, side, axis_px)
+
+    w = float(width_px or 0)
+    if w <= 0 or area <= 0:
+        return {"mode": "column", "side": side, "need_px": need,
+                "axis_px": axis_px,
+                "strip": _legend_strip(names, legend_title, side, None,
+                                       axis_px=axis_px)}
+
+    if need / area <= LEGEND_COLUMN_MAX_SHARE:
+        return {"mode": "column", "side": side, "need_px": need,
+                "axis_px": axis_px,
+                "strip": _legend_strip(names, legend_title, side, area,
+                                       axis_px=axis_px)}
+
+    # Too wide for a column: go horizontal. The band height follows the ITEM
+    # COUNT (they now sit side by side, so a long name no longer costs width),
+    # plus the legend title when one is set.
+    rows = max(1, len([n for n in (names or []) if str(n or "").strip()]))
+    band_px = rows * _LEGEND_ROW_PX + _LEGEND_BAND_GAP_PX
+    if legend_title:
+        band_px += _LEGEND_ROW_PX
+    return {"mode": "band", "side": side, "top": place[2] == "top",
+            "band_px": band_px, "rows": rows, "need_px": need}
+
+
+def reserve_legend_band(fig, legend_position, band_px):
+    """Reserve a horizontal legend band along the top or bottom edge.
+
+    The mirror image of ``reserve_legend_column``: instead of shrinking
+    ``xaxis.domain`` it shrinks ``yaxis.domain``, so the plot keeps its FULL
+    width and gives up only the height the legend rows actually need. That is
+    what makes a compact dashboard tile readable -- a side column on a 450px
+    card leaves the bars ~150px, while a band costs ~30px of height.
+
+    The legend's own anchor is written here too (``orientation="h"`` and the
+    matching x/y/anchor), because in this mode it is a genuinely different
+    placement rather than just a different reserved strip.
+
+    Returns True when the layout was rewritten.
+    """
+    place = legend_anchor(legend_position)
+    if not place:
+        return False
+    side, _ly, _lya = place
+    top = _lya == "top"
+    try:
+        band_px = max(0, int(band_px or 0))
+    except Exception:
+        band_px = 0
+    if band_px <= 0:
+        return False
+    # Never claim so much height that the plot stops being a plot.
+    band_px = min(band_px, int(LEGEND_BAND_MAX_SHARE * _LEGEND_BAND_REF_HEIGHT))
+    frac = band_px / float(_LEGEND_BAND_REF_HEIGHT)
+    try:
+        m = fig.layout.margin.to_plotly_json() or {}
+    except Exception:
+        m = {}
+    if top:
+        m["t"] = max(int(m.get("t") or 0), band_px)
+        domain = [frac, 1.0]
+    else:
+        m["b"] = max(int(m.get("b") or 0), band_px)
+        domain = [0.0, 1.0 - frac]
+    try:
+        fig.update_layout(margin=m, yaxis=dict(domain=domain))
+        # A secondary y axis created by make_subplots OVERLAYS 'y' and simply
+        # follows the primary domain, so writing it would be rejected as
+        # ignored; only a real, independently-placed yaxis2 needs the write.
+        ax2 = getattr(fig.layout, "yaxis2", None)
+        if ax2 is not None and not getattr(ax2, "overlaying", None):
+            fig.update_layout(yaxis2=dict(domain=domain))
+    except Exception:
+        return False
+    try:
+        fig.update_layout(legend=dict(
+            orientation="h",
+            x=0.0 if side == "left" else 1.0,
+            y=1.0 if top else 0.0,
+            xanchor="left" if side == "left" else "right",
+            yanchor="bottom" if top else "top",
+        ))
+    except Exception:
+        pass
+    return True
+
+
+def _plot_area_width(margin, width_px):
+    """Width an ``xaxis.domain`` fraction actually spans, in pixels.
+
+    ``layout.xaxis.domain`` is a fraction of the plot AREA -- the card minus
+    the left/right outer margins -- not of the full card.  Resolving a pixel
+    need against the card width therefore under-reserves by exactly the
+    margins, which is why a legend sized "correctly" still overlapped the axis
+    labels: the strip came out ~40px short on a typical card.
+
+    Returns the card width unchanged when no width is known.
+    """
+    try:
+        w = float(width_px or 0)
+        if w <= 0:
+            return width_px
+        l = float(margin.get("l") or 0)
+        r = float(margin.get("r") or 0)
+        # Never let a large margin invert or zero out the area; a card that
+        # narrow is degenerate and any sane fraction still beats crashing.
+        return max(1.0, w - l - r)
+    except Exception:
+        return width_px
+
+
 def reserve_legend_column(fig, legend_position, strip=None,
                           axis_margin=LEGEND_AXIS_MARGIN, names=None,
-                          legend_title="", width_px=None):
+                          legend_title="", width_px=None, axis_px=None):
     """Carve a dedicated legend column out of *fig*'s plot domain.
 
     Shrinks the x-domain on the legend's side and widens the matching outer
@@ -292,16 +523,37 @@ def reserve_legend_column(fig, legend_position, strip=None,
         return None
     side = place[0]
     try:
-        m = dict(fig.layout.margin or {})
+        # NB: ``dict(fig.layout.margin)`` raises ValueError on some Plotly
+        # versions (the Margin object iterates keys, not pairs), which silently
+        # discarded the real margins and made the strip resolve against the
+        # full card width.  ``to_plotly_json()`` is the supported accessor.
+        m = fig.layout.margin.to_plotly_json() or {}
     except Exception:
         m = {}
-    if strip is None:
-        strip = _legend_strip(names, legend_title, side, width_px)
+    # Widen the outer margin on the legend's side FIRST, so the plot area the
+    # domain fraction is resolved against is the one that will actually exist.
     if side == "left":
         m["l"] = max(int(m.get("l") or 0), int(axis_margin))
-        domain = [float(strip), 1.0]
     else:
         m["r"] = max(int(m.get("r") or 0), int(axis_margin))
+    if strip is None:
+        # The tick labels of the axis on the legend's side are drawn INSIDE the
+        # strip being freed (they sit just outside the plot edge), so the column
+        # has to hold them too -- otherwise the plate paints over them.  This is
+        # what put the legend on top of "Packaged Chocolate" on the left, and
+        # over the secondary y scale of a dual-axis chart on the right.
+        #
+        # The fraction is resolved against the PLOT AREA, not the card: an
+        # ``xaxis.domain`` fraction is a fraction of the width left after the
+        # outer margins, so dividing the pixel need by the full card width
+        # under-reserves by exactly the margin and leaves the plate overlapping.
+        strip = _legend_strip(names, legend_title, side,
+                              _plot_area_width(m, width_px),
+                              axis_px=(_legend_axis_need_px(fig, side)
+                                       if axis_px is None else axis_px))
+    if side == "left":
+        domain = [float(strip), 1.0]
+    else:
         domain = [0.0, 1.0 - float(strip)]
     try:
         fig.update_layout(margin=m, xaxis=dict(domain=domain))
@@ -315,13 +567,26 @@ def reserve_legend_column(fig, legend_position, strip=None,
 def infer_legend_position(fig):
     """Recover the legend position name from a figure that already has one.
 
-    A figure carries only the resolved anchors (``x``/``y``/``xanchor``/
-    ``yanchor``), not the friendly name the user picked. When the column has
-    to be re-sized later -- after the view finally knows its pixel width --
-    the name has to be recovered from those anchors to pick the same side.
+    A figure normally carries only the resolved anchors (``x``/``y``/
+    ``xanchor``/``yanchor``), not the friendly name the user picked, so the
+    name has to be recovered from those anchors to pick the same side when the
+    layout is re-fitted later.
 
-    Returns the position name, or None if the figure has no legend box.
+    ``apply_display_options`` records the name in ``layout.meta`` when it lays
+    the legend out, and that record is the authority. The anchors alone are
+    ambiguous once the compact band mode exists: there a TOP band is drawn with
+    ``yanchor="bottom"`` (so it grows downward out of the reserved strip), which
+    the anchor reading would report as "Bottom ...". Returns the position name,
+    or None when the figure has no legend box.
     """
+    try:
+        meta = fig.layout.meta
+        if isinstance(meta, dict):
+            pos = str(meta.get("lytrize_legend_position") or "").strip()
+            if pos in _LEGEND_ANCHORS:
+                return pos
+    except Exception:
+        pass
     try:
         legend = fig.layout.legend
     except Exception:
@@ -343,17 +608,114 @@ def infer_legend_position(fig):
     return None
 
 
+def legend_layout_mode(fig):
+    """Which layout the legend on *fig* was given: "column", "band" or None.
+
+    Recorded by ``reserve_legend_column``/``reserve_legend_band`` so a later
+    re-fit knows whether it is re-sizing a column or a band, instead of having
+    to re-derive it from the anchors.
+    """
+    try:
+        meta = fig.layout.meta
+        if isinstance(meta, dict):
+            mode = str(meta.get("lytrize_legend_mode") or "").strip()
+            if mode in ("column", "band"):
+                return mode
+    except Exception:
+        pass
+    return None
+
+
+def _record_legend_layout(fig, position, mode):
+    """Remember the position/mode on the figure so a refit can reproduce it."""
+    try:
+        meta = fig.layout.meta
+        meta = dict(meta) if isinstance(meta, dict) else {}
+        meta["lytrize_legend_position"] = str(position or "")
+        meta["lytrize_legend_mode"] = str(mode or "")
+        fig.update_layout(meta=meta)
+    except Exception:
+        log.debug("could not record the legend layout on the figure",
+                  exc_info=True)
+
+
+def _restore_legend_reservation(fig):
+    """Undo the previous legend reservation, returning the figure to baseline.
+
+    The layout must be recalculated from the figure's ORIGINAL margins and
+    domains, never from the already-reserved ones, or every pass compounds:
+    a column would grow a little further each resize and a band would never be
+    released when the card grew back. This restores a full-width domain on both
+    axes and puts the legend back to the vertical orientation, which is the
+    baseline both modes are measured against.
+    """
+    try:
+        fig.update_layout(xaxis=dict(domain=[0.0, 1.0]),
+                          yaxis=dict(domain=[0.0, 1.0]))
+        ax2 = getattr(fig.layout, "yaxis2", None)
+        if ax2 is not None and not getattr(ax2, "overlaying", None):
+            fig.update_layout(yaxis2=dict(domain=[0.0, 1.0]))
+    except Exception:
+        log.debug("could not reset the legend reservation", exc_info=True)
+    try:
+        if legend_layout_mode(fig) == "band":
+            fig.update_layout(legend=dict(orientation="v"))
+    except Exception:
+        pass
+
+
+def apply_legend_layout(fig, legend_position, names=None, legend_title="",
+                        width_px=None):
+    """Reserve space for the legend, choosing column or band from the pixels.
+
+    The single entry point both ``apply_display_options`` (no view width yet)
+    and ``refit_legend_width`` (the widget's real width) go through, so the two
+    always agree on the rules.
+
+    With no ``width_px`` this is the classic column reservation, which is what
+    every headless/export path keeps. With a width it also switches to the
+    compact horizontal band when a column would take more than
+    ``LEGEND_COLUMN_MAX_SHARE`` of the plot area.
+
+    Returns True when the layout was rewritten.
+    """
+    if fig is None:
+        return False
+    _restore_legend_reservation(fig)
+    plan = plan_legend_layout(fig, legend_position, names=names,
+                              legend_title=legend_title, width_px=width_px)
+    if not plan:
+        return False
+    if plan.get("mode") == "band":
+        ok = reserve_legend_band(fig, legend_position, plan.get("band_px"))
+    else:
+        ok = reserve_legend_column(
+            fig, legend_position, names=names, legend_title=legend_title,
+            width_px=width_px,
+            strip=plan.get("strip"),
+            axis_px=plan.get("axis_px"),
+        )
+    if ok:
+        _record_legend_layout(fig, legend_position, plan.get("mode"))
+    return bool(ok)
+
+
 def refit_legend_width(fig, width_px):
-    """Re-size an already-reserved legend column against the real view width.
+    """Re-lay the legend out against the real view width.
 
-    Figures are built on a worker thread with no view, so the reservation
-    falls back to a flat fraction of an assumed card width. Once the widget
-    is on screen its true width is known, and the column can be sized against
-    the pixels the labels actually need -- that is what removes the wide gap
-    between the plot and the legend on a full-width chart.
+    Figures are built on a worker thread with no view, so the first reservation
+    has to assume a card width. Once the widget is on screen its true width is
+    known, and the legend can be sized against the pixels the labels actually
+    need -- that is what removes the wide gap between the plot and the legend on
+    a full-width chart -- and can also switch to the compact band layout when
+    the card is too narrow for a column at all.
 
-    Returns True when the domain was rewritten. A figure without a reserved
-    legend column (legend off, or overlaid rather than in its own strip) is
+    Idempotent and reversible: the previous reservation is cleared first, so
+    repeated calls (a resize storm, a re-gridded dashboard, a full-width
+    toggle) converge on the layout the current width calls for instead of
+    compounding strips or leaving a stale band behind.
+
+    Returns True when the layout was rewritten. A figure with no legend box is
     left untouched.
     """
     if fig is None or not width_px or width_px <= 0:
@@ -370,14 +732,641 @@ def refit_legend_width(fig, width_px):
                  if getattr(tr, "showlegend", True) is not False]
     except Exception:
         return False
-    return bool(reserve_legend_column(fig, pos, names=names,
-                                      legend_title=title,
-                                      width_px=width_px))
+    return bool(apply_legend_layout(fig, pos, names=names,
+                                    legend_title=title,
+                                    width_px=width_px))
 
 
 # Colours shared by the legend plate and the colour-bar frame when their
 # border is switched on (theme_figure() re-tints them per mode).
 LEGEND_BORDER_COLOR = "rgba(148, 163, 184, 0.35)"
+
+
+def _apply_heatmap_options(fig, lo, typo, width_px=None):
+    """Apply the heatmap / colour-bar Layout options to *fig* in place.
+
+    Only heatmap and choropleth traces are touched. The behaviour mirrors the
+    old app's ``chart_settings.py``: the colour scale and the cell annotations
+    are per-trace, the colour-bar title/sizes/colours go through
+    ``update_coloraxes`` because ``px.imshow`` puts them on a shared colour
+    axis rather than on the trace.
+
+    Annotation text is turned OFF by clearing both ``text`` and
+    ``texttemplate`` (not just one), which is what actually removes the numbers
+    from a heatmap; a trace left with a stale ``texttemplate`` keeps drawing
+    them.
+    """
+    scales = ["heatmap", "choropleth"]
+    traces = [tr for tr in getattr(fig, "data", []) or []
+              if str(getattr(tr, "type", "")).lower() in scales]
+    if not traces:
+        return
+
+    # -- Per-trace: colour scale + in-cell annotations ---------------------
+    cs = lo.get("heatmap_colorscale")
+    show_text = lo.get("heatmap_show_text", True)
+    try:
+        prec = max(0, int(round(float(
+            lo.get("heatmap_annotation_precision", 2)))))
+    except Exception:
+        prec = 2
+    ann_size = lo.get("heatmap_annotation_size", 10)
+    ann_color = lo.get("heatmap_annotation_color", "#ffffff")
+
+    for tr in traces:
+        if cs:
+            try:
+                # Detach the trace from the shared colour axis FIRST. A
+                # px.imshow heatmap is bound to layout.coloraxis, and that
+                # axis carries its own colorscale -- while the trace is bound
+                # to the axis, the axis value is what Plotly paints, so
+                # writing colorscale on the trace alone had no visible effect
+                # and the chart kept the app's brand palette. Unbinding first
+                # makes the trace's own colorscale authoritative.
+                tr.coloraxis = None
+            except Exception:
+                pass
+            try:
+                tr.colorscale = str(cs)
+            except Exception:
+                pass
+        try:
+            if not show_text:
+                tr.text = None
+                tr.texttemplate = None
+            else:
+                # Replace only the format specifier, so a runner's own
+                # hovertemplate/texttemplate structure is preserved.
+                tmpl = getattr(tr, "texttemplate", None)
+                if isinstance(tmpl, str) and "%{z" in tmpl:
+                    import re as _re
+                    tr.texttemplate = _re.sub(
+                        r"%\{z:[^}]*\}", f"%{{z:.{prec}f}}", tmpl)
+                elif isinstance(tmpl, str) and "%{text" in tmpl:
+                    # The matrix heatmap does NOT use a %{z} template: the runner
+                    # pre-formats every cell into ``text`` (abbreviating to 1.2M
+                    # / 3,400) and paints it with "%{text}". Rewriting only a
+                    # %{z:..f} specifier therefore never matched, the precision
+                    # slider did nothing at all, and it stayed silently dead.
+                    # Re-derive the labels from z at the requested precision,
+                    # keeping the same abbreviations.
+                    rebuilt = _retext_at_precision(
+                        getattr(tr, "text", None), getattr(tr, "z", None), prec)
+                    if rebuilt is not None:
+                        tr.text = rebuilt
+        except Exception:
+            pass
+        try:
+            # Always write the font, even when the trace has none yet. On a
+            # fresh px.imshow heatmap ``textfont`` is None, so guarding on
+            # ``if tf is not None`` skipped the write entirely -- the slider
+            # and the colour swatch both looked connected but did nothing,
+            # and the annotation kept whatever the generic value-label pass
+            # gave it later in this function.
+            tf = getattr(tr, "textfont", None)
+            new_tf = dict(size=int(ann_size) if ann_size is not None else 10,
+                          color=str(ann_color or "#ffffff"))
+            fam = getattr(tf, "family", None) if tf is not None else None
+            if fam:
+                new_tf["family"] = fam
+            tr.textfont = new_tf
+        except Exception:
+            pass
+
+    # -- Shared colour axis: colour-bar title / sizes / colours -------------
+    # Both routes are used because a choropleth built with px carries its
+    # colour bar on the trace while a px.imshow heatmap carries it on the
+    # colour axis, and the old app updated both. The family/weight/style come
+    # from the same _style_dict helper the axis/legend text uses, so the
+    # colour bar cannot end up in a different typeface from the chart.
+    font = _style_dict(typo.get("family", ""), typo.get("font_style", "Normal"))
+    try:
+        cb_kwargs = {
+            "tickfont": dict(size=int(lo.get("colorbar_tick_size", 10)),
+                             color=str(lo.get("colorbar_tick_color", "#94a3b8")),
+                             family=font["family"], weight=font["weight"],
+                             style=font["style"]),
+        }
+    except Exception:
+        cb_kwargs = {}
+    cb_title = str(lo.get("colorbar_title", "") or "")
+    try:
+        # The title's FONT is written even when its TEXT is empty, or
+        # "CB title sz" / "CB title clr" do nothing until a title is typed --
+        # a control that only comes alive after an unrelated field is filled
+        # reads as broken (the audit this is named after caught exactly this).
+        # No runner sets a colour-bar title of its own, so the Layout option
+        # is the single authority for it: empty text means no title.
+        cb_kwargs["title"] = dict(
+            text=cb_title,
+            font=dict(size=int(lo.get("colorbar_title_size", 11)),
+                      color=str(lo.get("colorbar_title_color", "#cbd5e1")),
+                      family=font["family"], weight=font["weight"],
+                      style=font["style"]))
+    except Exception:
+        pass
+    if cs:
+        # Traces that could not be unbound (a choropleth, or a plotly build
+        # that refuses to drop the axis) still read the shared axis, so set
+        # it too. Both are written rather than one, so the selection is
+        # honoured whichever route Plotly ends up rendering.
+        try:
+            fig.update_coloraxes(colorscale=str(cs))
+        except Exception:
+            pass
+    if cb_kwargs:
+        try:
+            fig.update_coloraxes(colorbar=cb_kwargs)
+        except Exception:
+            pass
+    # -- Colour-bar placement ----------------------------------------------
+    # Left/Right reserve a strip out of the plot domain instead of nudging the
+    # bar with a negative x, which would land it on the y tick labels.
+    # See reserve_colorbar_strip for the full reason.
+    cbpos = str(lo.get("colorbar_position", "Right") or "Right").strip().lower()
+    reserve_colorbar_strip(fig, cbpos, traces=traces, width_px=width_px)
+    for tr in traces:
+        cb = getattr(tr, "colorbar", None)
+        if cb is None:
+            continue
+        for key, val in cb_kwargs.items():
+            try:
+                setattr(cb, key, val)
+            except Exception:
+                pass
+
+
+COLORBAR_THICKNESS_PX = 30
+COLORBAR_GAP_PX = 14
+
+
+# Per-character width for the y tick labels, at the ~12px size the axis ticks
+# are drawn at. Rounded up deliberately: over-reserving costs a little width,
+# under-reserving puts text under the colour bar.
+_AXIS_CHAR_PX = 8
+_AXIS_TICK_PAD_PX = 12
+
+
+def _axis_label_need_px(fig, side="left"):
+    """Pixels the reserved column must also leave for the tick labels.
+
+    Measures whichever y axis is drawn on *side*: ``yaxis`` on the left, and
+    ``yaxis2`` on the right when the chart has a secondary axis (the dual-axis
+    Categorical bar+line chart is the case that matters).  Returns 0 when that
+    side has no axis, or the axis has its tick labels switched off.
+    """
+    try:
+        name = "yaxis2" if side == "right" else "yaxis"
+        ax = getattr(fig.layout, name, None)
+        if ax is None:
+            return 0
+        if getattr(ax, "showticklabels", None) is False:
+            return 0
+        vals = getattr(ax, "tickvals", None)
+        longest = 0
+        if vals:
+            longest = max((len(str(v)) for v in vals), default=0)
+        else:
+            for tr in getattr(fig, "data", []) or []:
+                # Only traces actually bound to THIS axis; a secondary axis
+                # would otherwise be measured using the primary axis values.
+                if str(getattr(tr, "yaxis", "") or "y") != name.replace(
+                        "yaxis", "y"):
+                    continue
+                y = getattr(tr, "y", None)
+                if y is None:
+                    continue
+                try:
+                    longest = max((len(str(v)) for v in y), default=longest)
+                except Exception:
+                    continue
+        return _AXIS_CHAR_PX * longest + _AXIS_TICK_PAD_PX
+    except Exception:
+        return _AXIS_CHAR_PX * 10 + _AXIS_TICK_PAD_PX
+
+
+def _legend_axis_need_px(fig, side):
+    """Total axis furniture a reserved strip must leave on *side*.
+
+    Two things live in the strip beside the legend, not one. The tick labels
+    (see ``_axis_label_need_px``) AND the rotated axis title
+    (``_legend_axis_title_px``), both drawn just outside the axis. Measuring
+    only the labels left the title under the legend plate, which is the
+    "Sum transaction_qty" text visibly running through the Top Left plate in
+    the Categorical preview.
+
+    A separating gap is added on top so the plate's border never sits flush
+    against the axis text.
+    """
+    try:
+        return (_axis_label_need_px(fig, side)
+                + _legend_axis_title_px(fig, side)
+                + _LEGEND_AXIS_GAP_PX)
+    except Exception:
+        return _LEGEND_AXIS_GAP_PX
+
+
+def reserve_colorbar_strip(fig, side, traces=(), width_px=None):
+    """Carve a dedicated colour-bar strip out of *fig*'s plot domain.
+
+    Same idea as ``reserve_legend_column``: shrink the x-domain on the chosen
+    side so the colour bar, the cells and the axis labels each get their own
+    non-overlapping area.
+
+    Placing the bar with a bare ``colorbar.x = -0.12`` does NOT work. Paper
+    coordinates place x=0 at the left edge of the plotting area, and the y
+    tick labels are drawn in the margin immediately to the left of that edge
+    -- so a negative x drops the bar straight on top of them. That is the
+    "colour bar and the correlation chart meshed together" report: with
+    Colorbar pos = Left the bar sat against "transaction_qty" / "unit_price".
+
+    Reserving the domain instead moves the axis labels along with the plot, so
+    the freed strip is genuinely empty and the bar can be laid in it. The
+    strip is measured from the bar's own thickness, so a thicker bar gets a
+    proportionally wider strip.
+    """
+    if side not in ("left", "right"):
+        return False
+    try:
+        thick = COLORBAR_THICKNESS_PX
+        for tr in traces or ():
+            cb = getattr(tr, "colorbar", None)
+            if cb is not None and getattr(cb, "thickness", None):
+                thick = int(cb.thickness)
+                break
+        ca = getattr(fig.layout, "coloraxis", None)
+        if ca is not None and getattr(ca.colorbar, "thickness", None):
+            thick = int(ca.colorbar.thickness)
+        need_px = float(thick) + COLORBAR_GAP_PX
+        if side == "left":
+            # The y tick labels are drawn immediately left of the axis, i.e.
+            # inside the very strip being freed. On a heatmap they are the
+            # column NAMES ("transaction_qty"), so they are long: without
+            # measuring them the strip is only wide enough for the bar itself
+            # and the labels end up underneath it. Same reasoning as
+            # _legend_need_px adding _LEGEND_AXIS_PX on the left.
+            need_px += _axis_label_need_px(fig, side)
+        w = int(width_px or 0)
+        if w > 0:
+            strip = need_px / float(w)
+        else:
+            # No width to measure against: fall back to a fraction that covers
+            # the bar plus a generous axis allowance.
+            strip = min(0.28, need_px / 300.0)
+        # Clamp so a narrow card cannot be squeezed to nothing and a very wide
+        # one does not leave an absurd gap.
+        strip = max(0.05, min(0.30, strip))
+    except Exception:
+        strip = 0.10
+    try:
+        # ``dict(fig.layout.margin)`` raises ValueError on some Plotly versions
+        # (see the note in ``reserve_legend_column``); that made the colour-bar
+        # strip overwrite l/r/t/b with bare values and reset the chart's margins.
+        m = fig.layout.margin.to_plotly_json() or {}
+    except Exception:
+        m = {}
+    if side == "left":
+        m["l"] = max(int(m.get("l") or 0), 60)
+        domain = [strip, 1.0]
+        cb_pos, cb_anchor = 0.0, "left"
+    else:
+        m["r"] = max(int(m.get("r") or 0), 60)
+        domain = [0.0, 1.0 - strip]
+        cb_pos, cb_anchor = 1.0, "right"
+    try:
+        fig.update_layout(margin=m, xaxis=dict(domain=domain))
+    except Exception:
+        return False
+    try:
+        fig.update_coloraxes(colorbar=dict(x=cb_pos, xanchor=cb_anchor))
+    except Exception:
+        pass
+    for tr in traces or ():
+        try:
+            tr.colorbar.x = cb_pos
+            tr.colorbar.xanchor = cb_anchor
+        except Exception:
+            pass
+    return True
+
+
+# Trace types Plotly never draws a legend box for. A heatmap has no legend,
+# so reserving a legend column for one only steals width from the plot.
+_NO_LEGEND_TYPES = ("heatmap",)
+
+
+def _figure_has_legend(fig):
+    """True when at least one trace will actually paint a legend box."""
+    for tr in getattr(fig, "data", []) or []:
+        if str(getattr(tr, "type", "")).lower() in _NO_LEGEND_TYPES:
+            continue
+        if getattr(tr, "showlegend", None) is False:
+            continue
+        return True
+    return False
+
+
+def _apply_pie_options(fig, lo):
+    """Apply the Pie & Donut Layout options to every pie trace on *fig*.
+
+    Guarded per trace exactly like the histogram and heatmap blocks: one Layout
+    tab serves every chart type, and a pie trace is the only thing that has a
+    ``hole``, so a bar or line trace is never handed one.
+
+    ``donut_hole`` is absolute rather than relative. The runner picks 0.45 for a
+    donut, but the option defaults to 0, and writing that default is correct --
+    it is what turns a donut back into a full pie, which is exactly what the
+    control is for.
+    """
+    for tr in getattr(fig, "data", []) or []:
+        if str(getattr(tr, "type", "")).lower() != "pie":
+            continue
+        try:
+            tr.hole = max(0.0, min(0.9, float(lo.get("donut_hole", 0.0) or 0.0)))
+        except Exception:
+            pass
+        try:
+            tr.textinfo = str(lo.get("pie_textinfo", "label+percent") or "label+percent")
+        except Exception:
+            pass
+        try:
+            tr.insidetextfont = _font_kwargs(lo.get("pie_value_size"),
+                                             lo.get("pie_value_color"))
+            tr.outsidetextfont = _font_kwargs(lo.get("pie_value_size"),
+                                              lo.get("pie_value_color"))
+        except Exception:
+            pass
+        try:
+            tr.sort = (False if str(lo.get("pie_direction", "clockwise")) == "clockwise"
+                       else True)
+            tr.direction = str(lo.get("pie_direction", "clockwise") or "clockwise")
+        except Exception:
+            pass
+        try:
+            tr.rotation = int(lo.get("pie_rotation", 0) or 0)
+        except Exception:
+            pass
+        # "Pull" is a per-slice fraction; a scalar pulls every slice, which is
+        # what the old slider implied.
+        try:
+            tr.pull = max(0.0, min(0.5, float(lo.get("pull_slices", 0.0) or 0.0)))
+        except Exception:
+            pass
+
+
+# The trace types that carry a ``marker`` object the Layout marker controls may
+# touch. The geo scatter types are here because the MAP settings page offers
+# Marker size / opacity (old CONTROLS_ADVANCED["map_plot"]); without them the
+# map's own marker controls matched no trace and were dead on the map page
+# while working on a plain scatter.
+_MARKER_TRACE_TYPES = ("scatter", "scattergl", "scattermap", "scattermapbox",
+                       "scattergeo")
+
+
+def _line_mode_with_markers(mode, want):
+    """Return *mode* with its "markers" token added or removed.
+
+    Plotly's ``mode`` is an ordered set of tokens, so toggling has to rewrite
+    the string rather than append blindly: "lines+markers" with markers off is
+    "lines" (not "lines+"), and a "markers"-only trace with them on must not
+    gain a stray "lines".
+    """
+    mode = str(mode or "")
+    has = "markers" in mode
+    if has == bool(want):
+        return mode
+    if has and not want:
+        out = mode.replace("+markers", "").replace("markers+", "")
+        out = out.replace("markers", "")
+        if not out:
+            # A markers-ONLY trace (a plain px.scatter) would be left with an
+            # empty mode, which Plotly ignores -- so the checkbox silently did
+            # nothing. The old app fell back to drawing the points as a line
+            # instead (chart_settings.py ~868), and that is what a user who
+            # unticks "Markers" actually expects to see.
+            out = "lines"
+    elif "lines" in mode:
+        # Append after "lines" so the token order stays canonical.
+        out = mode + "+markers" if mode.startswith("lines") else "markers+" + mode
+    else:
+        out = mode
+    return out.strip("+")
+
+
+def _fmt_cell(v, prec):
+    """One heatmap cell label at *prec* decimals, abbreviated like the runner.
+
+    Mirrors ``modules.analysis.matrix_table._fmt`` but takes the precision from
+    the Layout control instead of hard-coding 2, so the slider and the label
+    cannot disagree.
+    """
+    import math
+    if v is None:
+        return "\u2014"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if math.isnan(f):
+        return "\u2014"
+    if abs(f) >= 1_000_000:
+        return f"{f / 1_000_000:,.{prec}f}M"
+    if abs(f) >= 1_000:
+        return f"{f:,.{max(0, prec - 2)}f}"
+    return f"{f:,.{prec}f}"
+
+
+def _retext_at_precision(text, z, prec):
+    """Rebuild a heatmap's ``text`` array from ``z`` at *prec* decimals.
+
+    Returns None when the shape cannot be matched, so a trace whose text is
+    not a z-shaped grid is left exactly as the runner drew it.
+    """
+    if z is None or text is None:
+        return None
+    try:
+        return [[_fmt_cell(v, prec) for v in row] for row in z]
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_line_options(fig, lo):
+    """Apply the line / marker Layout options (Time Series, Scatter).
+
+    Every write is guarded on the trace actually having the attribute: a
+    trendline is a "lines"-only trace with no markers, and a bar or heatmap
+    trace has neither.
+    """
+    shape = lo.get("line_shape")
+    fill = lo.get("line_fill")
+    show_markers = lo.get("show_markers")
+    for tr in getattr(fig, "data", []) or []:
+        if str(getattr(tr, "type", "")).lower() not in _MARKER_TRACE_TYPES:
+            continue
+        if show_markers is not None:
+            try:
+                new = _line_mode_with_markers(getattr(tr, "mode", ""), show_markers)
+                if new:
+                    tr.mode = new
+            except Exception:
+                pass
+        if shape and "lines" in str(getattr(tr, "mode", "") or ""):
+            # "spline" is Plotly's name for a smooth curve; the rest map 1:1.
+            try:
+                tr.line.shape = str(shape)
+            except Exception:
+                pass
+        if fill:
+            try:
+                tr.fill = str(fill)
+            except Exception:
+                pass
+    # Marker size / opacity are shared by every point, and only matter when
+    # something actually draws markers.
+    ms = lo.get("marker_size")
+    if ms is not None:
+        try:
+            ms = int(ms)
+        except (TypeError, ValueError):
+            ms = None
+    mo = lo.get("marker_opacity")
+    if mo is not None:
+        try:
+            mo = float(mo)
+        except (TypeError, ValueError):
+            mo = None
+    if ms is None and mo is None:
+        return
+    for tr in getattr(fig, "data", []) or []:
+        if str(getattr(tr, "type", "")).lower() not in _MARKER_TRACE_TYPES:
+            continue
+        if "markers" not in str(getattr(tr, "mode", "") or ""):
+            continue
+        # A size-by-value scatter already carries a per-point size ARRAY from its
+        # runner, which is what encodes the magnitude visually. Replacing it with
+        # one scalar would flatten that encoding, so only opacity is applied.
+        if ms is not None:
+            try:
+                if not isinstance(getattr(tr.marker, "size", None), (list, tuple)):
+                    tr.marker.size = ms
+            except Exception:
+                pass
+        if mo is not None:
+            try:
+                tr.marker.opacity = mo
+            except Exception:
+                pass
+
+
+def _format_table_number(v, spec):
+    """One Pivot Table cell at the Layout tab's chosen number *spec*.
+
+    Missing values keep the em-dash the runner used, so switching the format
+    never turns a gap into the text "nan".
+    """
+    import math
+    if v is None:
+        return "\u2014"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if math.isnan(f):
+        return "\u2014"
+    try:
+        return format(f, spec)
+    except (TypeError, ValueError):
+        return str(f)
+
+
+def _apply_table_options(fig, lo, t):
+    """Apply the Pivot Table Layout options to every table trace on *fig*.
+
+    Plotly draws a table with two independent blocks -- ``header`` and
+    ``cells`` -- so every size, colour and height has to be written to the
+    right one. The stripe colours are the cell ``fill`` alternation, and
+    alignment is per COLUMN, not per trace, so both need the column layout.
+    """
+    fam = _font_stack((t or {}).get("family", "Inter"))
+    for tr in getattr(fig, "data", []) or []:
+        if str(getattr(tr, "type", "")).lower() != "table":
+            continue
+        try:
+            hdr, cells = tr.header, tr.cells
+        except Exception:
+            continue
+        for block, size_key, col_key in ((hdr, "table_header_font_size",
+                                          "table_header_color"),
+                                         (cells, "table_font_size",
+                                          "table_font_color")):
+            sz, col = lo.get(size_key), lo.get(col_key)
+            if sz is None and col is None:
+                continue
+            try:
+                d = _font_kwargs(sz, col)
+                d["family"] = fam
+                block.font = dict(d)
+            except Exception:
+                pass
+        for block, key in ((hdr, "table_header_height"), (cells, "table_row_height")):
+            val = lo.get(key)
+            if val is None:
+                continue
+            try:
+                block.height = int(val)
+            except Exception:
+                pass
+        # The first column is the row index, so it takes index align while every
+        # data column takes data align. The column COUNT comes from the data,
+        # not from the existing `align` array: the runner never sets one, so
+        # reading its length would report a single column and left-align the
+        # whole table.
+        ia, da = lo.get("table_index_align"), lo.get("table_data_align")
+        if ia or da:
+            n = 0
+            for vals in (getattr(cells, "values", None) or [],
+                         getattr(hdr, "values", None) or []):
+                try:
+                    n = max(n, len(vals))
+                except TypeError:
+                    continue
+            n = max(n, 1)
+            try:
+                cells.align = [str(ia or "left")] + [str(da or "right")] * (n - 1)
+            except Exception:
+                pass
+            try:
+                if hdr is not None and hdr.values is not None:
+                    hdr.align = str(ia or "left")
+            except Exception:
+                pass
+        ev, od = lo.get("table_stripe_even_color"), lo.get("table_stripe_odd_color")
+        if ev or od:
+            try:
+                cells.fill = dict(color=[str(od or "#0f172a"), str(ev or "#1e293b")])
+            except Exception:
+                pass
+        # -- Number format -------------------------------------------------
+        # The runner pre-formatted every cell, and a formatted string cannot be
+        # re-formatted, so this re-renders the labels from the raw numbers the
+        # runner stashed on the figure meta. Applied only when a format is
+        # actually requested AND the raw values are present, so a figure built
+        # without them keeps the labels it already has.
+        fmt = lo.get("table_number_format")
+        if fmt:
+            meta = getattr(fig, "_lytrize_meta", None) or {}
+            raw_cols = meta.get("table_raw_number_cols")
+            idx_labels = meta.get("table_index_labels")
+            if raw_cols:
+                try:
+                    spec = str(fmt)
+                    rebuilt = [list(idx_labels or [])]
+                    for col in raw_cols:
+                        rebuilt.append([_format_table_number(v, spec)
+                                        for v in col])
+                    cells.values = rebuilt
+                except Exception:
+                    pass
 
 
 def _apply_colorbar_border(fig, show_border):
@@ -419,7 +1408,54 @@ def default_layout_opts():
     # the legend AND of the colour bar/colour range.  It defaults to True
     # because that is what the charts already looked like before the toggle
     # existed -- it is a control over the current look, not a new style.
-    return {"title": "", "x_label": "", "y_label": "", "legend_title": "", "legend_labels": {}, "show_value_labels": True, "value_label_color": "#ffffff", "label_position": "outside", "bar_mode": "group", "bar_gap": 0.28, "show_grid": True, "show_border": True, "legend_position": "Top Right"}
+    # histogram_bins / histogram_opacity (Distribution, Layout tab) control the
+    # histogram bars only -- they come from the old app's histogram_bins /
+    # histogram_opacity controls (5-200 step 1 default 30; 0.1-1.0 step 0.05
+    # default 0.80). They live in the shared layout dict because there is one
+    # Layout tab for every chart type, but apply_layout() only touches traces
+    # that are actually histograms, so a box plot in the same chart is
+    # unaffected.
+    # The heatmap_* / colorbar_* options (Correlation, Layout tab) control a
+    # heatmap or matrix view. They come from the old app's control metadata
+    # (chart_settings.py _CONTROL_META): heatmap_show_text "Annotations"
+    # default True; heatmap_colorscale "RdBu"; heatmap_annotation_size 6-24
+    # step 1 default 10; heatmap_annotation_precision 0-10 step 1 default 2;
+    # heatmap_annotation_color #ffffff; colorbar_title ""; colorbar_tick_size
+    # 6-18 step 1 default 10; colorbar_tick_color #94a3b8; colorbar_title_size
+    # 8-24 step 1 default 11; colorbar_title_color #cbd5e1. As with
+    # histogram_bins/opacity, they live in the shared layout dict because
+    # there is one Layout tab for every chart type, but apply_display_options()
+    # only touches traces that are actually heatmaps/choropleths.
+    # The line/pie/marker/table/map option groups below come from the old app's
+    # _CONTROL_META for the chart types that were migrated after the first four.
+    # Same reasoning as the histogram and heatmap groups: one Layout tab serves
+    # every chart type, so they share the layout dict and are applied under a
+    # per-trace guard that only matches the trace types they can affect.
+    #
+    # Pie & Donut (pie_chart): donut_hole 0-0.9 default 0; pie_textinfo one of
+    # [label, percent, value, label+percent, label+value] default label+percent;
+    # pull_slices 0-0.5 step 0.01 default 0; pie_rotation 0-360 step 1 default
+    # 0; pie_direction clockwise/counterclockwise default clockwise;
+    # pie_value_size 6-24 default 11; pie_value_color #e2e8f0.
+    #
+    # Time Series / Scatter: line_shape linear/spline/hv/vh/hvh/vhv default
+    # linear; line_fill none/tozeroy/tozerox/tonexty/tonextx default none;
+    # show_markers default True; marker_opacity 0.1-1.0 step 0.05 default 0.8;
+    # marker_size 2-30 step 1 default 6; render_mode svg/webgl default svg.
+    #
+    # Matrix Table: table_font_size 8-24 default 11; table_header_font_size 8-24
+    # default 12; table_row_height 16-60 default 26; table_header_height 16-60
+    # default 28; table_index_align left/center/right default left;
+    # table_data_align left/center/right default right; table_number_format one
+    # of the old d3-format strings default ",.2f"; table_font_color #f1f5f9;
+    # table_header_color #6163df; table_stripe_even_color #1e293b;
+    # table_stripe_odd_color #0f172a.
+    #
+    # Map Plot: show_colorbar default True and size_by_value default False, both
+    # per old _CONTROL_META. map_plot already routes its own colour scale
+    # through the shared colorbar_* / heatmap_colorscale keys, which is why they
+    # are not repeated here.
+    return {"title": "", "x_label": "", "y_label": "", "legend_title": "", "legend_labels": {}, "show_value_labels": True, "value_label_color": "#ffffff", "label_position": "outside", "bar_mode": "group", "bar_gap": 0.28, "histogram_bins": 30, "histogram_opacity": 0.80, "show_grid": True, "show_border": True, "legend_position": "Top Right", "heatmap_show_text": True, "heatmap_colorscale": "RdBu", "heatmap_annotation_size": 10, "heatmap_annotation_precision": 2, "heatmap_annotation_color": "#ffffff", "colorbar_position": "Right", "colorbar_title": "", "colorbar_tick_size": 10, "colorbar_tick_color": "#94a3b8", "colorbar_title_size": 11, "colorbar_title_color": "#cbd5e1", "donut_hole": 0.0, "pie_textinfo": "label+percent", "pull_slices": 0.0, "pie_rotation": 0, "pie_direction": "clockwise", "pie_value_size": 11, "pie_value_color": "#e2e8f0", "line_shape": "linear", "line_fill": "none", "show_markers": True, "marker_opacity": 0.8, "marker_size": 6, "render_mode": "svg", "table_font_size": 11, "table_header_font_size": 12, "table_row_height": 26, "table_header_height": 28, "table_index_align": "left", "table_data_align": "right", "table_number_format": ",.2f", "table_font_color": "#f1f5f9", "table_header_color": "#6163df", "table_stripe_even_color": "#1e293b", "table_stripe_odd_color": "#0f172a", "show_colorbar": True, "size_by_value": False}
 
 def default_typo_opts():
     # Sizes mirror the readouts on the Typography Options tab of
@@ -588,6 +1624,13 @@ def apply_display_options(fig, layout_opts=None, typo_opts=None,
     new options on top of an already-styled figure would compound.
     """
     f2 = copy.deepcopy(fig)
+    # Plotly's Figure does not deepcopy its custom attributes, so the runners'
+    # ``_lytrize_meta`` is dropped by the copy. The Pivot Table's raw numbers
+    # ride in there, and without this the "Num format" control had nothing to
+    # re-render from the moment it was applied.
+    _meta = getattr(fig, "_lytrize_meta", None)
+    if _meta is not None and getattr(f2, "_lytrize_meta", None) is None:
+        f2._lytrize_meta = copy.deepcopy(_meta)
     lo = dict(default_layout_opts())
     lo.update(layout_opts or {})
     t = dict(default_typo_opts())
@@ -600,6 +1643,12 @@ def apply_display_options(fig, layout_opts=None, typo_opts=None,
         f2.update_layout(xaxis=dict(title=dict(text=lo["x_label"])))
     if lo.get("y_label"):
         f2.update_layout(yaxis=dict(title=dict(text=lo["y_label"])))
+    # The dual-axis (secondary) label. Categorical -- and time series later --
+    # can draw a right-hand axis; the old display layer wrote y2_label to
+    # ``yaxes(secondary_y=True)`` (chart_settings.py ~1113). Only written when
+    # non-empty so a chart whose runner set its own right-axis title keeps it.
+    if lo.get("y2_label"):
+        f2.update_layout(yaxis2=dict(title=dict(text=lo["y2_label"])))
     if lo.get("legend_title"):
         f2.update_layout(legend=dict(title=dict(text=lo["legend_title"])))
     labels = lo.get("legend_labels") or {}
@@ -618,6 +1667,62 @@ def apply_display_options(fig, layout_opts=None, typo_opts=None,
     except Exception:
         pass
 
+    # -- Histogram geometry (Distribution only) ----------------------------
+    # Guarded per trace, exactly like the old app's `if ttype == "histogram"`
+    # check: a distribution chart can also draw box plots, and bins/opacity
+    # are meaningless (and Plotly-invalid) on those.
+    _bins = lo.get("histogram_bins")
+    if _bins is not None:
+        try:
+            _bins = max(1, int(round(float(_bins))))
+        except Exception:
+            _bins = None
+    if _bins is not None:
+        try:
+            _op = float(lo.get("histogram_opacity", 0.80))
+        except Exception:
+            _op = 0.80
+        for tr in f2.data:
+            # The trace name "histogram" is how Plotly names a Histogram
+            # trace type; checking it is safer than isinstance() alone
+            # because figure copies can come back as BaseTraceType.
+            if type(tr).__name__ != "Histogram":
+                continue
+            try:
+                # Plotly removed the old `nbins` shorthand: the bin count now
+                # lives on nbinsx / nbinsy, chosen by the axis the data sits
+                # on. Setting the right one matters -- assigning the other
+                # would bin against the wrong axis.
+                has_x = getattr(tr, "x", None) is not None
+                has_y = getattr(tr, "y", None) is not None
+                if has_x and not has_y:
+                    tr.nbinsx = _bins
+                    tr.nbinsy = None
+                elif has_y and not has_x:
+                    tr.nbinsy = _bins
+                    tr.nbinsx = None
+                else:
+                    tr.nbinsx = _bins
+                    tr.nbinsy = _bins
+            except Exception:
+                pass
+            try:
+                tr.opacity = _op
+            except Exception:
+                pass
+
+    # -- Heatmap / colour-bar options (Correlation, Matrix Heatmap) ----------
+    # Guarded per trace exactly like the histogram block above, and for the
+    # same reason: one Layout tab serves every chart type, and these options
+    # are meaningless (and largely Plotly-invalid) on a bar or line trace.
+    _apply_heatmap_options(f2, lo, t, width_px=width_px)
+
+    # -- Pie / line / marker / table options (Pie, Time Series, Scatter, Pivot)
+    # Same per-trace guarding as the two blocks above, for the same reason.
+    _apply_pie_options(f2, lo)
+    _apply_line_options(f2, lo)
+    _apply_table_options(f2, lo, t)
+
     # -- Grid -------------------------------------------------------------
     sg = lo.get("show_grid", True)
     f2.update_layout(xaxis=dict(showgrid=bool(sg)), yaxis=dict(showgrid=bool(sg)))
@@ -633,7 +1738,13 @@ def apply_display_options(fig, layout_opts=None, typo_opts=None,
     # legend plate and the colour bar / colour range.  Default True keeps
     # the look charts already had, so this only changes when unchecked.
     show_border = bool(lo.get("show_border", True))
-    if place:
+    # Only reserve a legend column when a legend is really drawn. A heatmap
+    # (correlation) has none, yet ``legend_position`` still carries a default,
+    # so this used to reserve a column for a legend that never appears -- and
+    # because it writes xaxis.domain it also clobbered the colour-bar strip
+    # reserved moments earlier, which is why a left-hand colour bar ended up
+    # on top of the y tick labels.
+    if place and _figure_has_legend(f2):
         side, ly, lyanchor = place
         # Reserve the column AFTER the xaxis showgrid/title updates above,
         # so this domain is not clobbered by a later update_layout.
@@ -642,7 +1753,14 @@ def apply_display_options(fig, layout_opts=None, typo_opts=None,
         # legend renames already happened above, so the trace names on f2 are
         # the final ones (no need to thread them in from the caller), and the
         # legend title comes from the layout options.
-        reserve_legend_column(
+        #
+        # ``apply_legend_layout`` is the shared entry point (the same one the
+        # widget's resize refit calls), so a chart first drawn at an assumed
+        # width and then refit to its real width always ends up on the same
+        # rule rather than two different ones. When a width is known it may
+        # also return a horizontal band instead of a column; the anchors are
+        # written after, so they win in that case and the band stays put.
+        apply_legend_layout(
             f2, lp,
             names=[getattr(tr, "name", "") for tr in f2.data
                    if getattr(tr, "showlegend", True) is not False],
@@ -679,7 +1797,15 @@ def apply_display_options(fig, layout_opts=None, typo_opts=None,
             except Exception:
                 pass
             try:
-                tr.textfont = dict(color=vcolor)
+                # A heatmap's in-cell text is sized and coloured by the
+                # heatmap_* Layout options, which were applied EARLIER in this
+                # same function. This generic pass must not undo them, so
+                # heatmap/choropleth traces are left alone entirely. Every
+                # other trace type has no annotation options of its own and
+                # still takes the shared value-label colour.
+                if str(getattr(tr, "type", "")).lower() not in ("heatmap",
+                                                                "choropleth"):
+                    tr.textfont = dict(color=str(vcolor))
             except Exception:
                 pass
             # An "outside" label on the tallest bar is drawn ABOVE the bar,
@@ -698,6 +1824,30 @@ def apply_display_options(fig, layout_opts=None, typo_opts=None,
                 # 'none' keeps the trace's text data intact (so switching
                 # back on can restore it) while hiding it from the plot.
                 tr.textposition = "none"
+            except Exception:
+                pass
+
+    # -- Line width (Layout tab, categorical + the line-drawing types) ------
+    # Old _CONTROL_META: slider 1..10 default 2, applied to every trace whose
+    # mode contains "lines" (chart_settings.py ~862). For categorical that is
+    # the Secondary Y-Axis overlay the runner draws as lines+markers; a
+    # bar-only figure has no line trace and is untouched -- exactly how the
+    # old app behaved. Kept as its own guarded pass so a bar/heatmap trace
+    # never sees an attribute it does not have.
+    lw = lo.get("line_width")
+    if lw is not None:
+        try:
+            lw = int(lw)
+        except (TypeError, ValueError):
+            lw = None
+    if lw is not None:
+        for tr in f2.data:
+            if str(getattr(tr, "type", "")).lower() not in _MARKER_TRACE_TYPES:
+                continue
+            if "lines" not in str(getattr(tr, "mode", "") or ""):
+                continue
+            try:
+                tr.line.width = lw
             except Exception:
                 pass
 

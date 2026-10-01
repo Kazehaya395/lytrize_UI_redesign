@@ -4,8 +4,30 @@ from typing import Dict, Optional, Type
 from PySide6.QtWidgets import QWidget
 from .base import AnalysisSettingsBase
 from .statistical import StatisticalSettings
+from .distribution import DistributionSettings
+from .correlation import CorrelationSettings
+from .categorical import CategoricalSettings
+from .pie_chart import PieChartSettings
+from .time_series import TimeSeriesSettings
+from .scatter_plot import ScatterPlotSettings
+from .matrix_heatmap import MatrixHeatmapSettings
+from .matrix_table import MatrixTableSettings
+from .map_plot import MapPlotSettings
+
+# Every analysis type the old app declared, in ``chart_settings.py`` order. The
+# chain is deliberate: each builder inherits the nearest one whose tab shape it
+# shares, so a shared control is defined once (see each module's docstring).
 _REGISTRY: Dict[str, Type[AnalysisSettingsBase]] = {}
 _REGISTRY['statistical'] = StatisticalSettings
+_REGISTRY['distribution'] = DistributionSettings
+_REGISTRY['correlation'] = CorrelationSettings
+_REGISTRY['categorical'] = CategoricalSettings
+_REGISTRY['pie_chart'] = PieChartSettings
+_REGISTRY['time_series'] = TimeSeriesSettings
+_REGISTRY['scatter_plot'] = ScatterPlotSettings
+_REGISTRY['matrix_heatmap'] = MatrixHeatmapSettings
+_REGISTRY['matrix_table'] = MatrixTableSettings
+_REGISTRY['map_plot'] = MapPlotSettings
 def register(aid: str, cls: Type[AnalysisSettingsBase]) -> None:
     _REGISTRY[aid] = cls
 def get_builder(aid: str, parent: QWidget | None = None, **ctx):

@@ -30,6 +30,7 @@ from desktop.theme import PAGE_MARGINS
 from desktop.session_bridge import SessionBridge
 from desktop.widgets.chart_card import ChartCard
 from desktop.widgets.kpi_card import KpiCard
+from desktop.widgets.tiling_canvas import TilingCanvas, DEFAULT_ROW_HEIGHT
 from desktop.workers import ExportWorker
 from services.export_service import build_export_report, build_export_charts
 from services.chart_service import safe_filename, num_cols
@@ -57,6 +58,122 @@ _STYLE_DEFAULTS = {
     "ex_notes_size": 14, "ex_notes_color": "#f5f7ff",
 }
 
+# The colour keys above are the EXPORT palette: the report is a standalone
+# file, so its colours must not depend on whatever theme the app happens to be
+# in when it is written. That is also why they are hard-coded dark -- light
+# mode never touched them.
+#
+# The LIVE dashboard, though, sits inside the app's own window. Painting those
+# same dark export colours onto it is what made light mode look broken: a
+# near-black card (#1b2245) with #f5f7ff text, on a #f1f5f9 window. In dark mode
+# the two palettes happened to coincide, so the bug was invisible.
+#
+# So: the live view derives its colours from the active theme, and only a key
+# the user has EXPLICITLY overridden keeps its stored value. Anything still at
+# its default follows the theme.
+_THEME_DERIVED_COLORS = {
+    "ex_bg": "window_bg",
+    "ex_card": "card_bg",
+    "ex_kpi": "card_bg",
+    "ex_border": "border",
+    "ex_text": "text",
+    "ex_kpi_text_color": "text",
+    "ex_notes_color": "text",
+    "ex_accent": "accent",
+    "ex_not_bg": "input_bg",
+    "ex_not_bd": "accent",
+    "ex_title_color": "accent",
+}
+
+# Colour keys the dashboard's own picker writes, tracked so a live re-theme can
+# tell "the user chose this" from "nobody has chosen this yet".
+_OVERRIDABLE_COLORS = tuple(_THEME_DERIVED_COLORS)
+
+
+def _resolve_live_style(bridge, mode: Optional[str] = None) -> dict:
+    """The style dict the LIVE dashboard paints with, for the given theme.
+
+    Numeric / font / density keys pass straight through. Colour keys resolve to
+    the active theme's token UNLESS the user has explicitly picked a value, in
+    which case their choice wins -- picking a colour is a deliberate act and
+    must not be silently reverted by a later theme toggle.
+
+    Export keeps using the raw stored dict (see _on_export), so a report always
+    looks the same regardless of the theme it was written under.
+    """
+    mode = mode or _theme_mod.current_mode()
+    out: dict = {}
+    for key, default in _STYLE_DEFAULTS.items():
+        stored = bridge.get(key, default)
+        if key in _THEME_DERIVED_COLORS and not _is_user_override(bridge, key, stored):
+            # resolve_color, not mode_tokens: 'accent' is a SHARED constant
+            # rather than a per-mode token, but it still has a light value
+            # (#4f46e5) that resolve_color knows about. Reading mode_tokens
+            # directly would miss it and leave the accent -- and so the chart
+            # and dashboard titles -- on the dark-mode shade.
+            out[key] = _theme_mod.resolve_color(_THEME_DERIVED_COLORS[key], mode)
+        else:
+            out[key] = stored
+    return out
+
+
+def _load_saved_tiles(sm: dict) -> dict:
+    """Per-card tiling geometry saved with a session, or {} when absent.
+
+    Stored inside the existing ``grid_fullwidth_json`` blob rather than a new DB
+    column: it is the same concept (per-card grid placement) and the session
+    schema already carries it, so this needs no migration. The legacy
+    full-width map is honoured too, so a session saved by the pre-tiling build
+        still opens with its wide charts spanning the full row instead of
+        silently losing that choice.
+    """
+    try:
+        raw = json.loads(sm.get("grid_fullwidth_json", "{}"))
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+
+    cols = int(sm.get("grid_cols_n", 2) or 2)
+    cols = max(1, cols)
+    tiles: dict = {}
+    for uid, val in raw.items():
+        if isinstance(val, dict) and "x" in val:
+            tiles[uid] = {"x": int(val.get("x", 0)), "y": int(val.get("y", 0)),
+                          "w": int(val.get("w", 1)), "h": int(val.get("h", 1))}
+        elif val:
+            # Legacy boolean: "this chart spans the whole row".
+            tiles[uid] = {"x": 0, "y": -1, "w": cols, "h": 1}
+    return _densify_legacy_tiles(tiles, cols)
+
+
+def _densify_legacy_tiles(tiles: dict, cols: int) -> dict:
+    """Give legacy full-width entries a real row index.
+
+    They were stored with y=-1 because the old grid worked out rows itself.
+    Placing them in list order from the top preserves the arrangement those
+    sessions were saved with.
+    """
+    out: dict = {}
+    y = 0
+    for uid, g in tiles.items():
+        if g["y"] < 0:
+            out[uid] = {"x": 0, "y": y, "w": cols, "h": 1}
+            y += 1
+        else:
+            out[uid] = g
+    return out
+
+
+def _is_user_override(bridge, key: str, stored) -> bool:
+    """True when *stored* differs from the built-in default.
+
+    The picker is the only writer of these keys, so "differs from default" is
+    exactly "the user set it". Kept as a helper because the same question is
+    asked for every colour on every re-theme.
+    """
+    return stored != _STYLE_DEFAULTS.get(key)
+
 
 class DashboardPage(QWidget):
     """Dashboard page: chart grid, KPIs, and export."""
@@ -70,6 +187,7 @@ class DashboardPage(QWidget):
         self._kpi_widgets: list[KpiCard] = []
         self._color_swatches: dict[str, QPushButton] = {}
         self._viewing_saved = False
+        self._kpi_drag_index = None
 
         self._build_ui()
         self._connect_signals()
@@ -130,13 +248,15 @@ class DashboardPage(QWidget):
         self.kpi_row_layout.setSpacing(10)
         right_layout.addWidget(self.kpi_row_container)
 
+        # Free-form tiling surface. Cards are positioned absolutely by the
+        # canvas from a per-card grid geometry, so there is deliberately no
+        # QGridLayout here any more -- a layout would fight every
+        # setGeometry() and cap what a card may be sized to.
         self.charts_scroll = QScrollArea()
         self.charts_scroll.setWidgetResizable(True)
-        self.charts_container = QWidget()
-        self.charts_layout = QGridLayout(self.charts_container)
-        self.charts_layout.setContentsMargins(0, 0, 0, 0)
-        self.charts_layout.setSpacing(12)
-        self.charts_scroll.setWidget(self.charts_container)
+        self.tiling_canvas = TilingCanvas()
+        self.charts_scroll.setWidget(self.tiling_canvas)
+        self.tiling_canvas.layout_changed.connect(self._on_tiling_changed)
         right_layout.addWidget(self.charts_scroll, stretch=1)
 
         self.lbl_empty = QLabel("No charts yet. Go to Analysis to generate some!")
@@ -440,11 +560,23 @@ class DashboardPage(QWidget):
         self.bridge.theme_changed.connect(self._on_theme_changed)
 
     def _on_theme_changed(self, _mode: str) -> None:
-        """Re-colour the chart tiles after a dark<->light switch.
+        """Re-colour everything after a dark<->light switch.
 
-        A chart's canvas is painted by the figure / plot page, not by the app
-        stylesheet, so each open view re-themes and repaints in place
-        (Plotly.react -- no reload, no rebuild, no regeneration).
+        Two different surfaces have to be re-pointed, and only doing the first
+        one is why light mode looked broken here:
+
+        1. The chart CANVAS is painted by the figure / plot page, not by the app
+           stylesheet, so each open view re-themes and repaints in place
+           (Plotly.react -- no reload, no rebuild, no regeneration).
+        2. The card and KPI SURFACES are painted by a per-widget stylesheet
+           written from the style dict (see KpiCard.apply_style /
+           ChartCard.apply_style). Those are set explicitly, so the app
+           stylesheet swap cannot touch them -- they have to be re-applied from
+           the newly resolved palette or the tiles keep the old theme's colours.
+
+        The swatches in the style panel are refreshed too, otherwise the panel
+        would show the previous theme's colours while claiming to control the
+        new ones.
         """
         for card in self._chart_cards.values():
             try:
@@ -452,13 +584,34 @@ class DashboardPage(QWidget):
             except Exception:
                 log.debug("chart theme repaint failed", exc_info=True)
 
+        # Re-apply surfaces from the new theme's resolved palette.
+        self._apply_style_to_cards()
+
+        # Show the picker the values that are actually in effect now.
+        try:
+            self._sync_style_widgets_from_bridge()
+        except Exception:
+            log.debug("style widget sync failed", exc_info=True)
+
     # -- Style controls -------------------------------------------------
 
-    def _current_style_dict(self) -> dict:
-        """Single source of truth for the 23 export-style keys, read from
-        the bridge with defaults -- used by export, by the live-apply
-        path, and available for anything else that needs current styling."""
-        return {key: self.bridge.get(key, default) for key, default in _STYLE_DEFAULTS.items()}
+    def _current_style_dict(self, *, for_export: bool = False) -> dict:
+        """Current values for the 23 style keys.
+
+        Default is the LIVE view: colours follow the active theme unless the
+        user picked one (see _resolve_live_style). Pass ``for_export=True`` for
+        the raw stored values, which is what the report must be written from --
+        the exported file has to stand on its own, so it cannot follow an app
+        theme that will not exist when the file is opened.
+        """
+        if for_export:
+            return {key: self.bridge.get(key, default)
+                    for key, default in _STYLE_DEFAULTS.items()}
+        return _resolve_live_style(self.bridge)
+
+    def _export_style_dict(self) -> dict:
+        """Style dict for the exported report (theme-independent)."""
+        return self._current_style_dict(for_export=True)
 
     def _on_field_changed(self, key: str, value) -> None:
         """Any style control (color, font, size, checkbox...) calls this
@@ -519,10 +672,106 @@ class DashboardPage(QWidget):
             card.move_up_requested.connect(self._on_move_kpi_up)
             card.move_down_requested.connect(self._on_move_kpi_down)
             card.remove_requested.connect(self._on_remove_kpi)
+            card.drag_started.connect(self._on_kpi_drag_started)
+            card.drag_moved.connect(self._on_kpi_drag_moved)
+            card.drag_ended.connect(self._on_kpi_drag_ended)
             self.kpi_row_layout.addWidget(card)
             self._kpi_widgets.append(card)
         self.kpi_row_layout.addStretch()
         self.kpi_row_container.setVisible(bool(kpis))
+
+    # -- KPI drag-to-reorder ----------------------------------------------
+    # The arrow buttons stay as the accessible peer to dragging. While a drag is
+    # in progress the cards are shown in their tentative new order WITHOUT
+    # rebuilding them, so the drop is visible as it happens; the bridge is only
+    # written on release. Rebuilding on every mouse-move would recreate every
+    # KpiCard mid-gesture and kill the drag.
+
+    def _on_kpi_drag_started(self, index: int, _pos) -> None:
+        self._kpi_drag_index = index
+
+    def _on_kpi_drag_moved(self, _index: int, pos) -> None:
+        """Show the tentative position: swap the dragged card with whichever
+        sibling is currently under the cursor."""
+        idx = getattr(self, "_kpi_drag_index", None)
+        if idx is None or not self._kpi_widgets:
+            return
+        target = self._kpi_index_at(pos.x())
+        if target is None or target == idx:
+            return
+        order = list(range(len(self._kpi_widgets)))
+        order.insert(target, order.pop(idx))
+        self._kpi_layout_order(order)
+
+    def _kpi_index_at(self, x: int) -> Optional[int]:
+        """Which KPI slot contains global x, or None if the cursor is outside
+        the row entirely.
+
+        Deliberately does NOT hit-test widget geometry. The layout only assigns
+        real geometries once its page is actually shown, so a card that has not
+        been laid out yet still reports its 640x480 construction size and every
+        card reports the same origin -- hit-testing that yields either "always
+        slot 0" or no answer at all. Instead the row is treated as n evenly
+        divided slots across its own rectangle, which is valid regardless of
+        whether Qt has run the layout.
+
+        Slots follow the CURRENT visual order, not self._kpi_widgets: mid-drag
+        the layout holds the tentative order, so testing the widget list would
+        keep resolving against the pre-drag positions.
+        """
+        widgets = self._current_kpi_visual_order()
+        n = len(widgets)
+        if not n:
+            return None
+        left = self.kpi_row_container.mapToGlobal(
+            self.kpi_row_container.rect().topLeft()).x()
+        width = self.kpi_row_container.width()
+        if width <= 0:
+            return None
+        if not (left <= x < left + width):
+            return None
+        return min(n - 1, int((x - left) * n / width))
+
+    def _kpi_layout_order(self, order: list) -> None:
+        """Re-add the existing cards in *order* (no widget is recreated)."""
+        for w in self._kpi_widgets:
+            self.kpi_row_layout.removeWidget(w)
+        for i in order:
+            self.kpi_row_layout.addWidget(self._kpi_widgets[i])
+        self.kpi_row_layout.addStretch()
+        # Apply the layout NOW rather than waiting for the next event-loop
+        # pass: _kpi_index_at hit-tests real widget geometry, so a stale layout
+        # makes the drag keep resolving against the pre-drag positions and the
+        # reorder never advances past the first step.
+        self.kpi_row_layout.activate()
+
+    def _on_kpi_drag_ended(self, index: int) -> None:
+        """Commit the drop: write the visual order to the bridge and rebuild."""
+        self._kpi_drag_index = None
+        kpis = list(self.bridge.get("kpis", []))
+        if not (0 <= index < len(kpis)) or not self._kpi_widgets:
+            self._refresh_kpis()
+            return
+        # The widgets were re-added in the tentative order, so their current
+        # layout order IS the answer.
+        order = self._current_kpi_visual_order()
+        if order != list(range(len(kpis))):
+            self.bridge.set("kpis", [kpis[i] for i in order])
+        self._refresh_kpis()
+
+    def _current_kpi_visual_order(self) -> list:
+        """The KPI indices in the order they currently sit in the layout.
+
+        Read back from the layout itself rather than tracked in a parallel list,
+        because the drag re-adds widgets without recreating them -- the layout
+        is the only thing that knows the current order.
+        """
+        pos = {}
+        for slot in range(self.kpi_row_layout.count()):
+            w = self.kpi_row_layout.itemAt(slot).widget()
+            if w is not None and hasattr(w, "_index"):
+                pos[w._index] = slot
+        return [i for i, _ in sorted(pos.items(), key=lambda kv: kv[1])]
 
     def _on_add_kpi(self) -> None:
         """Open a small dialog to add a KPI card: pick a numeric column
@@ -626,10 +875,11 @@ class DashboardPage(QWidget):
         dash_title = self.dash_title.text().strip() or session_name
         orientation = "landscape" if self.layout_mode.currentText() == "Landscape" else "portrait"
 
-        # Build export state from session -- same dict the live preview
-        # uses (_current_style_dict), so the exported file matches what
-        # was shown on screen while editing.
-        state = self._current_style_dict()
+        # Build export state from session. Deliberately NOT the live
+        # (theme-following) dict: the report is a standalone file, so it is
+        # written from the stored values and looks identical no matter which
+        # app theme was active when it was exported.
+        state = self._export_style_dict()
 
         # Build export charts with meta and notes
         meta_map = {
@@ -654,6 +904,7 @@ class DashboardPage(QWidget):
             kpis=self.bridge.get("kpis", []),
             dashboard_title=dash_title,
             grid_cols_n=int(self.bridge.get("grid_cols_n", 2)),
+            tile_geometry=self.tiling_canvas.geometry_map(),
             parent=self,
         )
         self._export_worker.finished_ok.connect(self._on_export_finished)
@@ -688,7 +939,7 @@ class DashboardPage(QWidget):
         session_name = self.session_name.text().strip() or "Lytrize Report"
         dash_title = self.dash_title.text().strip() or session_name
         orientation = "landscape" if self.layout_mode.currentText() == "Landscape" else "portrait"
-        state = self._current_style_dict()
+        state = self._export_style_dict()
 
         meta_map = {uid: self.bridge.get_chart_meta(uid) for uid, _, _ in charts}
         notes = {uid: self.bridge.get_note(uid) for uid, _, _ in charts}
@@ -704,6 +955,7 @@ class DashboardPage(QWidget):
             kpis=self.bridge.get("kpis", []),
             dashboard_title=dash_title,
             grid_cols_n=int(self.bridge.get("grid_cols_n", 2)),
+            tile_geometry=self.tiling_canvas.geometry_map(),
             parent=self,
         )
         self._export_worker.finished_ok.connect(self._on_export_finished)
@@ -892,7 +1144,10 @@ class DashboardPage(QWidget):
 
         df = self.bridge.df
         grid_cols_n = int(self.bridge.get("grid_cols_n", 2))
-        grid_fullwidth_json = json.dumps(self.bridge.get("grid_fullwidth", {}))
+        # The tiling canvas is the live arrangement, so save what IT holds --
+        # reading grid_fullwidth here would persist the old boolean map and
+        # throw away everything the user dragged or resized.
+        grid_fullwidth_json = json.dumps(self.tiling_canvas.geometry_map())
         # The 23-key style dict (colors, typography, layout density from
         # the dashboard style panel) was being read/applied correctly
         # during a live session but never persisted at all -- the DB
@@ -906,7 +1161,11 @@ class DashboardPage(QWidget):
         # matching _current_style_dict()/_STYLE_DEFAULTS exactly is
         # simpler to keep correct than a hand-maintained translation
         # layer between two different key-naming conventions.
-        export_colours_json = json.dumps(self._current_style_dict())
+        # Raw stored values, NOT the live theme-following dict: persisting the
+        # resolved light-mode colours would turn them into what looks like a
+        # deliberate user override on the next load, so the dashboard would
+        # stick to light colours after switching back to dark.
+        export_colours_json = json.dumps(self._export_style_dict())
         try:
             if editing_sid:
                 # Update existing session.
@@ -982,82 +1241,61 @@ class DashboardPage(QWidget):
     # -- Chart management ---------------------------------------------------
 
     def _refresh_charts(self) -> None:
-        """Rebuild the chart cards from the session bridge in a grid layout.
+        """Rebuild the chart cards from the session bridge onto the tiling canvas.
 
-        Incremental on purpose: only the cards whose chart disappeared are
-        destroyed, and the surviving ones are re-gridded in place.  A
-        ChartCard owns a ``QWebEngineView``, so rebuilding every tile reloads
-        the plotly.js shell for each chart and flashes the whole grid -- the
-        same "the app reopened itself" bug the Analysis page had on Generate.
+        Still incremental: a ChartCard owns a ``QWebEngineView``, so rebuilding
+        every tile reloads the plotly.js shell for each chart and flashes the
+        whole board -- the same "the app reopened itself" bug the Analysis page
+        had on Generate. Surviving cards are reused and re-placed.
+
+        Placement is the canvas's job now. This method's remaining
+        responsibility is: which cards exist, what state they hold, and what
+        grid they snap to.
         """
         charts = self.bridge.get("charts", [])
         wanted = [c[0] for c in charts]
 
-        # Detach every card from the grid (they are re-placed below); drop
-        # only the ones whose chart is gone.
-        for i in reversed(range(self.charts_layout.count())):
-            item = self.charts_layout.itemAt(i)
-            if item is None:
-                continue
-            w = item.widget()
-            if w is None:
-                self.charts_layout.takeAt(i)
-                continue
-            if getattr(w, "uid", None) in wanted:
-                self.charts_layout.removeWidget(w)
-                continue
-            self.charts_layout.takeAt(i)
-            self._chart_cards.pop(getattr(w, "uid", None), None)
-            w.deleteLater()
+        # Drop only the cards whose chart is gone. Surviving cards stay parented
+        # to the canvas (the canvas owns their geometry now, so there is no
+        # layout to detach them from).
+        for uid in list(self._chart_cards):
+            if uid not in wanted:
+                card = self._chart_cards.pop(uid)
+                self.tiling_canvas.remove_card(uid)
+                card.deleteLater()
 
         self.lbl_empty.setVisible(len(charts) == 0)
 
-        # layout_mode still reflects Portrait/Landscape (used for export
-        # page orientation, not grid column count -- see grid_cols_n below).
+        # layout_mode still reflects Portrait/Landscape (export page
+        # orientation, not the grid column count -- see grid_cols below).
         view_sid = self.bridge.get("view_session_id")
         sm = None
         if view_sid:
             # Loaded saved session: use its saved layout mode + grid state
             user_id = self.bridge.get("user_id")
             sm = get_session_meta(view_sid, user_id) if user_id else None
-            layout_mode = sm.get("layout_mode", "portrait") if sm else "portrait"
         else:
-            # Current session: use selected mode
-            layout_mode = "landscape" if self.layout_mode.currentText() == "Landscape" else "portrait"
+            self.layout_mode.setCurrentText(
+                "Landscape" if self.bridge.get("layout_mode") == "landscape"
+                else "Portrait")
 
         if sm:
-            # Viewing a saved session: grid layout comes from what was
-            # actually saved with it, not from whatever the live bridge
-            # happens to hold (which could be leftover state from a
-            # previous, different session).
+            # Viewing a saved session: the grid comes from what was actually
+            # saved with it, not from leftover live-bridge state that could be
+            # from a previous, different session.
             grid_cols = int(sm.get("grid_cols_n", 2))
-            try:
-                fullwidth_map = json.loads(sm.get("grid_fullwidth_json", "{}"))
-            except (json.JSONDecodeError, TypeError):
-                fullwidth_map = {}
+            saved_tiles = _load_saved_tiles(sm)
         else:
             grid_cols = int(self.bridge.get("grid_cols_n", 2))
-            fullwidth_map = dict(self.bridge.get("grid_fullwidth", {}))
+            saved_tiles = self.bridge.get("tile_geometry", {}) or {}
 
-        # Explicit equal stretch per column -- verified empirically that
-        # Qt's default (no stretch factors set) happens to distribute
-        # space evenly for this app's current card content, including an
-        # asymmetric-content test (one card with a very long note vs a
-        # plain one still split 50/50). Setting this explicitly removes
-        # the "happens to work out today" reliance so it can't quietly
-        # become uneven if a future card's content grows a much larger
-        # natural size hint than its neighbors.
-        for i in range(max(grid_cols, 1)):
-            self.charts_layout.setColumnStretch(i, 1)
+        self.tiling_canvas.set_columns(grid_cols)
+        # Row height follows the dashboard's "Chart height" setting so the
+        # visual tiling grid and the cards agree on what one row is.
+        self.tiling_canvas.set_row_height(
+            int(self.bridge.get("ex_chart_h", DEFAULT_ROW_HEIGHT)))
 
-        # Add chart cards in grid. A running row/col cursor (not simple
-        # idx // grid_cols division) is needed because a full-width chart
-        # breaks the regular wrapping pattern -- it flushes whatever row
-        # is in progress, takes an entire row by itself, and the next
-        # chart starts fresh on the row after it.
-        row = 0
-        col = 0
-        for idx, (uid, title, fig) in enumerate(charts):
+        for uid, title, fig in charts:
             chart_type = self.bridge.get(f"chart_type_{uid}", "")
             meta = self.bridge.get_chart_meta(uid)
             note = self.bridge.get_note(uid)
@@ -1070,47 +1308,113 @@ class DashboardPage(QWidget):
                 card.note_changed.connect(self._on_note_changed)
                 card.style_changed.connect(self._on_style_changed)
 
-                # Hide edit button (chart config editing is an Analysis-page
-                # concept), but show reorder + full-width controls -- these
-                # are dashboard-grid-specific, the inverse of Analysis page
-                # which shows edit/up/down but has no concept of full-width.
+                # Hide edit (chart config is an Analysis-page concept); keep
+                # reorder as a keyboard/click-accessible peer to dragging, so
+                # the board is still operable without a mouse drag.
                 card.btn_edit.setVisible(False)
                 card.btn_up.setVisible(True)
                 card.btn_down.setVisible(True)
                 card.move_up_requested.connect(self._on_move_up)
                 card.move_down_requested.connect(self._on_move_down)
-
-                card.btn_fullwidth.setVisible(True)
-                card.fullwidth_toggled.connect(self._on_fullwidth_toggled)
+                card.drag_started.connect(self.tiling_canvas.begin_drag)
+                card.resize_started.connect(self.tiling_canvas.begin_resize)
                 self._chart_cards[uid] = card
+                self.tiling_canvas.add_card(uid, card)
             else:
-                # Surviving tile: update it in place (title/notes/figure/
-                # full-width) so its web view and loaded page are kept.
+                # Surviving tile: update in place so its web view and loaded
+                # page are kept.
                 card.set_title(title)
                 card.set_note(note)
-                if fig is not card._fig:
+                # Compare against the card's BASE figure, not its rendered
+                # one: _fig is restyled in place whenever the theme changes, so
+                # it would always look different from the bridge's figure and
+                # trigger a needless webview reload on every refresh. _base_fig
+                # is the last one actually loaded.
+                if fig is not card._base_fig:
                     card.set_figure(fig)
 
             # Style is the dashboard's own palette layer: re-applying it to a
             # retained card is a stylesheet swap on the tile, not a rebuild.
             card.apply_style(self._current_style_dict())
-            card.set_fullwidth(fullwidth_map.get(uid, False))
 
-            if fullwidth_map.get(uid, False):
-                if col != 0:
-                    row += 1
-                    col = 0
-                self.charts_layout.addWidget(card, row, 0, 1, grid_cols)
-                row += 1
-                col = 0
-            else:
-                self.charts_layout.addWidget(card, row, col)
-                col += 1
-                if col >= grid_cols:
-                    col = 0
-                    row += 1
+        # Restore the saved arrangement LAST, so it is applied on top of the
+        # cards that actually exist (a saved map may name charts that are gone,
+        # or omit ones that were added since).
+        if saved_tiles:
+            self.tiling_canvas.set_geometry_map(saved_tiles)
+        self.tiling_canvas.relayout()
 
-            self._chart_cards[uid] = card
+    def _on_tiling_changed(self, geometry: dict, cols: int) -> None:
+        """Persist a drag/resize result.
+
+        Two things are stored: the per-card grid geometry (the arrangement) and
+        the column count, since a card's span is meaningless without it.
+        """
+        self.bridge.set("tile_geometry", geometry)
+        self.bridge.set("grid_cols_n", cols)
+        # Keep the reorder arrows in step with what the user just dragged, so
+        # the two ways of reordering cannot disagree on screen.
+        order = self.tiling_canvas.card_order()
+        charts = list(self.bridge.get("charts", []))
+        by_uid = {c[0]: c for c in charts}
+        if all(u in by_uid for u in order):
+            self.bridge.set("charts", [by_uid[u] for u in order])
+
+    def _on_move_up(self, uid: str) -> None:
+        """Move a chart earlier via its arrow button.
+
+        The arrows are the accessible peer to dragging, so they must act on the
+        VISUAL order the canvas reports, not the bridge's insertion order --
+        otherwise the two reorder controls would disagree once the user has
+        dragged anything.
+        """
+        self._nudge_card(uid, -1)
+
+    def _on_move_down(self, uid: str) -> None:
+        """Move a chart later via its arrow button (see _on_move_up)."""
+        self._nudge_card(uid, +1)
+
+    def _nudge_card(self, uid: str, delta: int) -> None:
+        """Swap *uid* with its visual neighbour and reflow.
+
+        Moving in the visual order is what the user means: the card above or
+        below on screen, regardless of what order the bridge happens to hold.
+        """
+        order = self.tiling_canvas.card_order()
+        if uid not in order:
+            return
+        i = order.index(uid)
+        j = i + delta
+        if j < 0 or j >= len(order):
+            return
+        order[i], order[j] = order[j], order[i]
+        self._reorder_by_visual_order(order)
+
+    def _reorder_by_visual_order(self, order: list) -> None:
+        """Rewrite every card's grid geometry from a desired visual order.
+
+        Lays the cards out left-to-right, top-to-bottom, each keeping its own
+        width/height span, so a move preserves the sizes the user set instead
+        of resetting every card to a single cell.
+        """
+        cols = max(1, self.tiling_canvas.columns())
+        geom = self.tiling_canvas.geometry_map()
+        x = y = 0
+        placed = {}
+        for uid in order:
+            g = geom.get(uid) or {"w": 1, "h": 1}
+            w = max(1, min(int(g.get("w", 1)), cols))
+            h = max(1, int(g.get("h", 1)))
+            if x + w > cols:
+                x = 0
+                y += 1
+            placed[uid] = {"x": x, "y": y, "w": w, "h": h}
+            x += w
+            if x >= cols:
+                x = 0
+                y += 1
+        self.tiling_canvas.set_geometry_map(placed)
+        self._on_tiling_changed(placed, cols)
 
     def _on_delete_chart(self, uid: str) -> None:
         """Delete a chart from the dashboard."""
@@ -1148,13 +1452,24 @@ class DashboardPage(QWidget):
             self._refresh_charts()
 
     def _on_fullwidth_toggled(self, uid: str, is_full_width: bool) -> None:
-        """Per-chart full-width toggle -- old codebase's grid_fullwidth.
-        A full-width chart takes its own row, spanning every column,
-        instead of sharing a row slot with neighboring charts."""
-        fullwidth_map = dict(self.bridge.get("grid_fullwidth", {}))
-        fullwidth_map[uid] = is_full_width
-        self.bridge.set("grid_fullwidth", fullwidth_map)
-        self._refresh_charts()
+        """Per-chart full-width toggle.
+
+        Kept as a shortcut onto the tiling model rather than a separate
+        mechanism: "span the whole row" is just a full-width span in the
+        canvas, so both routes now produce the same stored geometry and cannot
+        disagree.
+        """
+        cols = max(1, self.tiling_canvas.columns())
+        geom = self.tiling_canvas.geometry_map()
+        cur = geom.get(uid) or {"x": 0, "y": 0, "w": 1, "h": 1}
+        if is_full_width:
+            cur["w"] = cols
+            cur["x"] = 0
+        else:
+            cur["w"] = 1
+        geom[uid] = cur
+        self.tiling_canvas.set_geometry_map(geom)
+        self._on_tiling_changed(self.tiling_canvas.geometry_map(), cols)
 
     def _on_note_changed(self, uid: str, text: str) -> None:
         """Handle note changes."""
@@ -1219,10 +1534,12 @@ class DashboardPage(QWidget):
                     grid_cols_n = int(sm.get("grid_cols_n", 2))
                     self.bridge.set("grid_cols_n", grid_cols_n)
                     self.grid_cols_combo.setCurrentIndex(0 if grid_cols_n == 2 else 1)
-                    try:
-                        self.bridge.set("grid_fullwidth", json.loads(sm.get("grid_fullwidth_json", "{}")))
-                    except (json.JSONDecodeError, TypeError):
-                        self.bridge.set("grid_fullwidth", {})
+                    # The saved blob now holds per-card tiling geometry; put it
+                    # in the bridge under the key the canvas reads back, so a
+                    # re-save keeps the arrangement instead of reverting to an
+                    # auto-arranged board.
+                    self.bridge.set("tile_geometry",
+                                    _load_saved_tiles(sm))
 
                     # Restore the 23-key style dict (colors, typography,
                     # layout density) into the bridge, then push those

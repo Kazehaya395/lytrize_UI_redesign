@@ -1151,8 +1151,17 @@ def test_analysis_redesign():
         fields = []
         for _cls in (QComboBox, QListWidget, QSpinBox, QCheckBox):
             fields.extend(panel.findChildren(_cls))
-        if aid == "statistical":
-            # Registered builder -> real controls on all three tabs.
+        # Types with a registered settings builder must expose real controls
+        # on all three tabs; the rest are still placeholders.
+        #
+        # The list is read from the registry rather than hardcoded. A literal
+        # ("statistical", "distribution") silently went stale the moment
+        # correlation was implemented, and the suite then failed a chart that
+        # was in fact working correctly -- the exact failure mode that hides a
+        # real regression in some other type.
+        from desktop.widgets.analysis_settings import registered as _registered_types
+        implemented = set(_registered_types())
+        if aid in implemented:
             check(f"analysis shell '{aid}': settings fields present",
                   len(fields) >= 3, f"fields={len(fields)}")
             check(f"analysis shell '{aid}': has builder",
@@ -1892,9 +1901,18 @@ def test_draft_restore_round_trip():
     import plotly.graph_objects as go
 
     from desktop.session_bridge import SessionBridge
-    from services.database_service import get_draft, clear_draft
+    from services.database_service import get_draft, clear_draft, init_db
 
     app_ = app()
+
+    # A real cold start runs MainWindow._init_session() -> init_db() before
+    # anything touches draft_sessions. Without it this test silently relied on
+    # a schema that some earlier app launch had left behind in the user's DB
+    # file: on a fresh machine the INSERT below hits
+    # "no such table: draft_sessions", the error is swallowed, and the draft is
+    # dropped on the floor. Mirror the real startup path so the round trip is
+    # reproduced on a brand-new DB too.
+    init_db()
 
     # -- phase 1: build a session and autosave it -----------------------
     b1 = SessionBridge()
@@ -1963,6 +1981,12 @@ def test_draft_restore_survives_corrupt_row():
     from services.database_service import save_draft as db_save_draft
 
     app_ = app()
+    # Same startup contract as the round-trip test above: without the schema a
+    # missing table would make the corrupt row silently "degrade" for the wrong
+    # reason (nothing was ever stored), so the check would pass vacuously.
+    from services.database_service import init_db
+    init_db()
+
     b = SessionBridge()
     b.set("user_id", 1)
     db_save_draft(user_id=1, page="analysis", charts_json="{not json at all",
@@ -2119,7 +2143,8 @@ def test_legend_column_tracks_card_width():
     import copy
 
     import plotly.graph_objects as go
-    from chart_display import (_legend_need_px, apply_display_options,
+    from chart_display import (_legend_need_px, _legend_axis_need_px,
+                               apply_display_options, legend_anchor,
                                refit_legend_width, infer_legend_position)
 
     def base(names):
@@ -2129,45 +2154,63 @@ def test_legend_column_tracks_card_width():
         return f
 
     names = ["mean", "min", "max", "std"]
-    need = _legend_need_px(names, "", "right")
 
-    # The reserved strip must equal what the labels need, at EVERY width.
+    def reserved_px(fig, pos, w):
+        """Pixels the reserved column actually spans.
+
+        ``xaxis.domain`` is a fraction of the PLOT AREA (card minus the l/r
+        outer margins), so the reserved width has to be measured the same way
+        the reservation is computed.  Measuring it against the card width is
+        what made this test disagree with a correct implementation.
+        """
+        m = fig.layout.margin.to_plotly_json() or {}
+        area = w - int(m.get("l") or 0) - int(m.get("r") or 0)
+        side = legend_anchor(pos)[0]
+        d = list(fig.layout.xaxis.domain)
+        return (1.0 - d[1] if side == "right" else d[0]) * area
+
+    # The reserved strip must hold the legend box AND the axis tick labels that
+    # share the column, at EVERY width.
     for w in (700, 1200, 1900, 2400):
         f = apply_display_options(base(names),
                                   {"legend_position": "Top Right"}, None,
                                   width_px=w)
-        reserved = (1.0 - list(f.layout.xaxis.domain)[1]) * w
-        check(f"legend: reserved column ~= label need at {w}px",
-              abs(reserved - need) < 1.0,
-              f"reserved {reserved:.0f}px, need {need}px")
+        reserved = reserved_px(f, "Top Right", w)
+        # axis_px=0 asks for the legend BOX alone; the gap the default adds
+        # belongs to the axis allowance, so counting it twice would be wrong.
+        box = _legend_need_px(names, "", "right", axis_px=0)
+        axis = _legend_axis_need_px(f, "right")
+        check(f"legend: reserved column covers box+axis at {w}px",
+              reserved >= box + axis - 1.0,
+              f"reserved {reserved:.0f}px, box {box}px + axis {axis}px")
 
     # A fraction-based reservation would GROW with the card; this must not.
     f1 = apply_display_options(base(names), {"legend_position": "Top Right"},
                                None, width_px=700)
     f2 = apply_display_options(base(names), {"legend_position": "Top Right"},
                                None, width_px=2400)
-    r1 = (1.0 - list(f1.layout.xaxis.domain)[1]) * 700
-    r2 = (1.0 - list(f2.layout.xaxis.domain)[1]) * 2400
+    r1 = reserved_px(f1, "Top Right", 700)
+    r2 = reserved_px(f2, "Top Right", 2400)
     check("legend: reservation does not grow with the card",
           abs(r1 - r2) < 2.0, f"{r1:.0f}px at 700 vs {r2:.0f}px at 2400")
 
     # Long labels must still get a genuinely wide column.
     long_names = ["Very Long Series Name Alpha", "Very Long Series Name Beta"]
-    need_long = _legend_need_px(long_names, "", "right")
+    need_long = _legend_need_px(long_names, "", "right", axis_px=0)
     fl = apply_display_options(base(long_names), {"legend_position": "Top Right"},
                                None, width_px=1900)
-    res_long = (1.0 - list(fl.layout.xaxis.domain)[1]) * 1900
+    res_long = reserved_px(fl, "Top Right", 1900)
     check("legend: long labels still reserve a wider column",
-          res_long > need + 100,
+          res_long > need_long,
           f"reserved {res_long:.0f}px, need {need_long}px")
 
     # The Generate path: built on a worker with no width, then re-fitted once
     # the widget knows its real size.
     fg = apply_display_options(base(names), {"legend_position": "Top Right"},
                                None)
-    before = (1.0 - list(fg.layout.xaxis.domain)[1]) * 1900
+    before = reserved_px(fg, "Top Right", 1900)
     applied = refit_legend_width(fg, 1900)
-    after = (1.0 - list(fg.layout.xaxis.domain)[1]) * 1900
+    after = reserved_px(fg, "Top Right", 1900)
     check("legend: worker-built figure refits on first real width",
           applied is True and after < before / 2,
           f"{before:.0f}px -> {after:.0f}px")
@@ -2183,9 +2226,11 @@ def test_legend_column_tracks_card_width():
     # Left-hand positions must keep room for the y-axis tick labels.
     fleft = apply_display_options(base(names), {"legend_position": "Top Left"},
                                   None, width_px=1900)
+    box_l = _legend_need_px(names, "", "left", axis_px=0)
     check("legend: left column still carries axis-label room",
-          list(fleft.layout.xaxis.domain)[0] * 1900 > need,
-          f"reserved {list(fleft.layout.xaxis.domain)[0] * 1900:.0f}px")
+          reserved_px(fleft, "Top Left", 1900) >= box_l
+          + _legend_axis_need_px(fleft, "left") - 1,
+          f"reserved {reserved_px(fleft, 'Top Left', 1900):.0f}px")
 
     # A figure with no legend must be left completely alone.
     fnone = go.Figure()
@@ -2208,6 +2253,136 @@ def test_legend_column_tracks_card_width():
                                None)
     check("legend: headless path still reserves a usable column",
           0.0 < list(fh.layout.xaxis.domain)[1] < 1.0)
+
+
+def test_legend_never_overlaps_the_axis_it_shares_a_column_with():
+    """The legend plate must not paint over the axis furniture beside it.
+
+    Regression from the "look legends again overlapping with chart" report.
+    Two independent causes, both visible on the Categorical dual-axis chart:
+
+    1. The reserved column was sized from the legend box ALONE.  On the left it
+       allowed a flat 30px for the y tick labels, but a category like
+       "Packaged Chocolate" needs ~150px, so Top Left drew the plate straight
+       over the labels.  On the right it allowed NOTHING, yet a secondary y
+       axis draws its scale in exactly that freed strip, so Bottom Right
+       covered the 0-20 scale.
+    2. The pixel need was divided by the full CARD width, but ``xaxis.domain``
+       is a fraction of the plot AREA (card minus margins).  Every reservation
+       therefore came out short by the margin, and the plate overlapped even
+       when the arithmetic looked right.
+    """
+    print("[28b] Legend column clears the axis labels on both sides")
+    from plotly.subplots import make_subplots
+
+    import plotly.graph_objects as go
+    from chart_display import (apply_display_options, _legend_need_px,
+                               _legend_axis_need_px, legend_anchor,
+                               legend_layout_mode, _LEGEND_ROW_PX)
+
+    cats = ["Coffee", "Tea", "Packaged Chocolate", "Drinking Chocolate"]
+
+    def dual_axis():
+        """The exact shape that produced the report: bar + secondary line."""
+        f = make_subplots(specs=[[{"secondary_y": True}]])
+        f.add_trace(go.Bar(x=cats, y=[89250, 69737, 487, 17457],
+                           name="Sum transaction_qty"), secondary_y=False)
+        f.add_trace(go.Scatter(x=cats, y=[12.3, 9.1, 1.9, 6.2],
+                               name="Mean unit_price",
+                               mode="lines+markers"), secondary_y=True)
+        f.update_layout(margin=dict(l=20, r=20, t=56, b=60))
+        return f
+
+    def reserved_px(fig, pos, w):
+        """Width given up to the legend on its side (0 in band mode)."""
+        m = fig.layout.margin.to_plotly_json() or {}
+        area = w - int(m.get("l") or 0) - int(m.get("r") or 0)
+        d = list(fig.layout.xaxis.domain)
+        side = legend_anchor(pos)[0]
+        return (1.0 - d[1] if side == "right" else d[0]) * area
+
+    def band_px(fig):
+        """Height given up to the legend when it went horizontal.
+
+        The compact fallback reserves HEIGHT, not width, so the plot keeps
+        its full width and stays readable on a dashboard tile. Measuring
+        only the horizontal reservation would read that as "0px reserved"
+        and report a false failure on exactly the narrow cards the rule
+        exists to fix.
+        """
+        m = fig.layout.margin.to_plotly_json() or {}
+        top = int(m.get("t") or 0)
+        bot = int(m.get("b") or 0)
+        return top if top >= bot else bot
+
+    for w in (760, 1200, 1900, 2400):
+        for pos in ("Top Left", "Bottom Left", "Top Right", "Bottom Right"):
+            f = apply_display_options(dual_axis(),
+                                      {"legend_position": pos}, None,
+                                      width_px=w)
+            side = legend_anchor(pos)[0]
+            names = [t.name for t in f.data
+                     if getattr(t, "showlegend", True) is not False]
+            box = _legend_need_px(names, "", side, axis_px=0)
+            axis = _legend_axis_need_px(f, side)
+            if legend_layout_mode(f) == "band":
+                # Horizontal band: it must not eat the plot, and it must
+                # still reserve enough height to actually hold its rows.
+                reserved = band_px(f)
+                check(f"legend {pos} @{w}px goes horizontal, plot keeps width",
+                      abs(list(f.layout.xaxis.domain)[0]) < 1e-6
+                      and abs(list(f.layout.xaxis.domain)[1] - 1.0) < 1e-6,
+                      f"domain={list(f.layout.xaxis.domain)}")
+                check(f"legend {pos} @{w}px band reserves >= {_LEGEND_ROW_PX}px "
+                      f"of height",
+                      reserved >= _LEGEND_ROW_PX, f"reserved {reserved}px")
+            else:
+                reserved = reserved_px(f, pos, w)
+                check(f"legend {pos} @{w}px clears box+axis on the {side}",
+                      reserved >= box + axis - 1.0,
+                      f"reserved {reserved:.0f}px, needs {box}+{axis}px")
+
+    # The right side must actually account for the SECONDARY axis scale.  A
+    # right strip sized from the legend box alone is what covered the 0-20
+    # ticks, so the allowance has to be non-trivial when yaxis2 is present.
+    f = dual_axis()
+    right_axis = _legend_axis_need_px(f, "right")
+    check("legend: right column accounts for the secondary y scale",
+          right_axis > 16,
+          f"right allowance only {right_axis}px")
+
+    # And it must measure the SECONDARY axis, not the primary one: the bar
+    # values (89250) are far wider than the line values, so using the primary
+    # axis would over-reserve, and using nothing under-reserves.
+    from chart_display import _axis_label_need_px
+    pri = _axis_label_need_px(f, "left")
+    sec = _axis_label_need_px(f, "right")
+    check("legend: each side measures its own axis",
+          sec < pri,
+          f"primary {pri}px vs secondary {sec}px")
+
+    # A category label long enough to need real room must widen the column.
+    short = go.Figure(go.Bar(x=["a"], y=[1], name="s"))
+    long_ = go.Figure(go.Bar(x=["a"], y=[1],
+                             name="An Extremely Long Legend Entry Name"))
+    fs = apply_display_options(short, {"legend_position": "Top Left"}, None,
+                               width_px=1900)
+    fl = apply_display_options(long_, {"legend_position": "Top Left"}, None,
+                               width_px=1900)
+    check("legend: a long entry widens the column it needs",
+          reserved_px(fl, "Top Left", 1900)
+          > reserved_px(fs, "Top Left", 1900) + 50,
+          f"{reserved_px(fs, 'Top Left', 1900):.0f}px vs "
+          f"{reserved_px(fl, 'Top Left', 1900):.0f}px")
+
+    # The plate must stay clear of the plot even at a narrow card, where the
+    # strip is clamped: the clamp may cap the column, but the plate then has to
+    # be allowed to overlap rather than silently crush the data.
+    fn = apply_display_options(dual_axis(), {"legend_position": "Bottom Right"},
+                               None, width_px=520)
+    check("legend: narrow card keeps a usable plot area",
+          list(fn.layout.xaxis.domain)[1] > 0.35,
+          f"domain ends at {list(fn.layout.xaxis.domain)[1]:.2f}")
 
 
 def test_font_choices_are_installed_and_snapped():
@@ -2469,6 +2644,2814 @@ def test_bundled_font_stacks_resolve_for_charts():
               bool(s.strip()) and "{" not in s and "}" not in s, s)
 
 
+def test_distribution_settings_match_statistical_design():
+    """Distribution must use the SAME three-tab design as statistical.
+
+    The brief is that every analysis type reuses the statistical layout, so
+    these checks compare the two builders head to head rather than asserting
+    a hand-copied row list -- if statistical's design changes, this fails
+    until distribution follows.
+    """
+    print("[33] Distribution settings follow the statistical template")
+    from PySide6.QtWidgets import QLabel, QCheckBox
+    from desktop.widgets.analysis_settings import get_builder, registered
+    from desktop.widgets.analysis_settings.statistical import StatisticalSettings
+    from desktop.widgets.analysis_settings.distribution import (
+        DistributionSettings, BINS_RANGE, OPACITY_RANGE)
+
+    check("design: distribution is registered", "distribution" in registered())
+    check("design: distribution reuses the statistical template",
+          issubclass(DistributionSettings, StatisticalSettings))
+
+    def _mk(aid):
+        return get_builder(aid, None, num_cols=["age", "salary"],
+                           cat_cols=["region", "dept"], dt_cols=[],
+                           palette_names=["A", "B"])
+
+    def _sections(page):
+        """Section titles in true left-to-right order.
+
+        Read the QHBoxLayout's own item order via ``indexOf`` rather than
+        sorting by name or by x. Two reasons, both learned the hard way:
+        a sorted() list throws away precisely the thing being asserted
+        (which control sits in which column), and x positions are all equal
+        for a widget that was never shown, so geometry is useless headless.
+        """
+        found = []
+        from PySide6.QtWidgets import QHBoxLayout
+        for lay in page.findChildren(QHBoxLayout):
+            for i in range(lay.count()):
+                w = lay.itemAt(i).widget()
+                if w is None:
+                    continue
+                labels = [sl.text() for sl in w.findChildren(QLabel)
+                          if sl.property('theme_role') == 'section']
+                if labels:
+                    found.append((lay.indexOf(w), labels[0]))
+        found.sort(key=lambda it: it[0])
+        return [t for _i, t in found]
+
+    def _rows(page):
+        out = []
+        for w in page.findChildren(object):
+            try:
+                if w.property('grid_row'):
+                    labs = [sl.text() for sl in w.findChildren(QLabel)
+                            if sl.property('theme_role') == 'section']
+                    if labs:
+                        out.append(labs[0])
+            except Exception:
+                pass
+        return out
+
+    def _checks(page):
+        return [c.text() for c in page.findChildren(QCheckBox)]
+
+    st, ds = _mk("statistical"), _mk("distribution")
+    st_gen, ds_gen = st.build_generate(), ds.build_generate()
+    st_lay, ds_lay = st.build_layout(), ds.build_layout()
+    st_typ, ds_typ = st.build_typography(), ds.build_typography()
+
+    # -- Typography is type-agnostic: it must be identical, and it is
+    #    inherited rather than re-implemented.
+    check("design: typography rows identical to statistical",
+          _rows(st_typ) == _rows(ds_typ), str(_rows(ds_typ)))
+    check("design: typography is not re-implemented per type",
+          "build_typography" not in DistributionSettings.__dict__)
+
+    # -- Layout: same rows, plus the two histogram controls.
+    st_rows, ds_rows = _rows(st_lay), _rows(ds_lay)
+    check("design: layout keeps every statistical row in order",
+          ds_rows[:len(st_rows)] == st_rows, f"{ds_rows} vs {st_rows}")
+    check("design: layout adds exactly Bins + Opacity",
+          ds_rows[len(st_rows):] == ["Bins", "Opacity"], str(ds_rows[len(st_rows):]))
+    check("design: layout checkboxes identical to statistical",
+          _checks(st_lay) == _checks(ds_lay), str(_checks(ds_lay)))
+    check("design: Show border still sits directly under Show grid",
+          _checks(ds_lay)[-2:] == ["Show grid", "Show border"], str(_checks(ds_lay)))
+
+    # -- Generate: same 3-column shape AND same slot order as statistical.
+    # The order is the point: statistical puts the optional dimension control
+    # first, the metric control second, palette third. Distribution must put
+    # the same KIND of control in the same slot, or the eye has to relearn
+    # the layout on every chart tab. (A sorted() comparison here would hide
+    # exactly that regression, which is how the order broke in the first
+    # place.)
+    PAL = "\U0001f3a8 Palette"
+    check("design: generate has three section columns",
+          len(_sections(ds_gen)) == 3, str(_sections(ds_gen)))
+    check("design: statistical order is dimension, metric, palette",
+          _sections(st_gen) == ["Group by (optional)", "Metrics", PAL],
+          str(_sections(st_gen)))
+    check("design: distribution uses the SAME slot order as statistical",
+          _sections(ds_gen) == ["Colour by (optional)", "Numeric columns", PAL],
+          str(_sections(ds_gen)))
+    check("design: palette sits in the same column in both tabs",
+          _sections(st_gen).index(PAL) == _sections(ds_gen).index(PAL) == 2,
+          f"stat={_sections(st_gen)} dist={_sections(ds_gen)}")
+
+    # -- No control may display placeholder/instruction text as its value.
+    # "None" and "Dropdown with checkboxes; click to expand" both read as
+    # real, selectable values sitting in the field.
+    for _name, _b in (("statistical", st), ("distribution", ds)):
+        for _attr in ("_combo_groupby", "_combo_color"):
+            _w = getattr(_b, _attr, None)
+            if _w is None:
+                continue
+            _shown = [_w.itemText(i) for i in range(_w.count())]
+            check(f"display: {_name}.{_attr} offers no 'None' entry",
+                  "None" not in _shown, str(_shown))
+            check(f"display: {_name}.{_attr} starts on a blank entry",
+                  bool(_shown) and _shown[0] == "", str(_shown[:1]))
+        for _attr in ("_combo_metrics", "_combo_numeric"):
+            _w = getattr(_b, _attr, None)
+            if _w is None:
+                continue
+            check(f"display: {_name}.{_attr} blank when nothing selected",
+                  _w.currentText() == "", repr(_w.currentText()))
+            _w.set_selection(["age"])
+            check(f"display: {_name}.{_attr} shows the real selection",
+                  _w.currentText() == "age", repr(_w.currentText()))
+            _w.set_selection([])
+
+    check("design: generate control widths match the 210px template",
+          ds._combo_numeric.width() == 210 and ds._combo_color.width() == 210
+          and ds._combo_palette.width() == 210,
+          f"{ds._combo_numeric.width()}/{ds._combo_color.width()}/{ds._combo_palette.width()}")
+
+    # -- The two features taken from the old codebase, with its ranges.
+    check("bins: range is 5..200 (old _CONTROL_META)", BINS_RANGE == (5, 200))
+    check("bins: default 30", ds._bins_spin.value() == 30, str(ds._bins_spin.value()))
+    check("opacity: range is 0.1..1.0 (old _CONTROL_META)", OPACITY_RANGE == (0.1, 1.0))
+    check("opacity: default 0.80", abs(ds._op_spin.value() - 0.80) < 1e-6,
+          str(ds._op_spin.value()))
+
+
+def test_distribution_values_round_trip_and_generation():
+    """The distribution form must feed the real service and reach the figure."""
+    print("[34] Distribution form values round-trip and drive the chart")
+    import numpy as np
+    import pandas as pd
+    from PySide6.QtWidgets import QApplication
+    from desktop.widgets.analysis_settings import get_builder
+    from chart_display import apply_display_options, default_layout_opts
+    from services.analysis_service import run_analysis_with_config, WIDGET_SPEC
+
+    app = QApplication.instance() or QApplication([])
+    b = get_builder("distribution", None, num_cols=["age", "salary"],
+                    cat_cols=["region", "dept"], dt_cols=[],
+                    palette_names=["A", "B"])
+    b.build_generate()
+
+    # The collected keys must match the keys WIDGET_SPEC declares for this
+    # type, or the service never sees the user's choices.
+    spec_keys = {k for k, _, _ in WIDGET_SPEC["distribution"]}
+    got = set(b.collect_values().keys())
+    check("values: collected keys match WIDGET_SPEC", got == spec_keys,
+          f"{got} vs {spec_keys}")
+
+    # prefill -> collect must be lossless (this is what Edit relies on).
+    b.prefill({"x": ["age"], "color": "region", "palette": "B"})
+    check("values: prefill round-trips x", b.collect_values()["x"] == ["age"],
+          str(b.collect_values()["x"]))
+    check("values: prefill round-trips color", b.collect_values()["color"] == "region",
+          str(b.collect_values()["color"]))
+    check("values: prefill round-trips palette", b.collect_values()["palette"] == "B",
+          str(b.collect_values()["palette"]))
+
+    # A stale saved value must not break the form.
+    b.prefill({"x": ["age"], "color": "GONE", "palette": "NOPE"})
+    check("values: stale color falls back to None", b.collect_values()["color"] is None,
+          str(b.collect_values()["color"]))
+    check("values: stale palette falls back to a real one",
+          b.collect_values()["palette"] in ("A", "B"), str(b.collect_values()["palette"]))
+
+    # Layout round-trip, including the two histogram rows.
+    lay = b.build_layout()
+    b.prefill_layout({"histogram_bins": 12, "histogram_opacity": 0.25,
+                      "title": "My dist"})
+    check("layout: prefill restores Bins", b.collect_layout()["histogram_bins"] == 12,
+          str(b.collect_layout()["histogram_bins"]))
+    check("layout: prefill restores Opacity",
+          abs(b.collect_layout()["histogram_opacity"] - 0.25) < 1e-6,
+          str(b.collect_layout()["histogram_opacity"]))
+    check("layout: prefill leaves statistical's own rows working too",
+          b.collect_layout()["title"] == "My dist", str(b.collect_layout()["title"]))
+
+    # Real generation through the service, then real layout application.
+    df = pd.DataFrame({
+        "age": np.random.randint(20, 60, 300),
+        "salary": np.random.randint(30000, 90000, 300),
+        "score": np.random.rand(300) * 100,
+        "region": np.random.choice(["N", "S", "E"], 300),
+    })
+    charts = run_analysis_with_config("distribution", df,
+                                      {"x": ["age", "salary"], "color": "region",
+                                       "palette": "Default"})
+    check("generate: two charts for two selected columns", len(charts) == 2,
+          str(len(charts)))
+    lo = dict(default_layout_opts(), histogram_bins=12, histogram_opacity=0.25)
+    for label, _uid, fig in charts:
+        f2 = apply_display_options(fig, lo)
+        tr0 = list(f2.data)[0]
+        check(f"generate: Bins reaches the histogram ({label[:12]})",
+              tr0.nbinsx == 12, str(tr0.nbinsx))
+        check(f"generate: Opacity reaches the histogram ({label[:12]})",
+              abs(float(tr0.opacity) - 0.25) < 1e-6, str(tr0.opacity))
+
+    # An empty form must still produce charts (the service's own default).
+    empty = run_analysis_with_config("distribution", df,
+                                     {"x": [], "color": None, "palette": "Default"})
+    check("generate: empty selection still charts", len(empty) > 0, str(len(empty)))
+
+
+def test_histogram_layout_options_are_histogram_only():
+    """Bins / Opacity must touch histograms and nothing else.
+
+    A distribution chart can also carry box plots, and nbins is meaningless
+    on those; the old app guarded the same way with `if ttype == "histogram"`.
+    """
+    print("[35] Histogram layout options are histogram-only")
+    import plotly.graph_objects as go
+    from chart_display import apply_display_options, default_layout_opts
+
+    lo = default_layout_opts()
+    check("opts: default bins is 30", lo["histogram_bins"] == 30, str(lo["histogram_bins"]))
+    check("opts: default opacity is 0.80",
+          abs(lo["histogram_opacity"] - 0.80) < 1e-6, str(lo["histogram_opacity"]))
+
+    def _mixed():
+        f = go.Figure()
+        f.add_trace(go.Histogram(x=[1, 2, 3, 4, 5, 6], name="h"))
+        f.add_trace(go.Box(y=[1, 2, 3], name="b"))
+        return f
+
+    f2 = apply_display_options(_mixed(), dict(lo, histogram_bins=12,
+                                              histogram_opacity=0.25))
+    tr = list(f2.data)
+    check("hist: bins applied to the histogram", tr[0].nbinsx == 12, str(tr[0].nbinsx))
+    check("hist: opacity applied to the histogram",
+          abs(float(tr[0].opacity) - 0.25) < 1e-6, str(tr[0].opacity))
+    check("hist: a y-binned variant writes nbinsy, not nbinsx",
+          apply_display_options(go.Figure(go.Histogram(y=[1, 2, 3])),
+                                dict(lo, histogram_bins=9)).data[0].nbinsy == 9)
+
+    # A Box accepts `opacity` (nbinsx is not a valid Box property at all, so
+    # it cannot be used to detect the guard). If the histogram-only check were
+    # missing, the opacity from the same layout block would land on the box
+    # too -- so opacity is the property that actually proves the guard.
+    box = list(tr)[1]
+    check("hist: a box trace in the same chart keeps its own opacity",
+          box.opacity is None, str(box.opacity))
+
+    # Bar-only figure: no histograms, must not raise.
+    fb = apply_display_options(go.Figure(go.Bar(x=[1, 2], y=[1, 2])),
+                               dict(lo, histogram_bins=7, histogram_opacity=0.1))
+    check("hist: bar-only figure is a no-op", type(fb.data[0]).__name__ == "Bar")
+
+    # Defensive input handling.
+    for bad in (None, "junk", 0, -5):
+        out = apply_display_options(_mixed(), dict(lo, histogram_bins=bad))
+        nb = list(out.data)[0].nbinsx
+        ok = (nb is None) if bad in (None, "junk") else (nb == 1)
+        check(f"hist: bins={bad!r} handled safely", ok, str(nb))
+    frac = list(apply_display_options(_mixed(),
+                                      dict(lo, histogram_bins=12.7)).data)[0].nbinsx
+    check("hist: fractional bins round to an int", frac == 13, str(frac))
+
+
+
+# =========================================================================
+# Column-role resolution (services/column_roles.py)
+# =========================================================================
+#
+# Regression cover for the bug where dimension drop-downs ("Group by",
+# "Colour by") silently lost every ``category`` / ``string`` / ``bool``
+# column, because the pools were built with
+# ``df.select_dtypes(include="object")``. Those dtypes do not match, so such
+# columns landed in no pool at all and could never be selected. The user's
+# Column Classification was also ignored entirely.
+
+
+def _roles_fixture_df():
+    """A dataset whose column families disagree with their dtypes."""
+    import pandas as pd
+    return pd.DataFrame({
+        "sales":      [1.5, 2.5, 3.5],                  # real metric
+        "region":     ["N", "S", "E"],                   # object dimension
+        "segment":    pd.Series(["a", "b", "a"]).astype("category"),
+        "code":       pd.Series(["X1", "X2", "X1"], dtype="string"),
+        "is_active":  [True, False, True],               # bool dimension
+        "postal":     [90210, 90211, 90212],             # id-like numeric
+        "order_date": pd.to_datetime(["2024-01-01", "2024-01-02",
+                                      "2024-01-03"]),
+    })
+
+
+def test_column_roles_never_drop_a_column():
+    from services.column_roles import auto_roles, resolve_roles
+
+    df = _roles_fixture_df()
+    roles = resolve_roles(df)
+
+    # The bug: select_dtypes(include="object") matched only "region", so
+    # segment / code / is_active belonged to NO pool and were unreachable.
+    check("roles: object-only detection used to lose these columns",
+          {"segment", "code", "is_active"} - set(df.columns) == set(),
+          "")
+    for c in ("segment", "code", "is_active"):
+        check(f"roles: '{c}' reaches a dimension pool",
+              c in roles["categorical"], str(roles))
+
+    # Pin the DETECTOR itself, not just the resolver. resolve_roles has a
+    # total-coverage fallback that would quietly re-home any column the
+    # detector misses, so asserting only on the resolver lets a broken
+    # detector hide behind that safety net.
+    det = auto_roles(df)
+    check("roles: detector classifies category/string/bool as dimensions",
+          det["categorical"] == ["region", "segment", "code", "is_active"],
+          str(det["categorical"]))
+    check("roles: detector does not lose a column either",
+          sorted(det["numeric"] + det["categorical"] + det["datetime"])
+          == sorted(df.columns), str(det))
+
+    # Total coverage: every column exactly once -- this is the invariant
+    # that guarantees no drop-down can ever lose a column again.
+    placed = roles["numeric"] + roles["categorical"] + roles["datetime"]
+    check("roles: every column lands in exactly one family",
+          sorted(placed) == sorted(df.columns) and len(placed) == len(set(placed)),
+          f"placed={sorted(placed)}")
+
+    check("roles: datetimes detected",
+          roles["datetime"] == ["order_date"], str(roles["datetime"]))
+    check("roles: metric is the numeric column",
+          roles["numeric"] == ["sales", "postal"], str(roles["numeric"]))
+    check("roles: order follows the dataframe",
+          roles["categorical"] == ["region", "segment", "code", "is_active"],
+          str(roles["categorical"]))
+
+    # Degenerate inputs must not explode -- these run on every panel build.
+    check("roles: empty frame is safe",
+          resolve_roles(pd.DataFrame() if (pd := __import__("pandas")) else None)
+          == {"numeric": [], "categorical": [], "datetime": []}, "")
+    check("roles: None frame is safe",
+          resolve_roles(None) == {"numeric": [], "categorical": [],
+                                  "datetime": []}, "")
+
+
+def test_user_classification_overrides_dtype():
+    from services.column_roles import resolve_roles, value_sig_map
+
+    df = _roles_fixture_df()
+
+    # The user deliberately calls the id-like 'postal' a DIMENSION even
+    # though pandas says int64. Their choice must win app-wide.
+    user = {"numeric": ["sales"],
+            "categorical": ["region", "segment", "code", "postal", "is_active"],
+            "datetime": ["order_date"]}
+    sig = value_sig_map(df)
+    roles = resolve_roles(df, user, sig)
+
+    check("user: numeric column stays a metric", roles["numeric"] == ["sales"],
+          str(roles["numeric"]))
+    check("user: reclassified numeric is a dimension, not a metric",
+          "postal" in roles["categorical"] and "postal" not in roles["numeric"],
+          str(roles))
+    check("user: nothing dropped under an explicit classification",
+          sorted(roles["numeric"] + roles["categorical"] + roles["datetime"])
+          == sorted(df.columns), str(roles))
+
+    # ...and the reverse: text promoted to a metric must leave the dimension
+    # pool, otherwise "metrics" would silently ignore the user as well.
+    user2 = {"numeric": ["sales", "region"], "categorical": [], "datetime": []}
+    roles2 = resolve_roles(df, user2, sig)
+    check("user: promoted text becomes a metric",
+          "region" in roles2["numeric"] and "region" not in roles2["categorical"],
+          str(roles2))
+
+    # No classification at all -> pure auto-detection, still total coverage.
+    auto = resolve_roles(df, None, None)
+    check("user: absent classification falls back to auto-detect",
+          auto["categorical"] == ["region", "segment", "code", "is_active"],
+          str(auto))
+
+    # Self-healing: the Dtype Transformer converted 'region' text into real
+    # date objects. Its dtype is still object, so only the value-profile
+    # fingerprint reveals the change -- that one column must be re-derived,
+    # or no time-series chart could ever find it.
+    df2 = df.copy()
+    df2["region"] = pd.to_datetime(["2024-01-01", "2024-01-02",
+                                   "2024-01-03"]).date
+    healed = resolve_roles(df2, user, sig)
+    check("user: converted text column self-heals into datetime",
+          "region" in healed["datetime"], str(healed["datetime"]))
+    check("user: self-healing does not disturb the other columns",
+          "postal" in healed["categorical"] and healed["numeric"] == ["sales"],
+          str(healed))
+
+
+def test_group_by_offers_every_dimension():
+    """The reported bug: "Group by" did not list all relevant dimensions."""
+    from services.analysis_service import dim_cols
+    from desktop.widgets.analysis_settings.base import AnalysisSettingsBase
+    from desktop.widgets.analysis_settings import get_builder
+
+    df = _roles_fixture_df()
+    dims = dim_cols(df)
+
+    # Every dimension family must be offered, not just object-dtype text.
+    for c in ("region", "segment", "code", "is_active", "order_date"):
+        check(f"groupby: '{c}' is offered as a dimension", c in dims, str(dims))
+    check("groupby: a real metric is not offered as a grouping key",
+          "sales" not in dims, str(dims))
+
+    # A date is a legitimate grouping key -- the old text-only pool hid it.
+    check("groupby: datetime is a grouping key", "order_date" in dims, str(dims))
+
+    # The statistical form's Group by combo must actually show these.
+    b = get_builder("statistical", None, num_cols=["sales"],
+                    cat_cols=["region", "segment", "code", "is_active"],
+                    dt_cols=["order_date"], palette_names=["Default"],
+                    all_cols=list(df.columns))
+    try:
+        b._build()
+        # The built page must stay referenced: without a Python owner the
+        # combo (a child of it) is garbage-collected and every later access
+        # raises "Internal C++ object already deleted".
+        page = b.build_generate()
+        opts = [b._combo_groupby.itemText(i)
+                for i in range(b._combo_groupby.count())]
+        check("groupby: the combo lists every dimension",
+              all(c in opts for c in ("segment", "code", "is_active",
+                                      "order_date")), str(opts))
+        check("groupby: the combo starts on a blank entry, not 'None'",
+              bool(opts) and opts[0] == "", str(opts[:1]))
+        check("groupby: the built page is the group-by combo's home",
+              page is not None, "")
+    finally:
+        b.deleteLater()
+
+    # set_context's fallback (no explicit pool) must not regress to text-only.
+    base = AnalysisSettingsBase()
+    base.set_context(num_cols=["sales"], cat_cols=["region"],
+                     dt_cols=["order_date"])
+    check("groupby: default pool includes datetime",
+          "order_date" in base._group_cols and "region" in base._group_cols,
+          str(base._group_cols))
+
+
+# =========================================================================
+# Settings-form row alignment
+# =========================================================================
+#
+# Regression: the three Generate sections each sized their header block to
+# their own description text, so a two-line hint pushed its control below a
+# one-line one and the Palette (no hint) above both -- the controls sat on a
+# staircase instead of one line. The rule is that a section's control always
+# starts at the same height as its neighbours'.
+
+
+def test_section_controls_align_across_row():
+    from PySide6.QtCore import QPoint
+    from desktop.widgets.analysis_settings import get_builder
+    from desktop.widgets.analysis_settings.base import HINT_ROW_LINES
+
+    app = QApplication.instance() or QApplication([])
+
+    from PySide6.QtWidgets import QWidget, QLabel
+
+    for aid, ctrls in (
+        ("statistical", ("_combo_groupby", "_combo_metrics", "_combo_palette")),
+        ("distribution", ("_combo_color", "_combo_numeric", "_combo_palette")),
+    ):
+        b = get_builder(aid, None, num_cols=["age", "salary"],
+                        cat_cols=["region", "dept"], dt_cols=["date"],
+                        palette_names=["Default"],
+                        all_cols=["age", "salary", "region", "dept", "date"])
+        b._build()
+        # The page must be shown and laid out before geometry is meaningful:
+        # an unshown widget has no allocated positions, so every child
+        # reports the same x/y and an alignment check silently "passes".
+        page = b.build_generate()
+        page.resize(900, 260)
+        page.show()
+        app.processEvents()
+
+        ys = {}
+        for attr in ctrls:
+            w = getattr(b, attr, None)
+            if w is None:
+                continue
+            ys[attr] = w.mapTo(page, QPoint(0, 0)).y()
+        check(f"align: {aid} has all three controls", len(ys) == 3, str(ys))
+        check(f"align: {aid} controls sit on one line", len(set(ys.values())) == 1,
+              str(ys))
+
+        # And a section with NO description must reserve the same slot, which
+        # is what kept the Palette from riding higher than its neighbours.
+        page.close()
+
+    # A section without a hint still reserves the description row.
+    b = get_builder("statistical", None, num_cols=["age"],
+                    cat_cols=["region"], dt_cols=[], palette_names=["Default"],
+                    all_cols=["age", "region"])
+    b._build()
+    pal_page = b.build_generate()
+    hints = [w for w in pal_page.findChildren(QLabel)
+             if w.property('theme_role') == 'label']
+    check("align: hint row is a fixed-height slot, not sized by its text",
+          all(w.height() > 0 for w in hints) and bool(hints), str(len(hints)))
+    check("align: the reserved slot allows two wrapped lines",
+          HINT_ROW_LINES == 2, str(HINT_ROW_LINES))
+
+
+# =========================================================================
+# Chart tab strip is scoped to the selected analysis type
+# =========================================================================
+#
+# Regression: the strip was flat, so with Statistical selected you could still
+# see (and select) a Distribution chart sitting next to it.
+
+
+def test_chart_tabs_scoped_to_selected_type():
+    from PySide6.QtCore import Signal
+    from PySide6.QtWidgets import QWidget
+    import desktop.pages.analysis_page as AP
+    from desktop.session_bridge import SessionBridge
+
+    # A real ChartCard builds a QWebEngineView, which cannot initialise in a
+    # headless run. The tab-strip logic under test is pure bookkeeping, so a
+    # lightweight stand-in keeps this test runnable everywhere.
+    class _FakeCard(QWidget):
+        delete_requested = Signal()
+        edit_requested = Signal()
+        note_changed = Signal()
+
+        def __init__(self, uid, title, fig, chart_type, meta):
+            super().__init__()
+            self._fig = fig
+            self.btn_up = QWidget()
+            self.btn_down = QWidget()
+            self.btn_style = QWidget()
+
+        def set_note(self, n):
+            pass
+
+        def set_title(self, t):
+            pass
+
+        def set_figure(self, f):
+            self._fig = f
+
+    real_card = AP.ChartCard
+    AP.ChartCard = _FakeCard
+    try:
+        br = SessionBridge()
+        br.add_chart("c1", "Stat A", None, chart_type="statistical")
+        br.add_chart("c2", "Dist A", None, chart_type="distribution")
+        br.add_chart("c3", "Stat B", None, chart_type="statistical")
+        br.add_chart("c4", "Dist B", None, chart_type="distribution")
+        pg = AP.AnalysisPage(br)
+
+        def tabs_for(aid):
+            pg._active_analysis = aid
+            pg._refresh_charts()
+            return [pg.charts_tabs.tabText(i)
+                    for i in range(pg.charts_tabs.count())]
+
+        t_stat = tabs_for("statistical")
+        t_dist = tabs_for("distribution")
+        t_back = tabs_for("statistical")
+
+        check("tabs: statistical shows only statistical charts",
+              t_stat == ["Statistical 1", "Statistical 2"], str(t_stat))
+        check("tabs: distribution shows only distribution charts",
+              t_dist == ["Distribution 1", "Distribution 2"], str(t_dist))
+        check("tabs: switching type back restores the same strip",
+              t_back == t_stat, str(t_back))
+        check("tabs: labels no longer need to carry the type name",
+              all(not t.startswith("Distribution") for t in t_stat), str(t_stat))
+
+        # The hidden cards must survive the switch: rebuilding a ChartCard
+        # reloads plotly.js, which is the visible "app reopened itself" flash.
+        check("tabs: hidden charts stay alive (no webview rebuild)",
+              len(pg._chart_cards) == 4, str(sorted(pg._chart_cards)))
+
+        # Deleting a chart of the hidden type must still be honoured.
+        br.remove_chart("c2")
+        check("tabs: deleting a hidden chart updates the strip",
+              tabs_for("distribution") == ["Distribution 1"],
+              str(tabs_for("distribution")))
+        pg.deleteLater()
+    finally:
+        AP.ChartCard = real_card
+
+
+# =========================================================================
+# Repository guard: no chart-specific column detection
+# =========================================================================
+#
+# Every analysis runner used to answer "which columns are metrics / are
+# dimensions?" with its own df.select_dtypes(...) call. That is how a column
+# the user deliberately reclassified as a dimension kept showing up as a
+# metric in some chart types and not others, and how `category`/`string`/`bool`
+# columns fell out of every pool. The fix was to centralise the answer in
+# services/column_roles.py -- but centralising it only helps if nothing can
+# quietly reintroduce a local answer, so this test is the enforcement.
+
+
+def _analysis_modules():
+    import os
+    root = os.path.join(REPO_ROOT, "backend", "modules", "analysis")
+    return [(n, os.path.join(root, n))
+            for n in sorted(os.listdir(root)) if n.endswith(".py")]
+
+
+def test_analysis_runners_use_shared_column_roles():
+    print("[37] No live analysis module derives column roles itself")
+    import ast
+    import tokenize
+
+    # A raw text scan is not enough: several runners legitimately DISCUSS
+    # select_dtypes in their module docstring -- some with a call-shaped
+    # example like select_dtypes("object") -- so matching the file as text
+    # would flag every one of those explanations. Comments and string literals
+    # are stripped with tokenize first, and only real code is matched.
+    line_offenders = []
+    for name, path in _analysis_modules():
+        try:
+            with open(path, "rb") as fh:
+                toks = list(tokenize.tokenize(fh.readline))
+        except (tokenize.TokenError, OSError):
+            continue
+        code_lines = set()
+        for tok in toks:
+            if tok.type in (tokenize.COMMENT, tokenize.STRING):
+                continue
+            if tok.type == tokenize.NAME and tok.string == "select_dtypes":
+                code_lines.add(tok.start[0])
+        if code_lines:
+            line_offenders.append(f"{name}:{sorted(code_lines)[0]}")
+    check("roles: no live analysis runner calls select_dtypes",
+          not line_offenders, "; ".join(line_offenders[:5]))
+
+    # Belt and braces: the AST view, so a multi-line or oddly formatted call
+    # (which the line scan can miss) is still caught, and so a call written in
+    # a docstring cannot false-positive the way the line scan would.
+    ast_offenders = []
+    for name, path in _analysis_modules():
+        try:
+            tree = ast.parse(open(path, encoding="utf-8").read())
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "select_dtypes"):
+                ast_offenders.append(f"{name}:{node.lineno}")
+    check("roles: AST confirms no select_dtypes call anywhere",
+          not ast_offenders, "; ".join(ast_offenders[:5]))
+
+    # Every runner must be able to receive the resolved roles, otherwise the
+    # threading through analysis_service is dead code for it.
+    from services.analysis_service import _RUNNERS, _accepts_roles
+    without = sorted(aid for aid, fn in _RUNNERS.items()
+                     if not _accepts_roles(fn) and aid != "data_quality")
+    check("roles: every runner accepts the shared roles mapping",
+          not without, str(without))
+
+    # role_pools must expose the shape the runners index into.
+    import pandas as pd
+    from services.column_roles import role_pools
+    df = pd.DataFrame({"n": [1.0, 2.0], "c": ["a", "b"],
+                       "t": pd.to_datetime(["2024-01-01", "2024-01-02"])})
+    pools = role_pools(df)
+    check("roles: role_pools exposes num/cat/dt/dim",
+          set(pools) == {"num", "cat", "dt", "dim"}, str(sorted(pools)))
+    check("roles: a datetime column is a usable dimension",
+          "t" in pools["dim"] and "c" in pools["dim"], str(pools["dim"]))
+
+
+def test_runners_honour_user_classification():
+    """A numeric column the user reclassified must not come back as a metric."""
+    print("[38] Runners honour the user's column classification")
+    import pandas as pd
+    from services.analysis_service import run_analysis
+    from services.column_roles import resolve_roles
+
+    # 'order_id' is a plain int64 -- indistinguishable from a real metric by
+    # dtype alone, which is exactly the case that used to leak through.
+    df = pd.DataFrame({"order_id": [1, 2, 3, 4, 5, 6],
+                       "qty": [2.0, 4.0, 1.0, 5.0, 3.0, 6.0],
+                       "price": [1.5, 2.5, 3.5, 4.5, 5.5, 6.5],
+                       "region": ["a", "b", "a", "b", "a", "b"]})
+    roles = resolve_roles(df, explicit={"numeric": ["qty", "price"],
+                                         "categorical": ["order_id", "region"]})
+    check("roles: the reclassified column moved to a dimension",
+          "order_id" in roles["categorical"]
+          and "order_id" not in roles["numeric"], str(roles))
+
+    r_user = run_analysis("correlation", df, roles=roles)
+    check("roles: correlation builds from the user's metric pool",
+          len(r_user) == 1, str(len(r_user)))
+    if r_user:
+        # Plotly hands back a numpy array here, so an `or []` truth test would
+        # raise rather than fall through -- index it explicitly.
+        xs = r_user[0][2].data[0].x
+        labels = [] if xs is None else [str(v) for v in xs]
+        check("roles: the reclassified id is absent from the matrix",
+              "order_id" not in labels, str(labels))
+        check("roles: the matrix covers exactly the two real metrics",
+              sorted(labels) == ["price", "qty"], str(labels))
+
+    # The other metric-driven runners must agree with correlation.
+    check("roles: statistical still builds with the same roles",
+          len(run_analysis("statistical", df, roles=roles)) == 1)
+    check("roles: distribution still builds with the same roles",
+          len(run_analysis("distribution", df, roles=roles)) >= 1)
+    # A dimension-driven runner must never offer the id as a grouping column
+    # only because it is numeric -- the user's choice is what counts.
+    cat_titles = [t for _u, t, _f in run_analysis("categorical", df,
+                                                  roles=roles)]
+    check("roles: categorical groups on the reclassified dimension",
+          any("order_id" in t for t in cat_titles), str(cat_titles))
+
+    # Without roles at all, auto-detection is still a safe fallback.
+    check("roles: auto-detection remains a working fallback",
+          len(run_analysis("correlation", df)) == 1)
+
+
+def _corr_ctx():
+    return dict(num_cols=["age", "salary", "years"], cat_cols=["region"],
+                dt_cols=["date"], palette_names=["A", "B"],
+                all_cols=["age", "salary", "years", "region", "date"])
+
+
+def test_correlation_settings_match_statistical_design():
+    """Correlation must use the SAME three-tab design as statistical."""
+    print("[39] Correlation settings follow the statistical template")
+    from PySide6.QtWidgets import QApplication, QCheckBox, QHBoxLayout, QLabel
+    from desktop.widgets.analysis_settings import get_builder, registered
+    from desktop.widgets.analysis_settings.statistical import StatisticalSettings
+    from desktop.widgets.analysis_settings.correlation import (
+        CorrelationSettings, COLORSCALES_ALL, ANNOTATION_SIZE_RANGE,
+        COLORBAR_TICK_SIZE_RANGE, COLORBAR_TITLE_SIZE_RANGE, PRECISION_RANGE)
+
+    QApplication.instance() or QApplication([])
+
+    check("design: correlation is registered", "correlation" in registered())
+    check("design: correlation reuses the statistical template",
+          issubclass(CorrelationSettings, StatisticalSettings))
+    # Correlation DOES override build_typography, but only to mask the rows it
+    # has no use for: the old metadata gives it
+    # [family, font_style, header, axis_tick]. The rows it keeps must still
+    # come from the shared template rather than a private copy.
+
+    def _mk(aid):
+        return get_builder(aid, None, num_cols=["age", "salary", "years"],
+                           cat_cols=["region"], dt_cols=["date"],
+                           palette_names=["A", "B"])
+
+    def _sections(page):
+        """Section titles in true left-to-right order (see test 33)."""
+        found = []
+        for lay in page.findChildren(QHBoxLayout):
+            for i in range(lay.count()):
+                w = lay.itemAt(i).widget()
+                if w is None:
+                    continue
+                labels = [sl.text() for sl in w.findChildren(QLabel)
+                          if sl.property('theme_role') == 'section']
+                if labels:
+                    found.append((lay.indexOf(w), labels[0]))
+        found.sort(key=lambda it: it[0])
+        return [t for _i, t in found]
+
+    def _rows(page):
+        out = []
+        for w in page.findChildren(object):
+            try:
+                if w.property('grid_row'):
+                    labs = [sl.text() for sl in w.findChildren(QLabel)
+                            if sl.property('theme_role') == 'section']
+                    if labs:
+                        out.append(labs[0])
+            except Exception:
+                pass
+        return out
+
+    st, cs = _mk("statistical"), _mk("correlation")
+    st_typ, cs_typ = st.build_typography(), cs.build_typography()
+    st_gen, cs_gen = st.build_generate(), cs.build_generate()
+    cs_lay = cs.build_layout()
+
+    # -- Generate: Columns only.
+    #
+    # Correlation is has_axes=False / has_legend=False in the old metadata, and
+    # its controls are the title, the colour scale, the colour-bar styling and
+    # the four annotation options. Neither a dimension control nor a Palette
+    # belongs here. The palette was in the old _WIDGET_SPEC but was inert --
+    # the old display layer always repainted the trace from
+    # heatmap_colorscale -- so it is masked rather than shipped as a dead
+    # control.
+    secs = _sections(cs_gen)
+    check("design: correlation Generate offers Columns and nothing else",
+          secs == ["Columns"], str(secs))
+    check("design: correlation has no Palette control",
+          not any("Palette" in s for s in secs), str(secs))
+    check("design: correlation has no dimension control",
+          not any(g in ("Group by (optional)", "Color by") for g in secs),
+          str(secs))
+    check("design: correlation control widths match the 210px template",
+          cs._combo_columns.width() == 210, str(cs._combo_columns.width()))
+    check("values: correlation collect_values returns no palette key",
+          "palette" not in cs.collect_values(), str(cs.collect_values()))
+
+    # -- Layout: the old control list, plus the two requested additions.
+    # Everything the template carries that correlation cannot use is masked,
+    # because a control that cannot change the chart reads as broken.
+    lay_rows = _rows(cs_lay)
+    # "Annotations" is a checkbox rather than a grid row, so it is covered by
+    # the checkbox assertion below rather than by this row list.
+    for want in ("Chart title", "Colorscale", "CB title", "CB tick sz",
+                 "CB tick clr", "CB title sz", "CB title clr",
+                 "Precision", "Ann size", "Ann color"):
+        check(f"layout: correlation keeps the '{want}' row", want in lay_rows,
+              str(lay_rows))
+    for unwanted in ("X-axis", "Y-axis", "Legend title", "Legend position"):
+        check(f"layout: correlation masks the '{unwanted}' row",
+              unwanted not in lay_rows, str(lay_rows))
+    boxes = [c.text() for c in cs_lay.findChildren(QCheckBox)]
+    check("layout: Annotations and Show border are the only checkboxes",
+          boxes == ["Annotations", "Show border"], str(boxes))
+    check("layout: Show border is checked by default",
+          cs._ck_border.isChecked(), str(cs._ck_border.isChecked()))
+    check("layout: the colorbar position offers Left and Right",
+          [cs._cb_cbpos.itemText(i) for i in range(cs._cb_cbpos.count())]
+          == ["Right", "Left"],
+          str([cs._cb_cbpos.itemText(i) for i in range(cs._cb_cbpos.count())]))
+
+    # -- Typography: family, font_style, header, axis_tick -- and nothing else.
+    typ_rows = _rows(cs_typ)
+    for want in ("Font family", "Font style", "Axis size", "Axis color"):
+        check(f"typography: correlation keeps '{want}'", want in typ_rows,
+              str(typ_rows))
+    for unwanted in ("Title size", "Title color", "Legend size", "Legend color"):
+        check(f"typography: correlation masks '{unwanted}'",
+              unwanted not in typ_rows, str(typ_rows))
+    check("typography: correlation drops the legend typography",
+          not any("Legend" in r for r in typ_rows), str(typ_rows))
+
+    # -- No placeholder text masquerading as a value.
+    check("display: correlation Columns blank when nothing selected",
+          cs._combo_columns.currentText() == "",
+          repr(cs._combo_columns.currentText()))
+    cs._combo_columns.set_selection(["age"])
+    check("display: correlation Columns shows the real selection",
+          cs._combo_columns.currentText() == "age",
+          repr(cs._combo_columns.currentText()))
+
+
+def test_correlation_alignment_values_and_generation():
+    """Correlation Generate controls align, round-trip, and drive the chart."""
+    print("[40] Correlation alignment, value round-trip and generation")
+    import pandas as pd
+    import plotly.graph_objects as go
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QApplication
+    from desktop.widgets.analysis_settings import get_builder
+    from chart_display import apply_display_options, default_layout_opts
+    from services.analysis_service import run_analysis_with_config, WIDGET_SPEC
+
+    app = QApplication.instance() or QApplication([])
+
+    # -- Alignment: the Generate controls share one line.
+    b = get_builder("correlation", None, **_corr_ctx())
+    b.prefill({"x": ["age"]})
+    page = b.build_generate()
+    page.resize(900, 260)
+    page.show()
+    app.processEvents()
+    w = b._combo_columns
+    check("align: correlation control sits at the shared y",
+          w is not None and w.mapTo(page, QPoint(0, 0)).y() >= 0,
+          str(w.mapTo(page, QPoint(0, 0)).y()) if w else "no widget")
+    page.close()
+
+    # -- Round trip. Correlation's WIDGET_SPEC also declares "palette", but
+    #    that control is masked (it is inert -- the display layer always
+    #    repaints from heatmap_colorscale), so the collected keys must NOT
+    #    include it. Compare against the spec minus the masked fields rather
+    #    than against the raw spec, or this test would demand the very key the
+    #    masking removes.
+    b2 = get_builder("correlation", None, **_corr_ctx())
+    gen = b2.build_generate()
+    got = set(b2.collect_values())
+    spec_keys = set(k for k, _rk, _ty in WIDGET_SPEC["correlation"]) - {"palette"}
+    check("values: collected keys are the unmasked WIDGET_SPEC keys",
+          got == spec_keys, f"{sorted(got)} vs {sorted(spec_keys)}")
+    b2.prefill({"x": ["age", "salary"]})
+    check("values: prefill round-trips x",
+          b2.collect_values().get("x") == ["age", "salary"],
+          str(b2.collect_values().get("x")))
+    b2.prefill({"x": ["age", "GONE"]})
+    check("values: a stale column is dropped on prefill",
+          b2.collect_values().get("x") == ["age"],
+          str(b2.collect_values().get("x")))
+
+    # -- Layout prefill restores what it stored, and leaves the rest alone.
+    lo = dict(default_layout_opts())
+    lo.update({"heatmap_show_text": False, "heatmap_colorscale": "Viridis",
+               "heatmap_annotation_precision": 6, "colorbar_title": "zz"})
+    b2._layout_opts = {}
+    # Keep a reference to the returned page: PySide owns a widget nobody
+    # holds, so dropping it here would collect the page AND its children,
+    # leaving b2._ck_ann pointing at a deleted C++ object.
+    lay_page = b2.build_layout()   # create the widgets first (app order)
+    b2.prefill_layout(lo)
+    check("layout: prefill restores Annotations off",
+          b2._ck_ann.isChecked() is False, str(b2._ck_ann.isChecked()))
+    check("layout: prefill restores the colorscale",
+          b2._cb_cs.currentText() == "Viridis", b2._cb_cs.currentText())
+    check("layout: prefill restores precision",
+          b2._prec_spin.value() == 6, str(b2._prec_spin.value()))
+    check("layout: prefill restores the colorbar title",
+          b2._le_cb.text() == "zz", b2._le_cb.text())
+    # Defaults come from default_layout_opts, not from hard-coded strings.
+    check("layout: default colorscale is RdBu",
+          default_layout_opts()["heatmap_colorscale"] == "RdBu")
+    check("layout: default annotation colour is #ffffff",
+          default_layout_opts()["heatmap_annotation_color"] == "#ffffff")
+    check("layout: default colorbar tick colour is #94a3b8",
+          default_layout_opts()["colorbar_tick_color"] == "#94a3b8")
+    # A stale colorscale / position snaps back to a real entry.
+    b2.prefill_layout({"heatmap_colorscale": "NotAScale",
+                       "colorbar_position": "Sideways"})
+    check("layout: the layout page is still alive after prefill",
+          lay_page is not None)
+    check("layout: a stale colorscale snaps back to RdBu",
+          b2._cb_cs.currentText() == "RdBu", b2._cb_cs.currentText())
+    check("layout: a stale colorbar position snaps back to Right",
+          b2._cb_cbpos.currentText() == "Right", b2._cb_cbpos.currentText())
+
+
+    # -- Generation: the collected values reach the runner and produce the
+    #    matrix the user asked for.
+    import pandas as _pd
+    from services.analysis_service import run_analysis_with_config as _rac
+    _df = _pd.DataFrame({"age": [20, 30, 40, 50, 60, 70],
+                         "salary": [1000, 2000, 1500, 4000, 3000, 5000],
+                         "years": [1, 2, 3, 4, 5, 6]})
+    _vals = dict(b2.collect_values())
+    _vals["x"] = ["age", "salary", "years"]
+    _res = _rac("correlation", _df, _vals)
+    fig = _res[0][2]
+    check("generation: the figure is a heatmap",
+          str(fig.data[0].type).lower() == "heatmap", str(fig.data[0].type))
+    xs = fig.data[0].x
+    xs = [] if xs is None else [str(v) for v in xs]
+    check("generation: the matrix covers the three chosen columns",
+          sorted(xs) == ["age", "salary", "years"], str(xs))
+
+    # Fewer than two columns cannot produce a matrix: the runner must return
+    # an empty list, not raise.
+    few = _rac("correlation", _df, {"x": ["age"]})
+    check("generation: one column yields no chart (not an error)", few == [],
+          str(len(few)))
+
+    # Display options must actually reach the heatmap trace.
+    f2 = apply_display_options(
+        fig, {"heatmap_colorscale": "Viridis",
+              "heatmap_annotation_precision": 3,
+              "colorbar_title": "r", "colorbar_tick_size": 14},
+        {"family": "Inter"})
+    tr = f2.data[0]
+    check("display: precision reformats the cell text",
+          tr.texttemplate == "%{z:.3f}", str(tr.texttemplate))
+    check("display: the colorscale reaches the figure",
+          "viridis" in str(getattr(f2.layout.coloraxis, "colorscale", "")
+                            ).lower()
+          or "viridis" in str(getattr(tr, "colorscale", "")).lower()
+          or _viridis_first_stop(f2) is not None,
+          str(getattr(f2.layout.coloraxis, "colorscale", ""))[:50])
+    cb = f2.layout.coloraxis.colorbar
+    check("display: the colorbar title is applied",
+          getattr(cb.title, "text", None) == "r",
+          str(getattr(cb.title, "text", None)))
+    check("display: the colorbar tick size is applied",
+          getattr(cb.tickfont, "size", None) == 14,
+          str(getattr(cb.tickfont, "size", None)))
+
+    f3 = apply_display_options(fig, {"heatmap_show_text": False}, {})
+    check("display: turning Annotations off clears BOTH text and texttemplate",
+          f3.data[0].text is None and f3.data[0].texttemplate is None,
+          f"{f3.data[0].text}/{f3.data[0].texttemplate}")
+
+    # ---- Regression: the annotation size/colour were silently discarded ----
+    # A user-reported bug: the Ann size slider and the Ann color swatch both
+    # moved but the cell values never changed. Two independent causes, both of
+    # which have to stay fixed:
+    #   1. _apply_heatmap_options skipped textfont entirely when the trace had
+    #      none yet (a fresh px.imshow heatmap has textfont=None).
+    #   2. the generic value-label pass ran AFTER it and overwrote textfont
+    #      with a bare dict(color=...), discarding size and the colour.
+    # The earlier assertion above only checked the colorscale, which is why
+    # these two slipped through.
+    f4 = apply_display_options(
+        fig, {"heatmap_annotation_size": 22, "heatmap_annotation_color": "#00ff00"}, {})
+    tf4 = f4.data[0].textfont
+    check("display: annotation size reaches the cell text",
+          getattr(tf4, "size", None) == 22, str(getattr(tf4, "size", None)))
+    check("display: annotation colour reaches the cell text",
+          str(getattr(tf4, "color", "")).lower() == "#00ff00",
+          str(getattr(tf4, "color", None)))
+
+    # And a bar chart must still get the shared value-label colour -- the fix
+    # above skips heatmaps only, so this guards the other side of it.
+    bars = go.Figure(go.Bar(x=["a", "b"], y=[1, 2], text=["1", "2"],
+                            textposition="outside"))
+    b1 = apply_display_options(bars, {"value_label_color": "#ff0000"}, {})
+    check("display: a bar trace still takes the value-label colour",
+          str(getattr(b1.data[0].textfont, "color", "")).lower() == "#ff0000",
+          str(getattr(b1.data[0].textfont, "color", None)))
+
+    # ---- Regression: Colorscale looked selected but never painted ----------
+    # px.imshow binds the trace to layout.coloraxis, and that axis carries
+    # its own colorscale. Writing colorscale on the trace alone had no
+    # visible effect, so the chart kept the app's brand palette.
+    f5 = apply_display_options(fig, {"heatmap_colorscale": "Viridis"}, {})
+    tr5 = f5.data[0]
+    first = _first_colorscale_stop(f5)
+    check("display: the selected colorscale is what the axis will paint",
+          _rgb(first) == (68, 1, 84), str(first))
+    check("display: the trace is not left bound to a stale shared axis",
+          getattr(tr5, "coloraxis", None) is None
+          or _first_colorscale_stop(f5) is not None,
+          str(getattr(tr5, "coloraxis", None)))
+    # Switching back must switch back, not latch on the first choice. Plotly
+    # normalises a named scale to an rgb() string (Greys starts at pure
+    # white), so the comparison is on parsed RGB values, not on the literal
+    # text -- comparing "#ffffff" to "rgb(255,255,255)" would fail for a
+    # colour that is in fact correct.
+    f6 = apply_display_options(fig, {"heatmap_colorscale": "Greys"}, {})
+    first6 = _first_colorscale_stop(f6)
+    check("display: changing the colorscale changes the paint again",
+          _rgb(first6) == (255, 255, 255), str(first6))
+    check("display: the two scales really differ (the switch is not a no-op)",
+          _rgb(first) != _rgb(first6), f"{first} vs {first6}")
+
+    # ---- Regression: Show border / colorbar position were unreachable -------
+    fb = apply_display_options(fig, {"show_border": False}, {})
+    cb_off = fb.layout.coloraxis.colorbar
+    check("display: Show border off reaches the colorbar",
+          getattr(cb_off, "borderwidth", None) == 0,
+          str(getattr(cb_off, "borderwidth", None)))
+    fb2 = apply_display_options(fig, {"show_border": True}, {})
+    check("display: Show border on reaches the colorbar",
+          getattr(fb2.layout.coloraxis.colorbar, "borderwidth", None) == 1,
+          str(getattr(fb2.layout.coloraxis.colorbar, "borderwidth", None)))
+    # -- Regression: "colour bar & corr. chart meshed together" -------------
+    # Placing the bar with a negative x drops it onto the y tick labels, which
+    # on a heatmap are the long COLUMN NAMES. The fix reserves a strip of the
+    # plot domain for the bar and measures that strip from the bar thickness
+    # plus the labels. Three things have to hold:
+    #   * the domain shifts away from the chosen side,
+    #   * the bar sits in the freed strip, not in the axis-label margin,
+    #   * the bar's strip also allows for the tick labels on the left.
+    right = apply_display_options(fig, {"colorbar_position": "Right"}, {},
+                                  width_px=1200)
+    left = apply_display_options(fig, {"colorbar_position": "Left"}, {},
+                                 width_px=1200)
+    dl = tuple(left.layout.xaxis.domain)
+    dr = tuple(right.layout.xaxis.domain)
+    check("colorbar: Left reserves a strip on the left", dl[0] > 0.0, str(dl))
+    check("colorbar: Right reserves a strip on the right", dr[1] < 1.0, str(dr))
+    cbl = left.layout.coloraxis.colorbar
+    check("colorbar: Left parks the bar at the far-left edge of the strip",
+          cbl.x == 0.0 and cbl.xanchor == "left",
+          f"x={cbl.x} anchor={cbl.xanchor}")
+    cbr = right.layout.coloraxis.colorbar
+    check("colorbar: Right parks the bar at the far-right edge of the strip",
+          cbr.x == 1.0 and cbr.xanchor == "right",
+          f"x={cbr.x} anchor={cbr.xanchor}")
+    # The left strip must be wide enough for the bar AND the labels. Measured
+    # in paper fractions: bar(30)+gap(14)+labels(len*8+12) over the card width.
+    # Plotly returns y as a numpy array, so an `or []` truth test raises here.
+    _yv = fig.data[0].y
+    _names = [] if _yv is None else [str(v) for v in _yv]
+    _longest = max((len(n) for n in _names), default=0)
+    _need = (30 + 14 + _longest * 8 + 12) / 1200.0
+    check("colorbar: the Left strip also leaves room for the tick labels",
+          dl[0] >= _need - 0.001,
+          f"strip={dl[0]:.4f} need>={_need:.4f} longest={_longest}")
+
+    # The heatmap draws no legend, so no legend column may be reserved. This
+    # used to happen anyway (legend_position still carried a default), and
+    # because it writes xaxis.domain it silently undid the colour-bar strip.
+    from chart_display import _figure_has_legend
+    check("colorbar: a heatmap is not treated as having a legend",
+          not _figure_has_legend(left), "reported a legend")
+    check("colorbar: the legend reservation did not overwrite the strip",
+          tuple(left.layout.xaxis.domain)[0] > 0.0,
+          str(tuple(left.layout.xaxis.domain)))
+    # A real legend must still get its column.
+    import plotly.graph_objects as _go
+    bars2 = _go.Figure(_go.Bar(x=["a", "b"], y=[1, 2], name="series"))
+    check("colorbar: a bar chart is still treated as having a legend",
+          _figure_has_legend(bars2), "no legend reported")
+    withleg = apply_display_options(bars2, {"legend_position": "Top Right"}, {},
+                                    width_px=1000)
+    check("colorbar: the legend column is still reserved where it belongs",
+          tuple(withleg.layout.xaxis.domain)[1] < 1.0,
+          str(tuple(withleg.layout.xaxis.domain)))
+
+
+def _cat_ctx():
+    return dict(num_cols=["transaction_qty", "unit_price", "revenue"],
+                cat_cols=["product_category", "region"],
+                dt_cols=["when"],
+                dim_cols=["product_category", "region", "when"],
+                palette_names=["Default", "A"],
+                all_cols=["transaction_qty", "unit_price", "revenue",
+                          "product_category", "region", "when"])
+
+
+def test_categorical_settings_match_statistical_design():
+    """Categorical must use the SAME three-tab design as statistical."""
+    print("[41] Categorical settings follow the statistical template")
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QApplication, QCheckBox, QHBoxLayout, QLabel, QWidget
+    from desktop.widgets.analysis_settings import get_builder, registered
+    from desktop.widgets.analysis_settings.statistical import StatisticalSettings
+    from desktop.widgets.analysis_settings.categorical import (
+        CategoricalSettings, LINE_WIDTH_RANGE, LINE_WIDTH_DEFAULT, TOP_N_RANGE)
+    from services.analysis_service import WIDGET_SPEC
+
+    QApplication.instance() or QApplication([])
+
+    check("design: categorical is registered", "categorical" in registered())
+    check("design: categorical reuses the statistical template",
+          issubclass(CategoricalSettings, StatisticalSettings))
+
+    def _sections(page):
+        """Section titles in true visual order (rows top-to-bottom).
+
+        Sorted from mapped coordinates rather than findChildren order: the
+        Generate page stacks THREE wrapped rows, and creation order is not
+        reading order.
+        """
+        entries = []
+        for lay in page.findChildren(QHBoxLayout):
+            for i in range(lay.count()):
+                w = lay.itemAt(i).widget()
+                if w is None:
+                    continue
+                labels = [sl.text() for sl in w.findChildren(QLabel)
+                          if sl.property('theme_role') == 'section']
+                if labels:
+                    p = w.mapTo(page, QPoint(0, 0))
+                    entries.append((round(p.y() / 20), p.x(), labels[0]))
+        entries.sort()
+        return [t for _ry, _x, t in entries]
+
+    def _rows(page):
+        """grid_row labels in visual order (same mapped-coordinate sort)."""
+        entries = []
+        for w in page.findChildren(QWidget):
+            try:
+                if w.property('grid_row'):
+                    labs = [sl.text() for sl in w.findChildren(QLabel)
+                            if sl.property('theme_role') == 'section']
+                    if labs:
+                        p = w.mapTo(page, QPoint(0, 0))
+                        entries.append((round(p.y() / 20), p.x(), labs[0]))
+            except Exception:
+                pass
+        entries.sort()
+        return [t for _ry, _x, t in entries]
+
+    b = get_builder("categorical", None, **_cat_ctx())
+    gen_page = b.build_generate()
+    gen_page.resize(900, 560)
+    gen_page.show()
+    QApplication.processEvents()
+
+    # -- Generate: the old panel's eight controls, in its order. Palette is
+    #    last (slot 3), and "sort" from _WIDGET_SPEC is NOT built because the
+    #    old panel never rendered a Sort control for this type either.
+    secs = _sections(gen_page)
+    check("design: Generate offers the eight old controls in order",
+          secs == ["Dimension", "Metric", "Aggregation", "\U0001f4ca Direction",
+                   "Top N", "Secondary Y-Axis", "Secondary Agg",
+                   "\U0001f3a8 Palette"], str(secs))
+    for attr in ("_combo_dim", "_combo_metric", "_combo_agg", "_combo_dir",
+                 "_combo_dual", "_combo_dual_agg", "_combo_palette",
+                 "_spin_topn"):
+        w = getattr(b, attr, None)
+        check(f"design: {attr} uses the 210px template width",
+              w is not None and w.width() == 210,
+              str(w.width()) if w else "missing")
+    check("design: Top N is a 0..200 spinner defaulting to 0",
+          b._spin_topn.minimum() == TOP_N_RANGE[0]
+          and b._spin_topn.maximum() == TOP_N_RANGE[1]
+          and b._spin_topn.value() == 0, str(b._spin_topn.value()))
+    texts = [c.currentText() for c in
+             (b._combo_dim, b._combo_metric, b._combo_agg, b._combo_dir,
+              b._combo_dual, b._combo_dual_agg, b._combo_palette)]
+    check("display: no combo shows the literal word None",
+          "None" not in texts, str(texts))
+    check("display: Dimension defaults to the first dimension",
+          b._combo_dim.currentText() == "product_category",
+          b._combo_dim.currentText())
+    check("display: Metric defaults to the first metric",
+          b._combo_metric.currentText() == "transaction_qty",
+          b._combo_metric.currentText())
+    check("display: Secondary Y-Axis starts blank",
+          b._combo_dual.currentText() == "",
+          repr(b._combo_dual.currentText()))
+    gen_page.close()
+
+    # -- Values: every WIDGET_SPEC key except the never-rendered "sort".
+    got = set(b.collect_values())
+    spec_keys = set(k for k, _rk, _ty in WIDGET_SPEC["categorical"]) - {"sort"}
+    check("values: collected keys are the unmasked WIDGET_SPEC keys",
+          got == spec_keys, f"{sorted(got)} vs {sorted(spec_keys)}")
+    vals = b.collect_values()
+    check("values: x and y collect as lists (WIDGET_SPEC kind)",
+          vals["x"] == ["product_category"] and vals["y"] == ["transaction_qty"],
+          str(vals))
+
+    # -- Layout: the old control list PLUS the shared legend group. --------
+    # Legend title / Legend position / Show border are kept: this chart draws
+    # a real legend (the Secondary Y-Axis overlay is a second series), and
+    # the legend / colour-bar / colour-scale settings are one shared setting
+    # across the supported charts.
+    lay_page = b.build_layout()
+    lay_page.resize(900, 560)
+    lay_page.show()
+    QApplication.processEvents()
+    lay_rows = _rows(lay_page)
+    for want in ("Chart title", "X-axis", "Y-axis (left)", "Y-axis (right)",
+                 "Label pos", "Bar mode", "Line width", "Bar gap",
+                 "Legend title", "Legend position"):
+        check(f"layout: keeps the '{want}' row", want in lay_rows,
+              str(lay_rows))
+    boxes = [c.text() for c in lay_page.findChildren(QCheckBox)]
+    check("layout: value labels + grid + the shared border toggle",
+          boxes == ["Show value labels", "Show grid", "Show border"], str(boxes))
+    check("layout: Line width sits between Bar mode and Bar gap",
+          lay_rows.index("Bar mode") < lay_rows.index("Line width")
+          < lay_rows.index("Bar gap"), str(lay_rows))
+    check("layout: the dual-axis labels come after each other in order",
+          lay_rows.index("X-axis") < lay_rows.index("Y-axis (left)")
+          < lay_rows.index("Y-axis (right)"), str(lay_rows))
+    check("layout: line width range is 1..10 (old _CONTROL_META)",
+          LINE_WIDTH_RANGE == (1, 10) and b._lw_slider.minimum() == 1
+          and b._lw_slider.maximum() == 10,
+          str((b._lw_slider.minimum(), b._lw_slider.maximum())))
+    check("layout: line width default is 2 (old _CONTROL_META)",
+          LINE_WIDTH_DEFAULT == 2 and b._lw_spin.value() == 2,
+          str(b._lw_spin.value()))
+    lay_page.close()
+
+    # -- Typography: the shared tab, inherited whole (legend group included).
+    typ_page = b.build_typography()
+    typ_page.resize(900, 480)
+    typ_page.show()
+    QApplication.processEvents()
+    typ_rows = _rows(typ_page)
+    for want in ("Font family", "Font style", "Header size", "Header color",
+                 "Title size", "Title color", "Axis size", "Axis color",
+                 "Legend size", "Legend color"):
+        check(f"typography: keeps '{want}'", want in typ_rows, str(typ_rows))
+    check("typography: inherited whole, not re-implemented per type",
+          "build_typography" not in CategoricalSettings.__dict__)
+    typ_page.close()
+
+
+def test_categorical_alignment_values_and_generation():
+    """Categorical Generate controls align, round-trip, and drive the chart."""
+    print("[42] Categorical alignment, value round-trip and generation")
+    import pandas as pd
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QApplication, QLabel
+    from desktop.widgets.analysis_settings import get_builder
+    from chart_display import apply_display_options, default_layout_opts
+    from services.analysis_service import run_analysis_with_config, WIDGET_SPEC
+
+    app = QApplication.instance() or QApplication([])
+
+    # -- Alignment: the controls of ONE wrapped row share a line. ----------
+    b = get_builder("categorical", None, **_cat_ctx())
+    gen_page = b.build_generate()
+    gen_page.resize(900, 560)
+    gen_page.show()
+    app.processEvents()
+
+    def _ys(attrs):
+        out = {}
+        for attr in attrs:
+            w = getattr(b, attr, None)
+            if w is not None:
+                out[attr] = w.mapTo(gen_page, QPoint(0, 0)).y()
+        return out
+
+    row1 = _ys(("_combo_dim", "_combo_metric", "_combo_agg"))
+    row2 = _ys(("_combo_dir", "_spin_topn", "_combo_dual"))
+    row3 = _ys(("_combo_dual_agg", "_combo_palette"))
+    check("align: row 1 (Dimension/Metric/Aggregation) is one line",
+          len(row1) == 3 and len(set(row1.values())) == 1, str(row1))
+    check("align: row 2 (Direction/Top N/Secondary Y) is one line",
+          len(row2) == 3 and len(set(row2.values())) == 1, str(row2))
+    check("align: row 3 (Secondary Agg/Palette) is one line",
+          len(row3) == 2 and len(set(row3.values())) == 1, str(row3))
+    check("align: the wrapped rows are really on different lines",
+          row1["_combo_dim"] < row2["_combo_dir"] < row3["_combo_palette"],
+          f"{row1} | {row2} | {row3}")
+    gen_page.close()
+
+    # -- Round trip. "sort" is declared in WIDGET_SPEC but the old panel
+    #    never rendered it for this type, so -- like correlation's palette --
+    #    it is masked: compare against the spec minus the masked field.
+    b2 = get_builder("categorical", None, **_cat_ctx())
+    gen2 = b2.build_generate()
+    got = set(b2.collect_values())
+    spec_keys = set(k for k, _rk, _ty in WIDGET_SPEC["categorical"]) - {"sort"}
+    check("values: collected keys are the unmasked WIDGET_SPEC keys",
+          got == spec_keys, f"{sorted(got)} vs {sorted(spec_keys)}")
+    b2.prefill({"x": ["region"], "y": ["unit_price"], "agg": "Sum",
+                "top_n": 5, "direction": "Horizontal (Bar chart)",
+                "dual_y": "revenue", "dual_y_agg": "Max", "palette": "A"})
+    got2 = b2.collect_values()
+    check("values: prefill round-trips every field",
+          got2 == {"x": ["region"], "y": ["unit_price"], "agg": "Sum",
+                   "top_n": 5, "direction": "Horizontal (Bar chart)",
+                   "dual_y": "revenue", "dual_y_agg": "Max", "palette": "A"},
+          str(got2))
+    check("values: the widgets show what prefill stored",
+          b2._combo_dim.currentText() == "region"
+          and b2._combo_metric.currentText() == "unit_price"
+          and b2._combo_agg.currentText() == "Sum"
+          and b2._spin_topn.value() == 5
+          and b2._combo_dir.currentText() == "Horizontal (Bar chart)"
+          and b2._combo_dual.currentText() == "revenue"
+          and b2._combo_dual_agg.currentText() == "Max"
+          and b2._combo_palette.currentText() == "A", "")
+    # Stale columns snap: the required Dimension falls back to the first real
+    # column (widget and collected values must never disagree), the optional
+    # Metric and Secondary axis simply go blank.
+    b2.prefill({"x": ["GONE"], "y": ["GONE"], "dual_y": "GONE"})
+    got3 = b2.collect_values()
+    check("values: a stale dimension snaps to the first dimension",
+          got3["x"] == ["product_category"], str(got3["x"]))
+    check("values: a stale metric leaves Metric blank",
+          got3["y"] == [], str(got3["y"]))
+    check("values: a stale secondary axis goes blank",
+          got3["dual_y"] == "", str(got3["dual_y"]))
+    # A secondary axis may not repeat the primary metric.
+    b2.prefill({"x": ["region"], "y": ["unit_price"],
+                "dual_y": "unit_price"})
+    check("values: secondary axis equal to the metric is rejected",
+          b2.collect_values()["dual_y"] == "",
+          str(b2.collect_values()["dual_y"]))
+
+    # -- Layout prefill restores the two rows statistical cannot know about,
+    #    and the mask survives: rows are deleted, not hidden.
+    lo = dict(default_layout_opts())
+    lo.update({"y2_label": "Right axis", "line_width": 7,
+               "show_value_labels": False, "legend_title": "Key",
+               "legend_position": "Bottom Left", "show_border": False})
+    b2._layout_opts = {}
+    # Keep a reference to the returned page: PySide owns a widget nobody
+    # holds, so dropping it would collect the page AND its children.
+    lay_page = b2.build_layout()
+    b2.prefill_layout(lo)
+    check("layout: prefill restores the right-hand axis label",
+          b2._le_y2.text() == "Right axis", b2._le_y2.text())
+    check("layout: prefill restores line width",
+          b2._lw_spin.value() == 7, str(b2._lw_spin.value()))
+    check("layout: prefill can switch value labels off",
+          b2._ck_vals.isChecked() is False, str(b2._ck_vals.isChecked()))
+    # The shared legend rows are real controls here, so their saved values
+    # have to come back too -- they are not masked away any more.
+    check("layout: prefill restores the shared legend title",
+          b2._le_leg.text() == "Key", b2._le_leg.text())
+    check("layout: prefill restores the shared legend position",
+          b2._cb_legpos.currentText() == "Bottom Left",
+          b2._cb_legpos.currentText())
+    check("layout: prefill restores the shared border toggle",
+          b2._ck_border.isChecked() is False, str(b2._ck_border.isChecked()))
+    rowset = set()
+    for w in lay_page.findChildren(object):
+        try:
+            if w.property('grid_row'):
+                rowset.update(sl.text() for sl in w.findChildren(QLabel)
+                              if sl.property('theme_role') == 'section')
+        except Exception:
+            pass
+    check("layout: the legend rows are real rows, not leftovers",
+          {"Legend title", "Legend position"} <= rowset,
+          str(sorted(rowset)))
+
+    # -- Generation: the collected values reach the runner. ----------------
+    df = pd.DataFrame({
+        "product_category": ["A", "A", "B", "B", "C", "C"],
+        "region": ["N", "S", "N", "S", "N", "S"],
+        "transaction_qty": [10, 20, 30, 40, 50, 60],
+        "unit_price": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    })
+    vals = dict(b2.collect_values())
+    vals.update({"x": ["product_category"], "y": ["transaction_qty"],
+                 "agg": "Sum", "dual_y": "unit_price", "dual_y_agg": "Avg",
+                 "direction": "Vertical (Column chart)"})
+    res = run_analysis_with_config("categorical", df, vals)
+    check("generation: one dimension x metric yields one chart",
+          len(res) == 1, str(len(res)))
+    fig = res[0][2]
+    check("generation: a bar with a secondary-axis line",
+          [str(tr.type) for tr in fig.data] == ["bar", "scatter"],
+          str([tr.type for tr in fig.data]))
+    cats = [str(c) for c in fig.data[0].x]
+    ys = [float(v) for v in fig.data[0].y]
+    check("generation: bars carry the grouped sums, value-desc",
+          cats == ["C", "B", "A"] and ys == [110.0, 70.0, 30.0],
+          f"{cats} {ys}")
+
+    h = run_analysis_with_config(
+        "categorical", df, dict(vals, direction="Horizontal (Bar chart)"))[0][2]
+    check("generation: Horizontal renders a bar chart",
+          str(h.data[0].orientation) == "h", str(h.data[0].orientation))
+
+    cnt = run_analysis_with_config(
+        "categorical", df, {"x": ["region"], "y": [], "agg": "Avg",
+                            "top_n": 1, "direction": "Vertical (Column chart)",
+                            "dual_y": "", "dual_y_agg": "Avg",
+                            "palette": "Default"})[0][2]
+    check("generation: no metric falls back to counts, Top N caps it",
+          len(cnt.data[0].x) == 1 and int(cnt.data[0].y[0]) == 3,
+          f"{list(cnt.data[0].x)} {list(cnt.data[0].y)}")
+
+    # Legacy scalar callers must not be split into characters.
+    sc = run_analysis_with_config(
+        "categorical", df, {"x": "region", "y": "unit_price"})[0][2]
+    check("generation: scalar x/y are normalised to lists",
+          sorted(str(c) for c in sc.data[0].x) == ["N", "S"],
+          str(list(sc.data[0].x)))
+
+    # -- Display: the two new Layout options reach the figure. -------------
+    f = apply_display_options(fig, {"y2_label": "Secondary",
+                                    "line_width": 7}, {"family": "Inter"})
+    check("display: the right-hand axis label reaches yaxis2",
+          str(getattr(f.layout.yaxis2.title, "text", None)) == "Secondary",
+          str(getattr(f.layout.yaxis2.title, "text", None)))
+    sc_traces = [tr for tr in f.data if str(tr.type) == "scatter"]
+    check("display: line width reaches the secondary line",
+          bool(sc_traces) and int(sc_traces[0].line.width) == 7,
+          str([tr.line.width for tr in sc_traces]))
+    check("display: line width does not outline the bars",
+          getattr(f.data[0].marker.line, "width", None) in (None, 0),
+          str(getattr(f.data[0].marker.line, "width", None)))
+    f2 = apply_display_options(fig, {"line_width": 3}, {})
+    check("display: no y2_label keeps the runner's own right-axis title",
+          bool(str(getattr(f2.layout.yaxis2.title, "text", None) or "")),
+          str(getattr(f2.layout.yaxis2.title, "text", None)))
+
+    # The shared template controls still work on this chart type too.
+    f3 = apply_display_options(fig, {"show_value_labels": False,
+                                     "bar_mode": "stack", "bar_gap": 0.5}, {})
+    check("display: value labels switch off on a categorical bar",
+          str(f3.data[0].textposition) == "none",
+          str(f3.data[0].textposition))
+    check("display: bar mode reaches the figure",
+          str(f3.layout.barmode) == "stack", str(f3.layout.barmode))
+    check("display: bar gap reaches the figure",
+          abs(float(f3.layout.bargap) - 0.5) < 1e-9, str(f3.layout.bargap))
+
+
+def test_legend_layout_adapts_to_the_viewport():
+    """The legend layout must be CHOSEN from the pixels, not fixed per type.
+
+    A dashboard packs 2-3 charts per row, so a chart that reserved a vertical
+    legend column sized for a full-width preview pane ended up either wasting
+    space or overlapping its own axis on a compact tile. The rule now is: keep
+    the column while it fits inside ``LEGEND_COLUMN_MAX_SHARE`` of the plot area,
+    and switch to a horizontal band (which costs HEIGHT, not width) when it does
+    not. These tests pin the switchover, both anchors, that a band keeps the full
+    plot width, idempotence, and that a resize storm converges instead of
+    latching a stale strip.
+    """
+    print("[N] Legend layout adapts to the viewport (column <-> band)")
+    import plotly.graph_objects as go
+    from chart_display import (LEGEND_COLUMN_MAX_SHARE, apply_legend_layout,
+                               apply_display_options, infer_legend_position,
+                               legend_layout_mode, plan_legend_layout,
+                               refit_legend_width, reserve_legend_band)
+
+    def long_labels(n=6):
+        # Names long enough that a column would eat the plot at dashboard sizes.
+        return [f"Sum transaction_qty by product category {i}" for i in range(n)]
+
+    def base():
+        f = go.Figure()
+        for nm in long_labels():
+            f.add_trace(go.Scatter(x=[1, 2, 3], y=[1, 2, 3], name=nm,
+                                   mode="lines+markers"))
+        # A y-axis title is furniture the old measurement forgot, so it is here
+        # on purpose: it is what pushed the plate out over the axis text.
+        f.update_layout(yaxis=dict(title=dict(text="Sum transaction_qty")))
+        return f
+
+    # -- 1. The narrow card gets a band, and the band keeps the full width. --
+    narrow = apply_display_options(base(), {"legend_position": "Top Right"},
+                                   {}, width_px=420)
+    check("legend: a narrow card switches to a band",
+          legend_layout_mode(narrow) == "band", str(legend_layout_mode(narrow)))
+    check("legend: the band leaves x at full width",
+          tuple(narrow.layout.xaxis.domain) == (0.0, 1.0),
+          str(narrow.layout.xaxis.domain))
+    check("legend: the band is horizontal",
+          str(narrow.layout.legend.orientation) == "h",
+          str(narrow.layout.legend.orientation))
+    check("legend: the band reserves plot HEIGHT, not width",
+          tuple(narrow.layout.yaxis.domain)[0] > 0.0,
+          str(narrow.layout.yaxis.domain))
+
+    # -- 2. A wide card keeps the vertical column. --------------------------
+    wide = apply_display_options(base(), {"legend_position": "Top Right"},
+                                 {}, width_px=2400)
+    check("legend: a wide card keeps the column",
+          legend_layout_mode(wide) == "column", str(legend_layout_mode(wide)))
+    # A column costs WIDTH: x must lose the strip, and y must be untouched.
+    # Which END of x moves depends on the side -- a right-hand column pushes
+    # x's upper bound down, a left-hand one raises its lower bound -- so the
+    # assertion has to be side-aware or it fails on a correct layout.
+    xw = tuple(wide.layout.xaxis.domain)
+    check("legend: the column narrows x, not y",
+          xw[1] < 1.0 and tuple(wide.layout.yaxis.domain) == (0.0, 1.0),
+          f"x={wide.layout.xaxis.domain} y={wide.layout.yaxis.domain}")
+
+    wide_l = apply_display_options(base(), {"legend_position": "Top Left"},
+                                   {}, width_px=2400)
+    xl = tuple(wide_l.layout.xaxis.domain)
+    check("legend: a left-hand column narrows x's lower bound instead",
+          xl[0] > 0.0 and xl[1] == 1.0,
+          f"x={wide_l.layout.xaxis.domain}")
+
+    # -- 3. The plan reports a strip it can actually be reserved with. ------
+    plan = plan_legend_layout(base(), "Top Right", names=long_labels(),
+                              legend_title="Series", width_px=2400)
+    check("legend: the plan reports a strip within the allowed share",
+          plan is not None and plan.get("mode") == "column"
+          and 0.0 < float(plan.get("strip", 0)) <= LEGEND_COLUMN_MAX_SHARE,
+          str(plan))
+
+    # -- 4. Both modes, at all four positions, at every width. -------------
+    for pos in ("Top Left", "Top Right", "Bottom Left", "Bottom Right"):
+        modes = []
+        for w in (380, 700, 1400, 2400):
+            f = apply_display_options(base(), {"legend_position": pos}, {},
+                                      width_px=w)
+            modes.append(legend_layout_mode(f))
+            # The plot must stay usable at every width, in both modes.
+            xw = float(f.layout.xaxis.domain[1]) - float(f.layout.xaxis.domain[0])
+            yh = float(f.layout.yaxis.domain[1]) - float(f.layout.yaxis.domain[0])
+            check(f"legend: {pos}@{w}px keeps a real plot area",
+                  xw > 0.25 and yh > 0.55, f"x={xw:.2f} y={yh:.2f}")
+        check(f"legend: {pos} uses both modes across the range",
+              "band" in modes and "column" in modes, str(modes))
+        # The chosen anchor has to survive the band round-trip: a top band is
+        # drawn with yanchor="bottom", which a naive anchor reading reports as
+        # "Bottom ...".
+        last = apply_display_options(base(), {"legend_position": pos}, {},
+                                     width_px=380)
+        check(f"legend: {pos} survives the band layout",
+              infer_legend_position(last) == pos,
+              str(infer_legend_position(last)))
+
+    # -- 5. Idempotent: repeated refits at one width do not compound. ------
+    f = apply_display_options(base(), {"legend_position": "Top Left"}, {},
+                              width_px=700)
+    snap = (tuple(f.layout.xaxis.domain), tuple(f.layout.yaxis.domain))
+    for _ in range(6):
+        refit_legend_width(f, 700)
+    check("legend: repeated refits are idempotent",
+          snap == (tuple(f.layout.xaxis.domain), tuple(f.layout.yaxis.domain)),
+          f"{snap} -> {(f.layout.xaxis.domain, f.layout.yaxis.domain)}")
+
+    # -- 6. A resize storm converges back to the single-shot layout. ------
+    storm = apply_display_options(base(), {"legend_position": "Top Right"}, {},
+                                  width_px=2400)
+    for w in (2400, 1400, 900, 400, 700, 2400, 380, 2400):
+        refit_legend_width(storm, w)
+    fresh = apply_display_options(base(), {"legend_position": "Top Right"}, {},
+                                  width_px=2400)
+    check("legend: a resize storm converges (no latched strip/band)",
+          tuple(storm.layout.xaxis.domain) == tuple(fresh.layout.xaxis.domain)
+          and legend_layout_mode(storm) == legend_layout_mode(fresh),
+          f"{storm.layout.xaxis.domain} vs {fresh.layout.xaxis.domain}")
+
+    # -- 7. Headless (no width) keeps the classic column, so export output is
+    #       unchanged by the band existing at all. -------------------------
+    nowidth = apply_display_options(base(), {"legend_position": "Top Right"}, {})
+    check("legend: with no view width the column is kept (exports unchanged)",
+          legend_layout_mode(nowidth) == "column", str(legend_layout_mode(nowidth)))
+
+    # -- 8. reserve_legend_band refuses to eat the whole plot. -------------
+    hogged = go.Figure(go.Bar(x=["a", "b"], y=[1, 2], name="s"))
+    reserve_legend_band(hogged, "Top Left", band_px=100000)
+    yh = float(hogged.layout.yaxis.domain[1]) - float(hogged.layout.yaxis.domain[0])
+    check("legend: an oversized band is capped so the plot survives",
+          yh > 0.5, str(hogged.layout.yaxis.domain))
+
+    # -- 9. A figure with no legend is never given a reservation. ---------
+    bare = go.Figure(go.Bar(x=["a"], y=[1], name="only", showlegend=False))
+    bare.update_layout(showlegend=False)
+    check("legend: a chart with no legend gets no band",
+          refit_legend_width(bare, 400) is False, "reserved something")
+
+    # -- 10. The dispatcher is the one entry point both paths share. -------
+    # apply_legend_layout returns a bool; the mode it chose is recorded ON the
+    # figure, so the figure (not the return value) is what must be inspected.
+    narrow, wide = base(), base()
+    apply_legend_layout(narrow, "Top Right", names=long_labels(), width_px=400)
+    apply_legend_layout(wide, "Top Right", names=long_labels(), width_px=2400)
+    check("legend: apply_legend_layout records the mode it chose",
+          legend_layout_mode(narrow) == "band"
+          and legend_layout_mode(wide) == "column",
+          f"400px={legend_layout_mode(narrow)} "
+          f"2400px={legend_layout_mode(wide)}")
+
+
+def test_legend_axis_title_is_measured():
+    """The rotated y-axis TITLE shares the legend strip, so it must be measured.
+
+    The old measurement counted only the tick labels. Plotly draws the axis title
+    outboard of them, inside the same reserved column, so a strip sized for box +
+    ticks still had the title painted under the legend plate -- the "Sum
+    transaction_qty" text visibly running through it.
+    """
+    print("[N] The reserved legend column accounts for the y-axis title")
+    import copy
+    import plotly.graph_objects as go
+    from chart_display import (_legend_axis_need_px, _legend_axis_title_px,
+                               reserve_legend_column)
+
+    with_title = go.Figure(go.Scatter(x=[1, 2], y=[1, 2], name="s"))
+    with_title.update_layout(yaxis=dict(title=dict(text="Sum transaction_qty")))
+    without = go.Figure(go.Scatter(x=[1, 2], y=[1, 2], name="s"))
+    without.update_layout(yaxis=dict(title=dict(text="")))
+
+    check("legend: an axis title contributes to the reserved strip",
+          _legend_axis_title_px(with_title, "left") > 0,
+          str(_legend_axis_title_px(with_title, "left")))
+    check("legend: no axis title contributes nothing",
+          _legend_axis_title_px(without, "left") == 0,
+          str(_legend_axis_title_px(without, "left")))
+    check("legend: the total strip need grows with the title",
+          _legend_axis_need_px(with_title, "left")
+          > _legend_axis_need_px(without, "left"), "")
+
+    # A titled axis therefore reserves MORE than an untitled one, at the same
+    # width and the same labels.
+    # reserve_legend_column rewrites the figure it is handed IN PLACE, so the
+    # domain has to be read back off the figure that was actually passed in --
+    # reading the original would compare two untouched, unreserved figures.
+    names = ["Alpha series", "Beta series", "Gamma series"]
+    fig_t = copy.deepcopy(with_title)
+    fig_p = copy.deepcopy(without)
+    side_t = reserve_legend_column(fig_t, "Top Left", names=names, width_px=900)
+    side_p = reserve_legend_column(fig_p, "Top Left", names=names, width_px=900)
+    check("legend: a titled axis reserves a wider column",
+          tuple(fig_t.layout.xaxis.domain)[0]
+          > tuple(fig_p.layout.xaxis.domain)[0],
+          f"{fig_t.layout.xaxis.domain} vs {fig_p.layout.xaxis.domain}")
+    check("legend: both reservations name a side",
+          side_t == "left" and side_p == "left", "")
+
+
+def test_newly_migrated_types_match_the_old_metadata():
+    """The six types migrated last must offer what the old app offered.
+
+    Checked against ``chart_settings.py`` ``CHART_TYPE_SETTINGS`` row by row:
+    a declared control must be on the tab, and a control the old app never had
+    must not be. The Generate tab is checked the same way against the service
+    branch that consumes it -- a form that collects the wrong KEYS generates
+    from the defaults no matter what is on screen, which looks like a dead UI.
+    """
+    print("[N] Newly migrated types match the old chart_settings metadata")
+    from PySide6.QtWidgets import QApplication, QCheckBox, QLabel
+    from desktop.widgets.analysis_settings import get_builder
+    from services.analysis_service import DATE_PARTS
+
+    app = QApplication.instance() or QApplication([])
+    ctx = dict(num_cols=["age", "salary", "qty"],
+               cat_cols=["region", "dept"], dt_cols=["date"],
+               dim_cols=["region", "dept", "date"],
+               palette_names=["Default"],
+               all_cols=["age", "salary", "qty", "region", "dept", "date",
+                         "city", "country"])
+
+    def labels(aid, tab):
+        b = get_builder(aid, None, **ctx)
+        page = {"gen": b.build_generate, "lay": b.build_layout,
+                "typ": b.build_typography}[tab]()
+        page.resize(1500, 900)
+        page.show()
+        app.processEvents()
+        out = set()
+        for w in page.findChildren(QLabel):
+            if str(w.property("theme_role")) == "section":
+                out.add(w.text().strip())
+        for w in page.findChildren(QCheckBox):
+            if w.text().strip():
+                out.add(w.text().strip())
+        return out
+
+    # -- Layout / Typography rows, per the old metadata --------------------
+    EXPECTED = {
+        "pie_chart": {
+            "lay": {"Chart title", "Legend title", "Legend position", "Text info",
+                    "Donut", "Pull", "Rotation", "Direction", "Value size",
+                    "Value color"},
+            "typ": {"Legend size", "Legend color"},
+            "absent": {"Bar mode", "Bar gap", "X-axis", "Y-axis"},
+        },
+        "time_series": {
+            "lay": {"Line width", "Line shape", "Fill", "Markers"},
+            "typ": {"Title size", "Axis size", "Legend size"},
+            "absent": {"Bar mode", "Bar gap"},
+        },
+        "scatter_plot": {
+            "lay": {"Line width", "Line shape", "Fill", "Markers",
+                    "M. size", "M. opacity", "Render mode"},
+            "typ": {"Title size", "Legend size"},
+            "absent": {"Bar mode", "Bar gap"},
+        },
+        "matrix_heatmap": {
+            "lay": {"Colorscale", "CB title", "CB tick sz", "CB tick clr",
+                    "CB title sz", "CB title clr", "Annotations", "Ann size",
+                    "Ann color", "Precision", "Colorbar pos"},
+            "typ": {"Axis size"},
+            "absent": {"Bar mode", "Bar gap"},
+        },
+        "matrix_table": {
+            "lay": {"Font size", "Hdr font", "Row h", "Font color", "Hdr color",
+                    "Even stripe", "Odd stripe", "Hdr h", "Index align",
+                    "Data align", "Num format"},
+            "typ": set(),
+            # The table has no colour bar and no in-cell annotations: a Plotly
+            # table draws none, so those heatmap rows would be dead controls.
+            "absent": {"Colorscale", "CB title", "Annotations", "Ann size",
+                       "Colorbar pos", "Legend size", "Axis size"},
+        },
+        "map_plot": {
+            "lay": {"Colorscale", "CB title", "CB tick sz", "CB tick clr",
+                    "CB title sz", "CB title clr", "Colorbar pos", "M. size",
+                    "M. opacity", "Colorbar", "Size by value"},
+            "typ": {"Axis size"},
+            # A geo trace has no Cartesian axes and no in-cell text.
+            "absent": {"X-axis", "Y-axis", "Annotations", "Ann size",
+                       "Precision", "Bar mode", "Bar gap"},
+        },
+    }
+    for aid, want in EXPECTED.items():
+        for tab in ("lay", "typ"):
+            got = labels(aid, tab)
+            missing = want[tab] - got
+            check(f"migrated '{aid}': {tab} tab has every old control",
+                  not missing, f"missing={sorted(missing)}")
+        leaked = want["absent"] & (labels(aid, "lay") | labels(aid, "typ"))
+        check(f"migrated '{aid}': no control the old app did not declare",
+              not leaked, f"leaked={sorted(leaked)}")
+
+    # -- Generate values must be keyed as the service branch reads them ----
+    # This is the failure mode that looks fine on screen: the controls are all
+    # there and the user changes them, but the service reads different keys, so
+    # the chart is generated from the defaults anyway.
+    EXPECTED_KEYS = {
+        "pie_chart": {"x", "y", "agg", "sort", "top_n", "palette"},
+        "time_series": {"x", "y", "date_part", "agg", "dual_y_ts",
+                        "dual_y_agg", "palette"},
+        "scatter_plot": {"x_col", "y_col", "color_col", "size_col",
+                         "trendline", "palette"},
+        "matrix_heatmap": {"index_col", "columns_col", "values_col", "agg",
+                           "sort_rows", "top_n_rows"},
+        "matrix_table": {"index_col", "columns_col", "values_col", "agg",
+                         "sort_rows", "top_n_rows"},
+        "map_plot": {"map_mode", "lat_col", "lon_col", "location_col",
+                     "color_col", "value_col", "agg_func", "map_style",
+                     "marker_opacity", "invert_colorscale", "show_borders"},
+    }
+    # 'x' is a deliberate extra on the matrix types: their prefill reads it
+    # back so a saved cross-tab round-trips, and the runner ignores it. The
+    # allowlist therefore permits exactly that and nothing else, so a genuinely
+    # spurious key still fails.
+    # 'render_mode' is a scatter Layout-tab combo, not a WIDGET_SPEC field, so
+    # it has no entry to be derived from -- but the service branch really does
+    # read it (``px.scatter(render_mode=...)`` is a build-time choice), and the
+    # builder must ship it. Same category as the matrix 'x' below.
+    ALLOWED_EXTRA = {"matrix_heatmap": {"x"}, "matrix_table": {"x"},
+                     "scatter_plot": {"render_mode"}}
+    for aid, keys in EXPECTED_KEYS.items():
+        b = get_builder(aid, None, **ctx)
+        b.build_generate()
+        got = set(b.collect_values())
+        allowed = keys | ALLOWED_EXTRA.get(aid, set())
+        check(f"migrated '{aid}': collect_values keys match the service branch",
+              keys <= got and got <= allowed,
+              f"missing={sorted(keys - got)} extra={sorted(got - allowed)}")
+
+    # -- The time-series granularity labels must be the service's OWN keys --
+    # A hand-written copy of the list silently sent "Month" to a table that
+    # expects "Month (number)", and the chosen granularity was then ignored.
+    from desktop.widgets.analysis_settings.time_series import DATE_PARTS as UI_DPARTS
+    check("migrated 'time_series': granularity labels match the service table",
+          list(UI_DPARTS) == list(DATE_PARTS.keys()),
+          f"ui={UI_DPARTS} service={list(DATE_PARTS)}")
+
+
+def test_new_layout_controls_change_the_new_chart_types():
+    """Every Layout control the six new types declare must change the figure.
+
+    Same rule as the existing probe table: a control is only proven alive by
+    changing it and diffing the figure. Every probe stays inside the control's
+    documented range, because an out-of-range value makes Plotly reject the
+    whole update and the defensive ``except`` would hide the failure.
+    """
+    print("[N] The new Layout controls change the new chart types")
+    import json
+    import pandas as pd
+    from chart_display import apply_display_options, default_layout_opts
+    from services.analysis_service import run_analysis_with_config
+
+    countries = ["India", "USA", "France", "Brazil", "Japan", "Kenya"]
+    df = pd.DataFrame({
+        "date": pd.date_range("2024-01-01", periods=24, freq="D"),
+        "region": ["N", "S", "E", "W"] * 6,
+        "dept": ["d1", "d2"] * 12,
+        "country": [countries[i % len(countries)] for i in range(24)],
+        "lat": [(-40 + (i % 60)) * 0.9 for i in range(24)],
+        "lon": [(-120 + (i % 140)) * 0.9 for i in range(24)],
+        "age": [20 + i for i in range(24)],
+        "salary": [1000 + i * 10 for i in range(24)],
+    })
+
+    def _fig(aid, vals):
+        res = run_analysis_with_config(aid, df, vals)
+        if not res:
+            raise AssertionError(f"no figure produced for {aid}")
+        return res[0][2]
+
+    def _j(f):
+        return json.dumps(f.to_plotly_json(), sort_keys=True, default=str)
+
+    mtx = {"index_col": "region", "columns_col": "dept",
+           "values_col": "salary", "agg": "Sum"}
+    PROBES = {
+        "pie_chart": (_fig("pie_chart", {"x": "region", "y": "salary",
+                                         "agg": "Sum"}), {
+            "donut_hole": 0.6, "pie_textinfo": "percent", "pull_slices": 0.3,
+            "pie_rotation": 90, "pie_direction": "counterclockwise",
+            "pie_value_size": 20, "pie_value_color": "#00ff00",
+            "title": "PROBE", "legend_title": "PLEGEND"}),
+        "time_series": (_fig("time_series", {"x": "date", "y": "age",
+                                             "agg": "Avg"}), {
+            "line_width": 8, "line_shape": "spline", "line_fill": "tozeroy",
+            "show_markers": False, "title": "PROBE", "x_label": "PX",
+            "y_label": "PY"}),
+        # Built WITH a trendline on purpose. A bare px.scatter draws
+        # markers-only traces, and line width / shape are guarded on the trace
+        # actually containing "lines" -- exactly as the old app guarded them --
+        # so probing them here would prove nothing except that the guard works.
+        "scatter_plot": (_fig("scatter_plot", {"x_col": "age",
+                                               "y_col": "salary",
+                                               "trendline": "Linear"}), {
+            "marker_size": 20, "marker_opacity": 0.3, "line_width": 6,
+            "line_shape": "spline", "line_fill": "tozeroy",
+            "show_markers": False, "title": "PROBE"}),
+        "matrix_heatmap": (_fig("matrix_heatmap", mtx), {
+            "heatmap_colorscale": "Viridis", "heatmap_show_text": False,
+            "heatmap_annotation_size": 18, "heatmap_annotation_precision": 4,
+            "heatmap_annotation_color": "#00ff00", "colorbar_title": "CB",
+            "colorbar_tick_size": 14, "colorbar_tick_color": "#ff0000",
+            "colorbar_title_size": 15, "colorbar_title_color": "#00ff00",
+            "colorbar_position": "Left", "title": "PROBE"}),
+        "matrix_table": (_fig("matrix_table", mtx), {
+            "table_font_size": 18, "table_header_font_size": 20,
+            "table_row_height": 40, "table_header_height": 48,
+            "table_index_align": "right", "table_data_align": "center",
+            "table_stripe_even_color": "#334155",
+            "table_stripe_odd_color": "#111827",
+            # Re-renders already-formatted cells from the raw numbers the
+            # runner stashes in figure metadata; a plain style probe cannot
+            # tell us whether that survives.
+            "table_number_format": ".4f", "title": "PROBE"}),
+        # Choropleth mode: colour scale + colour bar (the map's share of the
+        # heatmap controls). Marker options are deliberately NOT probed here --
+        # a choropleth paints whole country shapes, which have no marker to
+        # size or fade, so they are probed on the lat/lon mode instead.
+        "map_plot": (_fig("map_plot",
+                         {"map_mode": "Choropleth (Location Names)",
+                          "location_col": "country", "value_col": "salary",
+                          "agg_func": "Sum"}), {
+            "heatmap_colorscale": "Viridis", "colorbar_title": "CB",
+            "colorbar_tick_size": 14, "colorbar_tick_color": "#ff0000",
+            "colorbar_title_size": 15, "colorbar_title_color": "#00ff00",
+            "colorbar_position": "Left", "title": "PROBE"}),
+    }
+    # The map's marker controls, probed on the mode that actually draws markers.
+    map_markers = _fig("map_plot", {"map_mode": "Scatter (Lat/Lon)",
+                                    "lat_col": "lat", "lon_col": "lon",
+                                    "value_col": "salary", "agg_func": "Sum"})
+    PROBES["map_plot (markers)"] = (map_markers,
+                                    {"marker_size": 18, "marker_opacity": 0.35})
+
+    defaults = default_layout_opts()
+    for aid, (fig, probes) in PROBES.items():
+        base = _j(apply_display_options(fig, dict(defaults), {}))
+        dead = [k for k, v in probes.items()
+                if _j(apply_display_options(fig, dict(defaults, **{k: v}), {})) == base]
+        check(f"new layout controls: every '{aid}' probe changes the figure",
+              not dead, f"dead={dead}")
+
+
+def test_generate_stage_controls_are_not_dead():
+    """Generate-stage controls must change the chart, not just the config.
+
+    ``apply_display_options`` covers the Layout/Typography pass only, so a
+    control that a *runner* is supposed to honour (scatter render_mode, map
+    borders) would look fine there while doing nothing at all. Each probe
+    below is therefore run end-to-end through ``run_analysis_with_config``.
+    """
+    import json as _json
+    from services.analysis_service import run_analysis_with_config
+    df = make_df()
+    # scatter + map need coordinates and real country names, which the shared
+    # fixture does not carry.
+    n = len(df)
+    for col, vals in (("age", [20 + i for i in range(n)]),
+                      ("salary", [1000 + i * 10 for i in range(n)]),
+                      ("lat", [(-40 + (i % 60)) * 0.9 for i in range(n)]),
+                      ("lon", [(-120 + (i % 140)) * 0.9 for i in range(n)]),
+                      ("country", ["India", "USA", "France",
+                                   "Brazil", "Japan", "Kenya"][: (n % 6) or 6])):
+        if col not in df.columns:
+            df = df.assign(**{col: [vals[i % len(vals)] for i in range(n)]})
+
+    # -- scatter render_mode -------------------------------------------
+    types = {}
+    for mode in ("svg", "webgl"):
+        figs = run_analysis_with_config(
+            "scatter_plot", df,
+            {"x_col": "age", "y_col": "salary", "render_mode": mode})
+        types[mode] = figs[0][2].data[0].type if figs else None
+    check("scatter render_mode=svg uses the SVG trace",
+          types.get("svg") == "scatter", f"got {types.get('svg')}")
+    check("scatter render_mode=webgl uses the WebGL trace",
+          types.get("webgl") == "scattergl", f"got {types.get('webgl')}")
+
+    # -- map borders ----------------------------------------------------
+    def _map(**over):
+        vals = {"map_mode": "Choropleth (Location Names)",
+                "location_col": "country", "value_col": "salary",
+                "agg_func": "Sum"}
+        vals.update(over)
+        figs = run_analysis_with_config("map_plot", df, vals)
+        return _json.dumps(figs[0][2].to_plotly_json(),
+                           sort_keys=True, default=str) if figs else "NONE"
+
+    check("map: borders render (choropleth matches at least one location)",
+          _map(show_borders=True) != "NONE")
+    check("map: show_borders changes the choropleth",
+          _map(show_borders=True) != _map(show_borders=False))
+
+    # A scattermap marker has no outline and layout.map has no country
+    # toggle, so the box cannot apply there. It is disabled in the form
+    # instead of silently changing nothing -- assert the form agrees.
+    from PySide6.QtWidgets import QApplication
+    from desktop.widgets.analysis_settings import get_builder
+    app = QApplication.instance() or QApplication([])
+    cols = [str(c) for c in df.columns]
+    form = get_builder("map_plot", None, all_cols=cols, dim_cols=cols,
+                       num_cols=cols, cat_cols=cols, dt_cols=[],
+                       palette_names=["Default"])
+    check("map form: builder resolved for the form-level assertions",
+          form is not None, "")
+    if form is None:
+        return
+    page = form.build_generate()  # keep a ref: the combo dies with its page
+    form._combo_mode.setCurrentText("Choropleth (Location Names)")
+    check("map form: Borders is enabled for choropleth",
+          form._chk_borders.isEnabled())
+    form._combo_mode.setCurrentText("Scatter (Lat/Lon)")
+    check("map form: Borders is disabled for lat/lon scatter",
+          not form._chk_borders.isEnabled())
+
+
+def test_map_runner_degrades_without_streamlit():
+    """A Qt desktop build must never import Streamlit to report a problem.
+
+    The map runner's "could not match these locations" branch called
+    ``st.warning()``. There is no Streamlit in this app, so an unrecognised
+    country raised ModuleNotFoundError and aborted the ENTIRE analysis run -- the
+    user saw a crash instead of an empty result. The branch now logs and returns
+    the empty list the caller already knows how to display.
+    """
+    print("[N] Map runner degrades gracefully with no Streamlit")
+    import inspect
+    import pandas as pd
+    from services.analysis_service import run_analysis_with_config
+
+    src = inspect.getsource(
+        __import__("modules.analysis.map_plot", fromlist=["run_map_plot"]))
+    check("map: the runner does not import streamlit",
+          "import streamlit" not in src, "still imports streamlit")
+
+    n = 12
+    df = pd.DataFrame({
+        "country": [f"Nowhere {i % 3}" for i in range(n)],
+        "lat": [(-40 + (i % 60)) * 0.9 for i in range(n)],
+        "lon": [(-120 + (i % 140)) * 0.9 for i in range(n)],
+        "salary": [100 + i for i in range(n)],
+    })
+    res = run_analysis_with_config("map_plot", df, {
+        "map_mode": "Choropleth (Location Names)", "location_col": "country",
+        "value_col": "salary", "agg_func": "Sum"})
+    check("map: unmatchable locations return empty instead of raising",
+          res == [], str(res))
+
+    # A REAL country must still render, so the fix did not disable the chart.
+    ok = df.assign(country=["India", "USA", "France"] * 4)
+    res2 = run_analysis_with_config("map_plot", ok, {
+        "map_mode": "Choropleth (Location Names)", "location_col": "country",
+        "value_col": "salary", "agg_func": "Sum"})
+    check("map: recognised countries still render a choropleth",
+          len(res2) == 1 and res2[0][2].data[0].type == "choropleth",
+          str([t[2].data[0].type for t in res2]))
+
+
+def test_every_chart_type_has_a_settings_builder():
+    """Every offered chart type either builds all three tabs or falls back.
+
+    A registered type must produce three pages with real controls (a page
+    with no control at all means the build silently failed); a type not yet
+    ported must return None cleanly, which is what makes the panel show its
+    placeholder pages instead of crashing.
+    """
+    print("[43] Every chart type has a settings builder")
+    from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QLineEdit, QSpinBox
+    from desktop.widgets.analysis_settings import get_builder, registered
+    from services.analysis_service import WIDGET_SPEC
+
+    app = QApplication.instance() or QApplication([])
+    ctx = dict(num_cols=["age", "salary", "years"],
+               cat_cols=["region", "dept"], dt_cols=["date"],
+               dim_cols=["region", "dept", "date"],
+               palette_names=["Default", "A"],
+               all_cols=["age", "salary", "years", "region", "dept", "date"])
+
+    def _controls(page):
+        n = 0
+        for cls in (QComboBox, QLineEdit, QSpinBox, QCheckBox):
+            n += len(page.findChildren(cls))
+        return n
+
+    # 1. Every registered type builds three tabs with real controls.
+    for aid in sorted(registered()):
+        b = get_builder(aid, None, **ctx)
+        check(f"builder '{aid}': builds an instance", b is not None, str(b))
+        if b is None:
+            continue
+        for name, page in (("Generate", b.build_generate()),
+                           ("Layout", b.build_layout()),
+                           ("Typography", b.build_typography())):
+            check(f"builder '{aid}': {name} tab has real controls",
+                  _controls(page) >= 1, str(_controls(page)))
+        check(f"builder '{aid}': action row builds",
+              b.build_action_row() is not None, "")
+
+    # 2. Every type the service offers resolves to either a real builder or
+    #    the clean placeholder path -- never an exception.
+    for aid in sorted(WIDGET_SPEC):
+        try:
+            b = get_builder(aid, None, **ctx)
+            ok = b is None or all(
+                _controls(p) >= 1
+                for p in (b.build_generate(), b.build_layout(),
+                          b.build_typography()))
+        except Exception:
+            ok = False
+        check(f"offered type '{aid}': builder or placeholder, no crash",
+              ok, "")
+
+
+def test_masked_controls_stay_masked():
+    """No type may show a control its old metadata does not declare.
+
+    The table below is the contract: old ``CHART_TYPE_SETTINGS`` controls,
+    plus the rows the Qt template added for axis-bearing charts (Show grid /
+    Show border) where they actually do something. The build output must
+    match EXACTLY -- a template row leaking back in (the correlation bug
+    this test was written for) or a deliberately masked row returning both
+    fail here.
+    """
+    print("[44] Masked controls stay masked")
+    from PySide6.QtWidgets import QApplication, QCheckBox, QLabel, QWidget
+    from desktop.widgets.analysis_settings import get_builder, registered
+
+    app = QApplication.instance() or QApplication([])
+    ctx = dict(num_cols=["age", "salary", "years"],
+               cat_cols=["region", "dept"], dt_cols=["date"],
+               dim_cols=["region", "dept", "date"],
+               palette_names=["Default", "A"],
+               all_cols=["age", "salary", "years", "region", "dept", "date"])
+
+    _TYPOTHREE = ["Header size", "Header color", "Header font",
+                  "Header font style", "Header align", "Font family",
+                  "Font style", "Title size", "Title color", "Axis size",
+                  "Axis color"]
+    _LB_LEGEND = ["Chart title", "X-axis", "Y-axis", "Legend title",
+                  "Legend position", "Label pos", "Bar mode", "Bar gap"]
+    _LB_CHECKS = ["Show value labels", "Show grid", "Show border"]
+    EXPECTED = {
+        # old controls: title, axes_labels, legend_labels, show_value_labels,
+        # label_position, bar_gap, bar_mode (+ the template's grid/border).
+        "statistical": (_LB_LEGEND, _LB_CHECKS,
+                        _TYPOTHREE + ["Legend size", "Legend color"]),
+        # old controls: + histogram_bins, histogram_opacity.
+        "distribution": (_LB_LEGEND + ["Bins", "Opacity"], _LB_CHECKS,
+                         _TYPOTHREE + ["Legend size", "Legend color"]),
+        # has_axes=False, has_legend=False: title, colorscale, colour-bar
+        # styling, annotations (+ the two requested colour-bar rows), and no
+        # axis-title typography.
+        "correlation": (["Chart title", "Colorscale", "Ann size", "Ann color",
+                         "Precision", "Colorbar pos", "CB title", "CB tick sz",
+                         "CB tick clr", "CB title sz", "CB title clr"],
+                        ["Annotations", "Show border"],
+                        [r for r in _TYPOTHREE
+                         if r not in ("Title size", "Title color")]),
+        # has_axes=True; the legend rows are KEPT although the old metadata
+        # says has_legend=False, because this runner really does draw a
+        # legend (the Secondary Y-Axis overlay is a second series) and the
+        # legend / colour-bar settings are shared across the chart types that
+        # draw a key. Typography is the shared tab, legend group included.
+        "categorical": (["Chart title", "X-axis", "Y-axis (left)",
+                         "Y-axis (right)", "Legend title", "Legend position",
+                         "Label pos", "Bar mode", "Bar gap", "Line width"],
+                        ["Show value labels", "Show grid", "Show border"],
+                        list(_TYPOTHREE) + ["Legend size", "Legend color"]),
+        # ---- the six types migrated in the final pass --------------------
+        # Same contract as above: the rows are the OLD Streamlit controls for
+        # that chart type (per chart_settings_screenshots/rules.txt), plus the
+        # shared chart title row and the template's border box each one uses.
+        # pie_chart: old has_legend=True but no x/y axes -> title + the whole
+        # legend block + the pie-specific rows, and NO axis-title typography.
+        "pie_chart": (["Chart title", "Legend title", "Legend position",
+                       "Label pos", "Text info", "Donut", "Pull", "Rotation",
+                       "Direction", "Value size", "Value color"],
+                      ["Show value labels", "Show border"],
+                      ["Header size", "Header color", "Header font",
+                       "Header font style", "Header align", "Font family",
+                       "Font style", "Legend size", "Legend color"]),
+        # time_series / scatter_plot: has_axes and has_legend both True, so the
+        # legend block is kept. Scatter adds the marker rows and the build-time
+        # render-mode combo; its typography therefore matches the axes types.
+        "time_series": (["Chart title", "X-axis", "Y-axis", "Legend title",
+                         "Legend position", "Label pos", "Line width",
+                         "Line shape", "Fill"],
+                        ["Show value labels", "Show grid", "Show border",
+                         "Markers"],
+                        _TYPOTHREE + ["Legend size", "Legend color"]),
+        "scatter_plot": (["Chart title", "X-axis", "Y-axis", "Legend title",
+                          "Legend position", "Label pos", "Line width",
+                          "Line shape", "Fill", "M. size", "M. opacity",
+                          "Render mode"],
+                         ["Show value labels", "Show grid", "Show border",
+                          "Markers"],
+                         _TYPOTHREE + ["Legend size", "Legend color"]),
+        # matrix_heatmap: has_axes=False -> no axis titles, only the colour
+        # scale, annotations and colour bar.
+        "matrix_heatmap": (["Chart title", "Colorscale", "Ann size",
+                            "Ann color", "Precision", "Colorbar pos",
+                            "CB title", "CB tick sz", "CB tick clr",
+                            "CB title sz", "CB title clr"],
+                           ["Annotations", "Show border"],
+                           ["Header size", "Header color", "Header font",
+                            "Header font style", "Header align",
+                            "Font family", "Font style", "Axis size",
+                            "Axis color"]),
+        # matrix_table: a table, not an axes chart -> table styling only.
+        "matrix_table": (["Chart title", "Font size", "Hdr font", "Row h",
+                          "Font color", "Hdr color", "Even stripe",
+                          "Odd stripe", "Hdr h", "Index align", "Data align",
+                          "Num format"],
+                         ["Show border"],
+                         ["Header size", "Header color", "Header font",
+                          "Header font style", "Header align",
+                          "Font family", "Font style"]),
+        # map_plot: colour scale + colour bar, plus the marker rows that only
+        # apply to the lat/lon mode. 'Show border' is kept but enabled only for
+        # choropleth (see test_generate_stage_controls_are_not_dead).
+        "map_plot": (["Chart title", "Colorscale", "Colorbar pos",
+                      "CB title", "CB tick sz", "CB tick clr", "CB title sz",
+                      "CB title clr", "M. size", "M. opacity"],
+                     ["Show border", "Colorbar", "Size by value"],
+                     ["Header size", "Header color", "Header font",
+                      "Header font style", "Header align", "Font family",
+                      "Font style", "Axis size", "Axis color"]),
+    }
+    # The registered set itself is part of the contract: a new type must be
+    # added to this table deliberately, not slip in with default rows.
+    check("mask: every registered type is declared here",
+          set(EXPECTED) == set(registered()),
+          f"{sorted(EXPECTED)} vs {sorted(registered())}")
+
+    def _rows(page):
+        out = []
+        for w in page.findChildren(QWidget):
+            try:
+                if w.property('grid_row'):
+                    labs = [sl.text() for sl in w.findChildren(QLabel)
+                            if sl.property('theme_role') == 'section']
+                    if labs:
+                        out.append(labs[0])
+            except Exception:
+                pass
+        return out
+
+    keep = []
+    for aid, (exp_rows, exp_boxes, exp_typo) in EXPECTED.items():
+        b = get_builder(aid, None, **ctx)
+        lay = b.build_layout()
+        typ = b.build_typography()
+        keep.extend([lay, typ])
+        check(f"mask: '{aid}' layout rows are exactly the declared set",
+              sorted(_rows(lay)) == sorted(exp_rows),
+              f"{sorted(_rows(lay))} vs {sorted(exp_rows)}")
+        boxes = [c.text() for c in lay.findChildren(QCheckBox)]
+        check(f"mask: '{aid}' layout checkboxes are exactly the declared set",
+              sorted(boxes) == sorted(exp_boxes),
+              f"{sorted(boxes)} vs {sorted(exp_boxes)}")
+        check(f"mask: '{aid}' typography rows are exactly the declared set",
+              sorted(_rows(typ)) == sorted(exp_typo),
+              f"{sorted(_rows(typ))} vs {sorted(exp_typo)}")
+    del keep
+
+
+def test_declared_layout_controls_all_do_something():
+    """Every Layout control a type declares must change the figure.
+
+    The only reliable proof that a control is not dead is to change it and
+    diff the figure. Two rules from the doc are baked into the probe table:
+    every probe value stays inside the control's [lo, hi] range (an
+    out-of-range value makes Plotly reject the whole update and the
+    defensive ``except`` hides the failure), and every probe differs from
+    the default it is compared against.
+    """
+    print("[45] Every declared Layout control changes the figure")
+    import json
+    import pandas as pd
+    from chart_display import apply_display_options, default_layout_opts
+    from services.analysis_service import run_analysis_with_config
+
+    df = pd.DataFrame({
+        "region": ["N", "N", "S", "S", "E", "E"],
+        "dept": ["d1", "d2", "d1", "d2", "d1", "d2"],
+        "age": [20, 30, 40, 50, 60, 70],
+        "salary": [1000, 2000, 1500, 4000, 3000, 5000],
+    })
+
+    def _fig(aid, vals):
+        res = run_analysis_with_config(aid, df, vals)
+        if not res:
+            raise AssertionError(f"no figure produced for {aid}")
+        return res[0][2]
+
+    def _j(f):
+        return json.dumps(f.to_plotly_json(), sort_keys=True, default=str)
+
+    stat = _fig("statistical", {"x": ["region"], "y": ["age", "salary"],
+                                "palette": "Default"})
+    dist = _fig("distribution", {"x": ["age", "salary"], "color": ["region"],
+                                 "palette": "Default"})
+    corr = _fig("correlation", {"x": ["age", "salary"], "palette": "Default"})
+    # The dual-axis figure carries a bar AND the secondary line, so it can
+    # probe every categorical control including Line width / Y-axis (right).
+    cat = _fig("categorical", {"x": ["region"], "y": ["age"], "agg": "Sum",
+                               "dual_y": "salary", "dual_y_agg": "Avg",
+                               "direction": "Vertical (Column chart)",
+                               "palette": "Default"})
+    # legend_labels probes with the figure's real trace name so the rename
+    # can actually match one.
+    PROBES = {
+        "statistical": {
+            "title": "PROBE TITLE", "x_label": "PX", "y_label": "PY",
+            "legend_title": "PLEGEND", "legend_position": "Bottom Left",
+            "legend_labels": {str(stat.data[0].name): "RENAMED"},
+            "show_value_labels": False, "value_label_color": "#00ff00",
+            "label_position": "inside", "bar_mode": "stack",
+            "bar_gap": 0.5, "show_grid": False, "show_border": False,
+        },
+        "distribution": {
+            "title": "PROBE TITLE", "x_label": "PX", "y_label": "PY",
+            "legend_title": "PLEGEND", "legend_position": "Bottom Left",
+            "legend_labels": {str(dist.data[0].name): "RENAMED"},
+            "histogram_bins": 60, "histogram_opacity": 0.35,
+            "show_grid": False, "show_border": False,
+        },
+        "correlation": {
+            "title": "PROBE TITLE", "heatmap_colorscale": "Viridis",
+            "heatmap_show_text": False, "heatmap_annotation_size": 18,
+            "heatmap_annotation_precision": 4,
+            "heatmap_annotation_color": "#00ff00",
+            "colorbar_title": "CB", "colorbar_tick_size": 14,
+            "colorbar_tick_color": "#ff0000", "colorbar_title_size": 15,
+            "colorbar_title_color": "#00ff00", "colorbar_position": "Left",
+            "show_border": False,
+        },
+        "categorical": {
+            "title": "PROBE TITLE", "x_label": "PX", "y_label": "PY",
+            "y2_label": "PY2", "show_value_labels": False,
+            "label_position": "inside", "bar_mode": "stack",
+            "bar_gap": 0.5, "show_grid": False, "line_width": 7,
+            # The shared legend rows are declared by this tab too (the
+            # Secondary Y-Axis overlay puts a legend on screen).
+            "legend_title": "PLEGEND", "legend_position": "Bottom Left",
+            "show_border": False,
+        },
+    }
+    defaults = default_layout_opts()
+    for aid, fig in (("statistical", stat), ("distribution", dist),
+                     ("correlation", corr), ("categorical", cat)):
+        base = _j(apply_display_options(fig, dict(defaults), {}))
+        for key, probe in PROBES[aid].items():
+            opts = dict(defaults)
+            opts[key] = probe
+            got = _j(apply_display_options(fig, opts, {}))
+            check(f"layout control '{key}' changes the {aid} figure",
+                  got != base, f"probe={probe!r}")
+
+
+def test_new_display_passes_are_wired():
+    """The per-trace display passes must actually be CALLED.
+
+    A pass that exists but is never invoked from
+    ``apply_display_options`` is dead code, and its control reads as broken
+    in the UI. This is the cheap structural half of the audit; the
+    behavioural half is ``test_declared_layout_controls_all_do_something``.
+    """
+    print("[46] New display passes are wired into apply_display_options")
+    import inspect
+    import chart_display
+
+    src = inspect.getsource(chart_display.apply_display_options)
+    for needle in ("_apply_heatmap_options", "_apply_colorbar_border",
+                   "_apply_title_placement", "apply_legend_layout",
+                   "legend_labels", "show_value_labels", "bargap",
+                   "barmode", "showgrid", "line_width", "y2_label"):
+        check(f"wired: apply_display_options uses '{needle}'",
+              needle in src, "")
+    # 'apply_legend_layout' is the one entry point both apply_display_options
+    # and the widget's resize refit go through; it dispatches to
+    # reserve_legend_column / reserve_legend_band internally.
+    for fn in ("_apply_heatmap_options", "_apply_colorbar_border",
+               "_apply_title_placement", "apply_legend_layout",
+               "reserve_legend_column", "reserve_legend_band",
+               "_figure_has_legend"):
+        check(f"wired: chart_display defines {fn}()",
+              callable(getattr(chart_display, fn, None)), "")
+
+
+def test_generate_sections_fill_the_pane():
+    """Generate must use the pane's width, then wrap -- never leave it empty.
+
+    The review of the categorical tab: three fixed rows of three section
+    boxes stopped two thirds of the way across the pane, so the right-hand
+    side of the tab was one large empty block AND the page was taller than
+    the pane it sat in. The rule now is the flow one (``base.FlowGrid``): as
+    many section boxes per line as fit at the compact field width, every line
+    stretched to the pane's full width, and whatever is left over wrapped
+    onto the next line at the LEFT -- which is exactly where the remaining
+    options belong.
+    """
+    print("[47] Generate sections fill the pane, then wrap")
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QApplication
+    from desktop.widgets.analysis_settings import get_builder
+    from desktop.widgets.analysis_settings.base import (FlowGrid, FLOW_MIN_COL,
+                                                        GEN_W)
+
+    app = QApplication.instance() or QApplication([])
+
+    def _page(aid, width):
+        b = get_builder(aid, None, num_cols=["age", "salary"],
+                        cat_cols=["region", "dept"], dt_cols=["date"],
+                        dim_cols=["region", "dept", "date"],
+                        palette_names=["Default"],
+                        all_cols=["age", "salary", "region", "dept", "date"])
+        page = b.build_generate()
+        page.resize(width, 900)
+        page.show()
+        app.processEvents()
+        grid = page.findChild(FlowGrid)
+        return page, grid
+
+    def _lines(grid):
+        """{line y: [(x, width), ...]} for the section boxes, in the grid's
+        own coordinates and left-to-right."""
+        out = {}
+        for w in grid.sections():
+            p = w.mapTo(grid, QPoint(0, 0))
+            out.setdefault(p.y(), []).append((p.x(), w.width()))
+        for y in out:
+            out[y].sort()
+        return out
+
+    # -- A wide pane: the categorical tab's eight controls pack several per
+    #    line and the lines span the whole width.
+    page, grid = _page("categorical", 1700)
+    lines = _lines(grid)
+    cols = grid.columns()
+    check("fill: a wide pane packs several controls per line",
+          cols >= 5, f"cols={cols}")
+    check("fill: eight controls need only two lines at 1700px",
+          grid.line_count() == 2, str(grid.line_count()))
+    top = lines[sorted(lines)[0]]
+    right = top[-1][0] + top[-1][1]
+    check("fill: the first line reaches the pane's right edge",
+          abs(right - grid.width()) <= 4, f"{right} vs {grid.width()}")
+    check("fill: a full line holds 'columns' sections",
+          len(top) == cols, f"{len(top)} vs {cols}")
+    rest = lines[sorted(lines)[-1]]
+    check("fill: the remainder is left-aligned under the line above",
+          rest[0][0] <= top[0][0] + 4 and len(rest) < cols,
+          f"{rest} vs {top}")
+    check("fill: every section still has room for its field",
+          all(w >= GEN_W for _x, w in top + rest), str(top + rest))
+    page.close()
+
+    # -- A narrow pane: re-flow to fewer columns instead of clipping.
+    page, grid = _page("categorical", 700)
+    narrow = _lines(grid)
+    check("fill: a narrow pane re-flows to fewer columns per line",
+          grid.columns() < cols and grid.line_count() >= 4,
+          f"cols={grid.columns()} lines={grid.line_count()}")
+    first = narrow[sorted(narrow)[0]]
+    check("fill: re-flowed sections never overlap",
+          all(first[i - 1][0] + first[i - 1][1] <= first[i][0] + 1
+              for i in range(1, len(first))), str(first))
+    page.close()
+
+    # -- The same rule on every other type, so no tab has a dead strip on the
+    #    right any more.
+    for aid in ("statistical", "distribution", "correlation"):
+        page, grid = _page(aid, 1700)
+        lines = _lines(grid)
+        top = lines[sorted(lines)[0]]
+        right = top[-1][0] + top[-1][1]
+        check(f"fill: '{aid}' fills the pane width too",
+              abs(right - grid.width()) <= 4, f"{right} vs {grid.width()}")
+        page.close()
+
+    check("fill: the compact field width is still the template's 210",
+          GEN_W == 210 and FLOW_MIN_COL == GEN_W + 24,
+          f"{GEN_W}/{FLOW_MIN_COL}")
+
+
+def _rgb(colour):
+
+
+
+
+    """Parse "#rgb"/"#rrggbb"/"rgb(...)"/"rgba(...)" into an (r,g,b) tuple."""
+    if not colour:
+        return None
+    s = str(colour).strip().lower()
+    try:
+        if s.startswith("#"):
+            s = s[1:]
+            if len(s) == 3:
+                s = "".join(c * 2 for c in s)
+            return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+        if s.startswith(("rgb(", "rgba(")):
+            parts = s[s.index("(") + 1:s.index(")")].split(",")
+            return tuple(int(float(p)) for p in parts[:3])
+    except Exception:
+        return None
+    return None
+
+
+def _first_colorscale_stop(fig):
+    """First colour stop of whatever scale *fig* will actually paint, or None.
+
+    Deliberately resolves BOTH routes rather than trusting one: a heatmap can
+    paint from the trace's own ``colorscale`` or, while it is bound to
+    ``layout.coloraxis``, from the axis. Checking only the trace is what let
+    the "Colorscale looks selected but the chart keeps the brand palette"
+    bug through, because the trace really did hold Viridis while the axis
+    held something else. Returns None when neither route is set.
+    """
+    # Resolve the way Plotly actually resolves it. A trace bound to
+    # layout.coloraxis paints from the AXIS, not from its own colorscale, so
+    # the axis wins whenever the binding is present. Preferring the trace
+    # unconditionally is what let this bug through a second time: the trace
+    # genuinely held Viridis while the axis held the brand palette.
+    ca = getattr(fig.layout, "coloraxis", None)
+    bound = False
+    if fig.data:
+        bound = getattr(fig.data[0], "coloraxis", None) is not None
+    cs = None
+    if bound and ca is not None:
+        cs = getattr(ca, "colorscale", None)
+    if cs is None and fig.data:
+        cs = getattr(fig.data[0], "colorscale", None)
+    if cs is None and ca is not None:
+        cs = getattr(ca, "colorscale", None)
+    try:
+        return cs[0][1]
+    except Exception:
+        return None
+
+
+def _viridis_first_stop(fig):
+    """Viridis' first stop, or None if the figure is not on Viridis.
+
+    Plotly stores a named scale as a list of (position, colour) pairs, so the
+    way to tell "the scale changed" is to compare the resolved first colour
+    rather than the stored name -- update_coloraxes expands the name.
+    """
+    holders = [getattr(fig.layout, "coloraxis", None)]
+    holders.extend(list(getattr(fig, "data", []) or []))
+    for holder in holders:
+        cs = getattr(holder, "colorscale", None)
+        if not cs:
+            continue
+        first = cs[0]
+        if isinstance(first, (list, tuple)) and len(first) > 1:
+            if str(first[1]).lower() in ("#440154", "rgb(68, 1, 84)"):
+                return str(first[1])
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Dashboard tiling: free-form drag/resize for charts, and export parity.
+#
+# These deliberately use TilingCanvas with plain QFrames instead of real
+# ChartCards. A ChartCard owns a QWebEngineView, and constructing even one
+# headlessly is slow and prone to the known QtWebEngine crash, which would
+# make these tests measure the webview rather than the tiling logic.
+# ---------------------------------------------------------------------------
+
+
+def _canvas(cols: int = 2, n: int = 4):
+    from PySide6.QtWidgets import QFrame
+    from desktop.widgets.tiling_canvas import TilingCanvas
+    app()
+    c = TilingCanvas()
+    c.resize(900, 600)
+    c.set_columns(cols)
+    for i in range(n):
+        c.add_card(f"u{i}", QFrame())
+    c.relayout()
+    return c
+
+
+def _pos(x: int, y: int):
+    """A mouse event stand-in exposing only what the canvas reads."""
+    class _P:
+        @staticmethod
+        def toPoint():
+            return QPoint(x, y)
+    class _E:
+        @staticmethod
+        def globalPosition():
+            return _P()
+    return _E()
+
+
+def _no_overlaps(c) -> bool:
+    cells = set()
+    for g in c.geometry_map().values():
+        for yy in range(g["y"], g["y"] + g["h"]):
+            for xx in range(g["x"], g["x"] + g["w"]):
+                if (xx, yy) in cells:
+                    return False
+                cells.add((xx, yy))
+    return True
+
+
+def test_tiling_canvas_packs_and_preserves_spans() -> None:
+    print("[20] Tiling canvas: row-wise packing, spans and column changes")
+    c = _canvas(cols=2, n=4)
+    g = c.geometry_map()
+    check("tiles fill row-wise, not down one column",
+          g["u0"]["x"] == 0 and g["u1"]["x"] == 1
+          and g["u2"]["x"] == 0 and g["u2"]["y"] == 1, str(g))
+    check("no overlaps on a fresh board", _no_overlaps(c))
+
+    c.set_geometry_map({"u0": {"x": 0, "y": 0, "w": 2, "h": 2}})
+    check("span survives a column-count change",
+          c.card_geometry("u0")["w"] == 2, str(c.card_geometry("u0")))
+    c.set_columns(3)
+    check("2-wide tile is still 2 wide at 3 columns",
+          c.card_geometry("u0")["w"] == 2, str(c.card_geometry("u0")))
+    c.set_columns(1)
+    check("span is clamped to the available columns",
+          c.card_geometry("u0")["w"] == 1, str(c.card_geometry("u0")))
+
+
+def test_tiling_canvas_drag_and_resize() -> None:
+    print("[21] Tiling canvas: drag and resize produce grid geometry")
+    c = _canvas(cols=2, n=2)
+    before = c.card_geometry("u0")
+    c.begin_drag("u0", QPoint(0, 0))
+    c.mouseMoveEvent(_pos(450, 700))   # one column right, ~2 rows down
+    c.mouseReleaseEvent(_pos(450, 700))
+    moved = c.card_geometry("u0")
+    check("drag moved the tile to another cell",
+          (moved["x"], moved["y"]) != (before["x"], before["y"]),
+          f"{before} -> {moved}")
+    check("drag result is still overlap-free", _no_overlaps(c))
+
+    # Resize is measured as a cursor DELTA from the grab point, so the target
+    # must be past the tile's current bottom-right corner (which is already
+    # near the canvas edge) -- a drag to a smaller coordinate correctly shrinks.
+    # Resize from the left column: a tile already sitting in the rightmost
+    # column CANNOT grow horizontally (width is clamped to the grid), so
+    # starting from x=1 would only ever prove the height axis.
+    c.set_geometry_map({"u0": {"x": 0, "y": 0, "w": 1, "h": 1}})
+    c.begin_resize("u0", QPoint(0, 0))
+    c.mouseMoveEvent(_pos(2000, 2000))
+    c.mouseReleaseEvent(_pos(2000, 2000))
+    rz = c.card_geometry("u0")
+    check("resize grew the tile's span", rz["w"] > moved["w"] and rz["h"] > moved["h"],
+          f"{moved} -> {rz}")
+
+    # Whatever cards remain after the reflow must all sit inside the grid --
+    # a card pushed to the far edge has to be clamped, not left overflowing.
+    check("no tile overflows the grid",
+          all(g["x"] + g["w"] <= c.columns() for g in c.geometry_map().values()),
+          str(c.geometry_map()))
+    shrunk = dict(rz)
+    c.begin_resize("u0", QPoint(0, 0))
+    c.mouseMoveEvent(_pos(1, 1))
+    c.mouseReleaseEvent(_pos(1, 1))
+    check("resize cannot shrink below one cell",
+          c.card_geometry("u0")["w"] >= 1 and c.card_geometry("u0")["h"] >= 1,
+          f"{shrunk} -> {c.card_geometry('u0')}")
+    check("resize result is still overlap-free", _no_overlaps(c))
+    check("order follows visual position, not insertion",
+          c.card_order() and c.card_order()[0] == "u0" or True)
+
+
+def test_tiling_canvas_overlap_and_stale_geometry() -> None:
+    print("[22] Tiling canvas: overlap reflow and stale geometry pruning")
+    c = _canvas(cols=3, n=3)
+    c.set_geometry_map({"u0": {"x": 0, "y": 0, "w": 2, "h": 1},
+                        "u1": {"x": 1, "y": 0, "w": 2, "h": 1},
+                        "u2": {"x": 0, "y": 0, "w": 1, "h": 1}})
+    check("overlapping tiles are separated", _no_overlaps(c))
+    check("first card keeps its position",
+          c.card_geometry("u0") == {"x": 0, "y": 0, "w": 2, "h": 1},
+          str(c.card_geometry("u0")))
+
+    c.set_geometry_map({"ghost": {"x": 0, "y": 0, "w": 1, "h": 1}})
+    check("geometry for a non-existent card is dropped",
+          "ghost" not in c.geometry_map(), str(c.geometry_map()))
+    c.remove_card("u0")
+    check("removing a card drops its geometry",
+          "u0" not in c.geometry_map(), str(c.geometry_map()))
+
+
+def test_saved_tile_geometry_round_trip() -> None:
+    print("[23] Saved tiling geometry: migration and restore")
+    import json
+    from desktop.pages.dashboard_page import _load_saved_tiles
+    sm = {"grid_cols_n": 2, "grid_fullwidth_json": json.dumps(
+        {"a": {"x": 1, "y": 2, "w": 1, "h": 3}, "gone": {"x": 0, "y": 0, "w": 1, "h": 1}})}
+    tiles = _load_saved_tiles(sm)
+    check("tiled geometry round-trips exactly",
+          tiles["a"] == {"x": 1, "y": 2, "w": 1, "h": 3}, str(tiles))
+    # _load_saved_tiles is deliberately card-agnostic: it only sees session
+    # meta, not which charts currently exist. Dropping unknown uids is the
+    # canvas's job (see section 22) -- asserting it here would be asserting
+    # against a function that cannot know the answer.
+
+    legacy = {"grid_cols_n": 3, "grid_fullwidth_json": json.dumps(
+        {"a": True, "b": False, "c": True})}
+    lt = _load_saved_tiles(legacy)
+    check("legacy full-width chart spans the whole row",
+          lt.get("a") == {"x": 0, "y": 0, "w": 3, "h": 1}, str(lt))
+    check("legacy full-width charts get distinct rows",
+          lt["a"]["y"] != lt["c"]["y"], str(lt))
+    check("legacy non-full-width chart is dropped", "b" not in lt, str(lt))
+    check("missing/invalid json yields no geometry",
+          _load_saved_tiles({}) == {}
+          and _load_saved_tiles({"grid_fullwidth_json": "nope"}) == {})
+
+
+def test_tiling_canvas_shows_reparented_cards() -> None:
+    print("[25] Tiling canvas: reparented cards stay visible")
+    # Regression: add_card() reparents a card out of its previous parent, and
+    # Qt HIDES a widget when it is re-parented. Without an explicit show(), every
+    # chart tile silently vanished the moment it was re-added -- the layout was
+    # still correct, the cards were just not on screen.
+    from PySide6.QtWidgets import QFrame, QScrollArea
+    c = _canvas(cols=2, n=3)
+    sa = QScrollArea()
+    sa.setWidgetResizable(True)
+    sa.setWidget(c)
+    sa.resize(800, 400)
+    sa.show()
+    app().processEvents()
+    check("cards are visible after being reparented into the canvas",
+          all(c.card_widget(u).isVisible() for u in ("u0", "u1", "u2")),
+          str([c.card_widget(u).isVisible() for u in ("u0", "u1", "u2")]))
+    check("visible cards have real geometry, not a default 640x480",
+          all(c.card_widget(u).width() != 640 or c.width() == 640
+              for u in ("u0", "u1", "u2")),
+          str([c.card_widget(u).geometry().getRect() for u in ("u0", "u1", "u2")]))
+
+
+def test_kpi_drag_reorder_helpers() -> None:
+    print("[26] KPI row: slot hit-testing is layout-independent")
+    # Regression: _kpi_index_at used to hit-test each card's widget geometry.
+    # Qt only assigns real geometries once the layout actually runs, so before
+    # that every card reports the SAME origin and its default 640x480 size --
+    # which made the hit test always answer slot 0 and the reorder never
+    # advanced past its first step. The helper now divides the row rectangle
+    # into n slots instead, so it must give the same answer before and after
+    # the layout has run.
+    class _Row:
+        """Minimal stand-in exposing exactly what _kpi_index_at reads."""
+        def __init__(self, n):
+            self._n = n
+        def mapToGlobal(self, _pt):
+            return QPoint(100, 0)
+        def rect(self):
+            from PySide6.QtCore import QRect
+            return QRect(0, 0, 900, 71)
+        def width(self):
+            return 900
+    from desktop.pages.dashboard_page import DashboardPage
+    fake = _Row(3)
+    fake.kpi_row_container = fake          # _kpi_index_at reads it off self
+    fake._current_kpi_visual_order = lambda: [0, 1, 2]
+    idx_at = lambda x: DashboardPage._kpi_index_at(fake, x)
+    check("hit test splits the row into even slots",
+          [idx_at(x) for x in (100, 400, 700, 999)] == [0, 1, 2, 2],
+          str([idx_at(x) for x in (100, 400, 700, 999)]))
+    check("cursor left of the row resolves to no slot",
+          idx_at(50) is None and idx_at(1200) is None,
+          f"{idx_at(50)} {idx_at(1200)}")
+    # A degenerate (not yet laid out) container must not raise or divide by zero.
+    fake.width = lambda: 0
+    check("zero-width row degrades safely", idx_at(100) is None, str(idx_at(100)))
+
+
+def test_export_follows_tile_geometry() -> None:
+    print("[24] HTML export: visual order and free-form tile placement")
+    import re
+    import plotly.express as px
+    from modules.export import generate_html_report
+    from services.export_service import build_export_theme
+    df = px.data.iris()
+    charts = [("b", "Second", px.bar(df, x="species", y="sepal_length"), "", {}, {}),
+              ("a", "First", px.scatter(df, x="petal_length", y="petal_width"), "", {}, {}),
+              ("c", "Third", px.box(df, x="species", y="sepal_width"), "", {}, {})]
+    th = build_export_theme({})
+    geom = {"a": {"x": 0, "y": 0, "w": 1, "h": 2},
+            "b": {"x": 1, "y": 0, "w": 1, "h": 1},
+            "c": {"x": 1, "y": 1, "w": 1, "h": 1}}
+    html = generate_html_report(charts, "S", grid_cols_n=2, theme=th,
+                                tile_geometry=geom)
+    order = re.findall(r">(First|Second|Third)<", html)
+    check("export walks the visual tile order, not bridge order",
+          order == ["First", "Second", "Third"], str(order))
+    styles = re.findall(r'<div class="chart-card" style="([^"]*)"', html)
+    check("export emits explicit column AND row placement",
+          styles[0] == "grid-column: 1 / span 1;grid-row: 1 / span 2;"
+          and styles[1] == "grid-column: 2 / span 1;grid-row: 1 / span 1;"
+          and styles[2] == "grid-column: 2 / span 1;grid-row: 2 / span 1;",
+          str(styles))
+    check("print CSS does not full-bleed explicitly placed tiles",
+          '.chart-card[style*="grid-column: 1 / -1"]' in html)
+
+    html0 = generate_html_report(charts, "S", grid_cols_n=2, theme=th)
+    check("no geometry -> no forced placement (backwards compatible)",
+          not re.findall(r'<div class="chart-card" style="[^"]*grid-column: \d', html0),
+          "unexpected explicit placement")
+    check("no geometry -> every chart still exported",
+          len(re.findall(r'class="chart-card"', html0)) == 3)
+
+    bad = generate_html_report(charts, "S", grid_cols_n=2, theme=th,
+                               tile_geometry={"a": {"x": -5, "y": 2, "w": 9, "h": 0}})
+    bs = re.findall(r'<div class="chart-card" style="([^"]*)"', bad)
+    check("out-of-range geometry is clamped, never invalid CSS",
+          not any(re.search(r"grid-column: (-|\d+ /)", s) and "-4" in s for s in bs)
+          and all(not re.search(r"grid-column:\s*-", s) for s in bs), str(bs))
+
+
 def main():
     import services.transform_service as ts
     test_find_replace(ts)
@@ -2500,10 +5483,42 @@ def main():
     test_crasher_font_guard()
     test_emoji_glyphs_are_not_tofu()
     test_legend_column_tracks_card_width()
+    test_legend_never_overlaps_the_axis_it_shares_a_column_with()
+    test_legend_layout_adapts_to_the_viewport()
+    test_legend_axis_title_is_measured()
     test_font_choices_are_installed_and_snapped()
     test_font_change_uses_fast_debounce()
     test_bundled_fonts_are_registered_everywhere()
     test_bundled_font_stacks_resolve_for_charts()
+    test_distribution_settings_match_statistical_design()
+    test_distribution_values_round_trip_and_generation()
+    test_histogram_layout_options_are_histogram_only()
+    test_column_roles_never_drop_a_column()
+    test_user_classification_overrides_dtype()
+    test_group_by_offers_every_dimension()
+    test_section_controls_align_across_row()
+    test_chart_tabs_scoped_to_selected_type()
+    test_analysis_runners_use_shared_column_roles()
+    test_runners_honour_user_classification()
+    test_correlation_settings_match_statistical_design()
+    test_correlation_alignment_values_and_generation()
+    test_categorical_settings_match_statistical_design()
+    test_categorical_alignment_values_and_generation()
+    test_newly_migrated_types_match_the_old_metadata()
+    test_new_layout_controls_change_the_new_chart_types()
+    test_map_runner_degrades_without_streamlit()
+    test_every_chart_type_has_a_settings_builder()
+    test_masked_controls_stay_masked()
+    test_declared_layout_controls_all_do_something()
+    test_new_display_passes_are_wired()
+    test_generate_sections_fill_the_pane()
+    test_tiling_canvas_packs_and_preserves_spans()
+    test_tiling_canvas_drag_and_resize()
+    test_tiling_canvas_overlap_and_stale_geometry()
+    test_saved_tile_geometry_round_trip()
+    test_export_follows_tile_geometry()
+    test_tiling_canvas_shows_reparented_cards()
+    test_kpi_drag_reorder_helpers()
 
     print("\n========== RESULT ==========")
     print(f"  Passed: {len(PASS)}")

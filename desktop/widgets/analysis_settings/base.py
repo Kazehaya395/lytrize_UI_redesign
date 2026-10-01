@@ -1,9 +1,13 @@
 """Shared flat-section helpers + 3-tab builder contract (no cards)."""
 from __future__ import annotations
+import logging
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPalette, QStandardItem, QStandardItemModel
-from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QLineEdit, QPushButton, QSizePolicy, QSlider, QSpinBox, QStyle, QStyledItemDelegate, QStyleOptionButton, QStyleOptionViewItem, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QColorDialog, QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QLineEdit, QPushButton, QSizePolicy, QSlider, QSpinBox, QStyle, QStyledItemDelegate, QStyleOptionButton, QStyleOptionViewItem, QVBoxLayout, QWidget)
 from desktop.theme import group_label_style, label_style, resolve_color, input_style, PAGE_MARGINS
+
+log = logging.getLogger(__name__)
+
 def _fallback(mode):
     return None
 CTA_TEXT = '\u25b6 Generate Charts'
@@ -13,7 +17,21 @@ PAGE_SPACING = 10
 ROW_SPACING = 6
 HINT_GAP = 4
 SECTION_GAP = 14
+# Lines reserved for a section's description row. Sections in the same row
+# share this height so their controls line up whatever the text says (and a
+# section with no description still reserves the slot instead of jumping up).
+HINT_ROW_LINES = 2
 PILL_W = 128
+# Compact Generate field width -- the annotated design's 210px field. Shared
+# by every builder (base owns it so ``FLOW_MIN_COL`` cannot drift from it).
+GEN_W = 210
+# Minimum width one Generate section box needs before the next section wraps
+# onto the following line: the compact field (``GEN_W``) plus the section's
+# own 12px side margins. See ``FlowGrid``.
+FLOW_MIN_COL = GEN_W + 24
+# Generous default pane width for a page that has not been shown yet, so a
+# headless build still gets a sane line-break instead of one item per line.
+FLOW_ASSUMED_W = 1440
 _CHECKED_ROLE = Qt.UserRole + 1
 _CHECK_BOX = True
 CHECK_ROW_H = 28
@@ -144,7 +162,11 @@ class _MultiSelectPopup(QWidget):
         self.show()
 class MultiSelectCombo(QComboBox):
     selection_changed = Signal(list)
-    PLACEHOLDER = 'Dropdown with checkboxes; click to expand'
+    # Shown when nothing is selected. Intentionally EMPTY: a sentence like
+    # "Dropdown with checkboxes; click to expand" is instruction text, not a
+    # value, and reading it as the current selection was confusing -- it
+    # looked like a real choice sitting in the field.
+    PLACEHOLDER = ''
     def __init__(self, items=None, parent=None):
         super().__init__(parent)
         self._items = list(items or [])
@@ -231,15 +253,169 @@ def page_root():
     rl.setSpacing(PAGE_SPACING)
     return root, rl
 def section_box(title, body, hint=''):
+    """A titled section: header, description, then the control.
+
+    The description row is a FIXED-height slot whether or not there is
+    anything to put in it. Without that reservation each section sized its
+    header block to its own text, so in a row of siblings a two-line hint
+    pushed its control further down than a one-line (or absent) hint and the
+    controls ended up on a staircase instead of one line. The rule is that
+    the control sits at the same height in every section of the row, no
+    matter what the wording or line count is.
+    """
     wrap = QWidget()
     wl = QVBoxLayout(wrap)
     wl.setContentsMargins(12, 4, 12, 4)
     wl.setSpacing(HINT_GAP)
     wl.addWidget(section_label(title))
-    if hint:
-        wl.addWidget(hint_label(hint))
+    hint_w = hint_label(hint)
+    try:
+        # Two lines' worth, measured from the actual hint font so it stays
+        # correct across theme/scale changes rather than being a magic number.
+        hint_w.setFixedHeight(hint_w.fontMetrics().height() * HINT_ROW_LINES)
+    except Exception:
+        pass
+    wl.addWidget(hint_w)
     wl.addWidget(body)
     return wrap
+class FlowGrid(QWidget):
+    """Generate sections packed across the pane, wrapping onto new lines.
+
+    The old panels were Streamlit ones and a ``st.columns(n)`` column always
+    spanned its share of the page, so the controls sat side by side across the
+    viewport. A fixed "three sections per row" grid instead stopped a third of
+    the way across and left the whole right-hand side of the tab empty -- the
+    reported "why is this leaving empty space, fill the viewport" -- while
+    also making the page taller than the pane it sits in.
+
+    This is the fix. A line holds as many sections as fit at ``min_col``
+    width; the sections on that line stretch to equal shares of the pane, so
+    the line is filled edge to edge and every line has the SAME column count,
+    which is what keeps the wrapped remainder aligned under the columns above
+    it. What does not fit wraps onto the next line and stays at the left.
+    The pane then only ever needs its vertical scrollbar for the wrapped
+    lines, never for a grid that was wider than the space it was given.
+
+    Re-flows on every resize: a narrow pane drops to fewer columns per line
+    instead of clipping, a wide one to more (the eight categorical controls
+    fit on one line once the pane is wide enough for them).
+    """
+
+    def __init__(self, min_col=FLOW_MIN_COL, gap=SECTION_GAP, parent=None):
+        super().__init__(parent)
+        self._min_col = int(min_col)
+        self._gap = int(gap)
+        self._items = []
+        self._lines = []
+        self._cols = 0
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(PAGE_SPACING)
+        self._outer = outer
+        # One column's worth is the floor, NOT the current layout's minimum.
+        # Qt refuses to shrink a widget below the minimum its CURRENT layout
+        # needs, so a line of six sections would pin the page at ~1470px and
+        # the pane could never get small enough to trigger the re-flow that
+        # would have broken those six into fewer columns -- the exact
+        # chicken-and-egg that leaves a page wider than its viewport. An
+        # explicit minimum lets the resize land; the line break is then
+        # recomputed from the new width.
+        try:
+            self.setMinimumWidth(self._min_col)
+        except Exception:
+            pass
+
+    # -- Content -----------------------------------------------------------
+    def add_section(self, widget):
+        """Add one section box, in slot order, and re-flow the lines."""
+        try:
+            widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        except Exception:
+            pass
+        self._items.append(widget)
+        self._relayout(force=True)
+        return widget
+
+    def columns(self):
+        """Columns per line at the last re-flow (0 before the first one)."""
+        return self._cols
+
+    def sections(self):
+        """The section boxes, in slot order (what ``add_section`` took)."""
+        return tuple(self._items)
+
+    def line_count(self):
+        return len(self._lines)
+
+    # -- Layout ------------------------------------------------------------
+    def _col_count(self):
+        n = len(self._items)
+        if n <= 0:
+            return 1
+        avail = self.width() if self.isVisible() else 0
+        if avail <= 0:
+            # Not on screen yet (an unshown page reports a meaningless
+            # width): assume a typical pane rather than one item per line.
+            # The first real resize re-flows against the true width.
+            avail = FLOW_ASSUMED_W
+        fit = int((avail + self._gap) // (self._min_col + self._gap))
+        # Never more columns than there are sections: empty columns would
+        # take a share of the width and leave the rest of the pane blank
+        # again, which is the very thing this replaces.
+        return max(1, min(int(fit), n))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._relayout()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._relayout()
+
+    def _ensure_line(self, index):
+        while len(self._lines) <= index:
+            row = QWidget()
+            lay = QHBoxLayout(row)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(self._gap)
+            self._lines.append((row, lay))
+            self._outer.addWidget(row)
+        return self._lines[index]
+
+    def _relayout(self, force=False):
+        n = len(self._items)
+        if n <= 0:
+            return
+        cols = self._col_count()
+        rows = (n + cols - 1) // cols
+        if not force and cols == self._cols and len(self._lines) == rows:
+            return
+        self._cols = cols
+        # Empty every line first: a widget lives in exactly one layout, and
+        # re-adding it is what moves it. The sections themselves are never
+        # destroyed -- the page keeps the controls it built.
+        for _row, lay in self._lines:
+            while lay.count():
+                lay.takeAt(0)
+        for line in range(rows):
+            _row, lay = self._ensure_line(line)
+            in_line = self._items[line * cols:(line + 1) * cols]
+            for w in in_line:
+                lay.addWidget(w, 1)
+            # Pad the last line with the slots it does not use, so its
+            # sections keep the same width as every line above: the leftover
+            # options stay in the left-hand columns instead of stretching
+            # across a line of their own.
+            for _ in range(cols - len(in_line)):
+                lay.addStretch(1)
+        for index in range(len(self._lines) - 1, rows - 1, -1):
+            row, _lay = self._lines.pop(index)
+            self._outer.removeWidget(row)
+            row.hide()
+            row.setParent(None)
+            row.deleteLater()
+
+
 def grid_row(label, widget, label_w=PILL_W):
     row = QWidget()
     row.setProperty('grid_row', True)
@@ -375,17 +551,26 @@ class AnalysisSettingsBase(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
-    def set_context(self, num_cols=None, cat_cols=None, dt_cols=None, palette_names=None, all_cols=None, trace_names=None, group_cols=None):
+    def set_context(self, num_cols=None, cat_cols=None, dt_cols=None, palette_names=None, all_cols=None, trace_names=None, group_cols=None, dim_cols=None):
         self._num_cols = list(num_cols or [])
         self._cat_cols = list(cat_cols or [])
         self._dt_cols = list(dt_cols or [])
         self._palette_names = list(palette_names or [])
         self._all_cols = list(all_cols or [])
         self._trace_names = list(trace_names or [])
-        if group_cols is None:
-            self._group_cols = list(cat_cols or [])
-        else:
+        if dim_cols is not None:
+            # Explicit dimension pool from the page (text + datetime, minus
+            # whatever the user classified as a metric).
+            self._group_cols = list(dim_cols)
+        elif group_cols is not None:
             self._group_cols = list(group_cols)
+        else:
+            # Fall back to the dimension families we were handed, NOT just
+            # the text ones: a datetime column is a valid grouping key and
+            # must not be missing from "Group by" simply because it is not
+            # object dtype.
+            self._group_cols = list(self._cat_cols) + [
+                c for c in self._dt_cols if c not in self._cat_cols]
     def _ensure_context(self):
         pass
     def _build(self):
@@ -451,6 +636,126 @@ class AnalysisSettingsBase(QWidget):
         return self._dirty
     def reset_dirty(self):
         self._dirty = False
+    def _mask_rows(self, root, labels):
+        """Delete the rows whose label text is in *labels*.
+
+        Shared by every type that inherits the template and then offers LESS
+        than it (see ``CorrelationSettings`` / ``CategoricalSettings`` and
+        ``extra/CHART_IMPLEMENTATION_RULES.md``). Removing the row outright
+        instead of hiding it takes the control out of the layout entirely, so
+        it cannot be reached by tab order, by a stray focus change, or by a
+        later prefill.
+
+        Both row styles are handled: a ``grid_row`` (label + widget, matched
+        via the section-role QLabel) and a ``_check_row`` checkbox (matched on
+        the checkbox text itself -- "Show border" has no separate label).
+        """
+        wanted = {str(t).strip() for t in labels}
+        seen = set()
+        for lbl in list(root.findChildren(QLabel)):
+            try:
+                if (str(lbl.property('theme_role')) != 'section'
+                        or lbl.text().strip() not in wanted):
+                    continue
+                row = lbl.parentWidget()
+                if row is None or id(row) in seen:
+                    continue
+                seen.add(id(row))
+                self._detach_row(row)
+            except Exception:
+                continue
+        for box in list(root.findChildren(QCheckBox)):
+            try:
+                if box.text().strip() not in wanted:
+                    continue
+                row = box.parentWidget()
+                if row is None or id(row) in seen:
+                    continue
+                seen.add(id(row))
+                self._detach_row(row)
+            except Exception:
+                continue
+    @staticmethod
+    def _detach_row(row):
+        """Unparent *row* from its layout and schedule it for deletion."""
+        lay = row.layout()
+        if lay is not None:
+            while lay.count():
+                item = lay.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.setParent(None)
+                    w.deleteLater()
+        row.setParent(None)
+        row.deleteLater()
+
+    # -- Shared layout-column access ---------------------------------------
+    # A builder that inherits the template's Layout tab and then ADDS its own
+    # type-specific rows must put them in the column that already exists, not in
+    # a third one. These two helpers let it do that without duplicating
+    # tree-walking per type.
+
+    def _option_columns(self, root):
+        """The Layout tab's option columns, left to right.
+
+        Located by the marker the template puts on each column (the ``grid_row``
+        / check-row widgets that hold them are children of the column itself),
+        and returned innermost-column-first would be fragile, so they come back
+        in visual order: the first is the left-hand column.
+        """
+        out = []
+        try:
+            for w in root.findChildren(QWidget):
+                if w.property('option_column'):
+                    out.append(w)
+        except Exception:
+            return []
+        # ``findChildren`` is a depth-first walk, which for this tree is already
+        # left-to-right, but sort on x to be certain rather than assumed.
+        def _x(w):
+            try:
+                return w.mapTo(root, QPoint(0, 0)).x()
+            except Exception:
+                return 0
+        out.sort(key=_x)
+        return out
+
+    def _layout_option_column(self, root):
+        """The right-hand Layout option column -- where extra rows belong."""
+        cols = self._option_columns(root)
+        return cols[-1] if cols else None
+
+    def _option_insert_index(self, column):
+        """Row index that appends just above a column's trailing stretch.
+
+        The shared columns end with ``addStretch()``, so inserting at the
+        spacer keeps the new rows grouped with the other options rather than
+        dropping them below the filler.
+        """
+        lay = column.layout()
+        for i in range(lay.count()):
+            if lay.itemAt(i).spacerItem() is not None:
+                return i
+        return lay.count()
+
+    def _add_option_row(self, root, row, column_index=-1):
+        """Insert *row* into the Layout tab's option *column_index*.
+
+        Returns True when it landed. Used by every builder that extends the
+        template's Layout tab with its own type-specific options.
+        """
+        cols = self._option_columns(root)
+        if not cols:
+            return False
+        try:
+            column = cols[column_index]
+            column.layout().insertWidget(self._option_insert_index(column), row)
+            return True
+        except Exception:
+            log.debug("could not add the option row to the layout column",
+                      exc_info=True)
+            return False
+
 def restyle_tree(root):
     try:
         for w in root.findChildren(QWidget):

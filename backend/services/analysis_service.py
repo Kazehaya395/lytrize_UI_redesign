@@ -11,11 +11,15 @@ Streamlit UI.
 
 from __future__ import annotations
 
+import inspect
 import uuid
 from typing import Any, Optional
 
 import pandas as pd
 
+from services.column_roles import (
+    dimension_columns, metric_columns, resolve_roles,
+)
 from modules.analysis.descriptive import run_descriptive
 from modules.analysis.statistical import run_statistical
 from modules.analysis.distribution import run_distribution
@@ -182,25 +186,47 @@ WIDGET_SPEC = {
 
 # ── Pure column-type helpers (no st.session_state dependency) ──────────
 
-def num_cols(df: pd.DataFrame) -> list:
-    """Return the list of numeric column names in *df*."""
-    return df.select_dtypes(include="number").columns.tolist()
+def _roles_for(df: pd.DataFrame, roles=None, explicit=None,
+               value_sig_map=None) -> dict:
+    if roles is not None:
+        return roles
+    return resolve_roles(df, explicit, value_sig_map)
 
 
-def cat_cols(df: pd.DataFrame) -> list:
-    """Return the list of categorical (object) column names in *df*."""
-    return df.select_dtypes(include="object").columns.tolist()
+def num_cols(df: pd.DataFrame, roles=None, explicit=None,
+             value_sig_map=None) -> list:
+    """Columns to offer as metrics (the values being measured)."""
+    return metric_columns(_roles_for(df, roles, explicit, value_sig_map))
 
 
-def dt_cols(df: pd.DataFrame) -> list:
-    """Return the list of datetime column names in *df*."""
-    return df.select_dtypes(include="datetime").columns.tolist()
+def cat_cols(df: pd.DataFrame, roles=None, explicit=None,
+             value_sig_map=None) -> list:
+    """Columns to offer as text/category dimensions."""
+    return list(_roles_for(df, roles, explicit, value_sig_map)["categorical"])
+
+
+def dt_cols(df: pd.DataFrame, roles=None, explicit=None,
+            value_sig_map=None) -> list:
+    """Columns to offer as datetime dimensions."""
+    return list(_roles_for(df, roles, explicit, value_sig_map)["datetime"])
+
+
+def dim_cols(df: pd.DataFrame, roles=None, explicit=None,
+             value_sig_map=None) -> list:
+    """Every dimension (categorical + datetime) -- for Group by / X axis.
+
+    Use this for "pick a column to break the data down by": a date is a
+    legitimate grouping key, so the list must not exclude the datetime
+    family the way a text-only pool does.
+    """
+    return dimension_columns(_roles_for(df, roles, explicit, value_sig_map))
 
 
 # ── Config dict builder (replaces _collect_kwargs) ─────────────────────
 
 def build_analysis_config(aid: str, df: pd.DataFrame,
-                          widget_values: dict[str, Any]) -> dict[str, Any]:
+                          widget_values: dict[str, Any],
+                          roles: Optional[dict] = None) -> dict[str, Any]:
     """Build a keyword-argument dict for a runner from raw widget values.
 
     Parameters
@@ -212,15 +238,21 @@ def build_analysis_config(aid: str, df: pd.DataFrame,
     widget_values : dict
         Raw widget values keyed by widget key (as defined in WIDGET_SPEC).
         Missing keys default to sensible defaults.
+    roles : dict, optional
+        Pre-resolved column families from ``services.column_roles``. Pass the
+        same roles the form was built from so the defaults computed here
+        (e.g. "first four metrics") honour the user's Column Classification
+        instead of re-detecting from raw dtypes. ``None`` falls back to
+        auto-detection, which is always safe but may ignore user intent.
 
     Returns
     -------
     dict
         Keyword arguments suitable for passing to ``run_analysis()``.
     """
-    num = num_cols(df)
-    cat = cat_cols(df)
-    dt = dt_cols(df)
+    num = num_cols(df, roles=roles)
+    cat = cat_cols(df, roles=roles)
+    dt = dt_cols(df, roles=roles)
     all_cols = df.columns.tolist()
     NONE = "None"
 
@@ -267,10 +299,21 @@ def build_analysis_config(aid: str, df: pd.DataFrame,
         # Fixed to pass the list selections straight through, matching
         # what the widget spec already promises and what the runner
         # already supports.
-        x_list = [v for v in (g("x", []) or []) if v not in (None, "", NONE)]
+        #
+        # Scalar strings are normalised too: WIDGET_SPEC declares x/y as
+        # "list", and the Qt form collects them as lists, but a legacy saved
+        # config (or a direct API caller) can still hand in a bare column
+        # name -- iterating it would split it into characters.
+        raw_x = g("x", [])
+        if isinstance(raw_x, str):
+            raw_x = [raw_x]
+        x_list = [v for v in (raw_x or []) if v not in (None, "", NONE)]
         if not x_list:
             x_list = cat[:2] if cat else []
-        y_list_sel = [v for v in (g("y", []) or []) if v not in (None, "", NONE)]
+        raw_y = g("y", [])
+        if isinstance(raw_y, str):
+            raw_y = [raw_y]
+        y_list_sel = [v for v in (raw_y or []) if v not in (None, "", NONE)]
 
         agg = AGG_FUNCS.get(g("agg", "Avg"), "mean")
         raw_sort = g("sort", "Value ↓")
@@ -311,6 +354,12 @@ def build_analysis_config(aid: str, df: pd.DataFrame,
             color_col=_sp_resolve("color_col"),
             size_col=_sp_resolve("size_col"),
             trendline=g("trendline", "None"),
+            # Render mode is a Plotly EXPRESS choice fixed at BUILD time, so it
+            # is read here from the widget values rather than applied later by
+            # apply_display_options like every other Layout option. It is
+            # deliberately NOT in WIDGET_SPEC: that schema drives the generic
+            # fallback panel, and this control lives on the scatter builder's
+            # own Layout tab, where it would otherwise be rendered twice.
             render_mode=g("render_mode", "svg"),
         )
 
@@ -356,15 +405,28 @@ def build_analysis_config(aid: str, df: pd.DataFrame,
             return None if v in (NONE, None, "") else v
         _mp_mode = g("map_mode", "Scatter (Lat/Lon)")
         if _mp_mode == "Choropleth (Location Names)":
+            # The choropleth country column is collected as ``location_col`` by
+            # the single Location control the form shows, but this branch names
+            # it ``geo_col``. Fall back so a form with only the Location field
+            # still produces a working choropleth instead of a silent None.
+            _geo = _mp_resolve("geo_col") or _mp_resolve("location_col")
+            # The form shows ONE "Borders" checkbox and collects it as
+            # ``show_borders``, while the runner parameter is named
+            # ``choropleth_show_borders``. Reading only the runner's name left
+            # the checkbox unable to change anything: the form's value was
+            # dropped and the default True was used every time.
+            _borders = bool(g("show_borders",
+                              g("choropleth_show_borders", True)))
             kwargs.update(
-                geo_col=_mp_resolve("geo_col"),
+                geo_col=_geo,
                 value_col=_mp_resolve("value_col"),
+                color_col=_mp_resolve("color_col"),
                 agg_func=AGG_FUNCS.get(g("agg_func", "Sum"), "sum"),
                 invert_colorscale=bool(g("invert_colorscale", False)),
                 choropleth_colorscale=g("choropleth_colorscale", "Blues"),
                 choropleth_projection=g("choropleth_projection", "natural earth"),
                 choropleth_scope=g("choropleth_scope", "world"),
-                choropleth_show_borders=bool(g("choropleth_show_borders", True)),
+                choropleth_show_borders=_borders,
             )
         else:
             kwargs.update(
@@ -378,8 +440,9 @@ def build_analysis_config(aid: str, df: pd.DataFrame,
                 invert_colorscale=bool(g("invert_colorscale", False)),
                 map_style=g("map_style", "carto-positron"),
                 marker_opacity=float(g("marker_opacity", 0.82)),
+                show_borders=bool(g("show_borders",
+                                    g("choropleth_show_borders", True))),
             )
-
     elif aid == "time_series":
         x = _single_choice_value(g("x", NONE), NONE)
         y = _single_choice_value(g("y", num[0] if num else NONE), num[0] if num else NONE)
@@ -416,7 +479,8 @@ def _single_choice_value(value, default=None):
 
 # ── Core analysis runner ───────────────────────────────────────────────
 
-def run_analysis(aid: str, df: pd.DataFrame, **kwargs) -> list[tuple[str, str, Any]]:
+def run_analysis(aid: str, df: pd.DataFrame, roles: Optional[dict] = None,
+                 **kwargs) -> list[tuple[str, str, Any]]:
     """Run an analysis and return a list of ``(uid, title, fig)`` tuples.
 
     This is the headless equivalent of the ``_run()`` function in
@@ -428,6 +492,13 @@ def run_analysis(aid: str, df: pd.DataFrame, **kwargs) -> list[tuple[str, str, A
         Analysis type ID (e.g. ``"descriptive"``, ``"correlation"``).
     df : pd.DataFrame
         The dataset.
+    roles : dict, optional
+        Pre-resolved column families from ``services.column_roles``. Threaded
+        into every runner so a chart's default column list is the same pool
+        the form offered the user, instead of each runner re-deriving it from
+        raw dtypes (which is how a user who reclassified a numeric column as
+        a dimension still saw it as a metric in some chart types). Runners
+        that do not accept ``roles`` are called without it.
     **kwargs
         Runner-specific keyword arguments (see ``build_analysis_config``).
 
@@ -441,7 +512,11 @@ def run_analysis(aid: str, df: pd.DataFrame, **kwargs) -> list[tuple[str, str, A
         return []
 
     try:
-        raw = fn(df) if aid in ("descriptive", "data_quality") else fn(df, **kwargs)
+        if roles is not None and _accepts_roles(fn):
+            kwargs = dict(kwargs)
+            kwargs["roles"] = roles
+
+        raw = fn(df, **kwargs)
 
         results = []
         for title, fig in raw:
@@ -457,8 +532,33 @@ def run_analysis(aid: str, df: pd.DataFrame, **kwargs) -> list[tuple[str, str, A
         return []
 
 
+def _accepts_roles(fn) -> bool:
+    """True when *fn* can take a ``roles`` keyword.
+
+    Every runner now declares ``roles`` explicitly, but the two paths that do
+    not take normal runner kwargs (``descriptive``, ``data_quality``) and any
+    future helper must keep working, so the argument is only passed when the
+    signature actually has it rather than relying on a blanket ``**kwargs``.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if "roles" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD
+               for p in params.values())
+
+
 def run_analysis_with_config(aid: str, df: pd.DataFrame,
-                              widget_values: dict[str, Any]) -> list[tuple[str, str, Any]]:
-    """Convenience: build config from widget values and run analysis in one call."""
-    kwargs = build_analysis_config(aid, df, widget_values)
-    return run_analysis(aid, df, **kwargs)
+                              widget_values: dict[str, Any],
+                              roles: Optional[dict] = None
+                              ) -> list[tuple[str, str, Any]]:
+    """Convenience: build config from widget values and run analysis in one call.
+
+    ``roles`` is forwarded to BOTH stages on purpose: the config builder uses
+    it to compute the same defaults the form showed, and the runner uses it so
+    the chart's own column fallbacks agree with those defaults.
+    """
+    kwargs = build_analysis_config(aid, df, widget_values, roles=roles)
+    return run_analysis(aid, df, roles=roles, **kwargs)

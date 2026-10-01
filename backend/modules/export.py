@@ -196,8 +196,17 @@ def generate_html_report(
     grid_cols_n=2,
     inline_plotly=True,
     theme: dict = None,
+    tile_geometry: dict = None,
 ) -> str:
-    """Generate a fully self-contained HTML dashboard file."""
+    """Generate a fully self-contained HTML dashboard file.
+
+    ``tile_geometry`` is the dashboard canvas's free-form arrangement
+    (``{uid: {x, y, w, h}}`` in grid units). When given, the exported grid is
+    laid out with explicit ``grid-column``/``grid-row`` placements so the HTML
+    reproduces the board the user actually built, including gaps and
+    non-sequential positions. When absent, export falls back to sequential
+    auto-flow (plus the legacy ``full_width`` span) exactly as before.
+    """
     t = _merge_theme(theme or {})
     is_landscape = orientation == "landscape"
     max_width    = t.get("max_width") or "1840px"
@@ -253,6 +262,22 @@ def generate_html_report(
         kpi_html = f'<div class="kpi-row">{kpi_items}</div>'
 
 
+    # Free-form tiling: walk the charts in VISUAL order (top-to-bottom,
+    # left-to-right) rather than the stored order, otherwise a board where the
+    # user dragged cards around would export with its charts in the wrong
+    # sequence for any reader not using CSS grid placement.
+    tiles = {u: g for u, g in (tile_geometry or {}).items()
+             if isinstance(g, dict)}
+
+    def _visual_key(item):
+        uid = item[0]
+        g = tiles.get(uid)
+        if g is None:
+            return (0, 0, 0, uid)          # unplaced charts keep bridge order
+        return (1, int(g.get("y", 0)), int(g.get("x", 0)), uid)
+
+    charts = sorted(charts, key=_visual_key) if tiles else charts
+
     chart_blocks = ""
     for idx, item in enumerate(charts):
         uid, chart_title, fig, notes = item[:4]
@@ -260,7 +285,33 @@ def generate_html_report(
 
 
         display_title = meta.get("custom_title") or chart_title
-        col_span      = "grid-column: 1 / -1;" if meta.get("full_width") else ""
+        # Explicit placement from the canvas geometry. The card is given
+        # grid-row: span <h> so a tall tile really is tall, and grid-column: span
+        # <w> so the exported widths match what the user dragged -- this is what
+        # makes the standalone HTML a true preview of the live dashboard.
+        # Cards with no saved geometry fall back to auto-flow, and a full-width
+        # span when the chart has no geometry at all (legacy sessions).
+        g = tiles.get(uid)
+        if g is not None:
+            # Clamp here as well as in the canvas: export can be handed geometry
+            # straight from stored session JSON, so a negative or oversized
+            # span must not reach CSS as "grid-column: -4 / span 2", which the
+            # browser discards (silently full-bleed the card).
+            cols = max(1, int(grid_cols_n))
+            x = max(0, min(int(g.get("x", 0)), cols - 1))
+            span_w = max(1, min(int(g.get("w", 1)), cols - x))
+            y = max(0, int(g.get("y", 0)))
+            span_h = max(1, int(g.get("h", 1)))
+            # Both tracks are given an explicit START line. Emitting only a
+            # span for grid-row would leave the row to auto-placement, which
+            # can drop a card back onto an occupied cell when its column is
+            # explicitly placed.
+            col_span = (
+                f"grid-column: {x + 1} / span {span_w};"
+                f"grid-row: {y + 1} / span {span_h};"
+            )
+        else:
+            col_span = "grid-column: 1 / -1;" if meta.get("full_width") else ""
         text_style    = _merge_text_style(meta.get("text_style", {}))
 
 
@@ -485,8 +536,11 @@ def generate_html_report(
         page-break-inside: avoid !important;
         break-inside: avoid-column !important;
       }}
-      /* Full-width chart cards keep their expanded width. */
-      .chart-card[style*="grid-column"] {{
+      /* Full-width chart cards keep their expanded width. Exclude cards with
+         an explicit grid-column START (free-form tiles) -- those carry a real
+         column index and must keep it, or every tiled card would print as
+         full-bleed and stacked. */
+      .chart-card[style*="grid-column: 1 / -1"] {{
         width: 100% !important;
       }}
       .kpi-row {{

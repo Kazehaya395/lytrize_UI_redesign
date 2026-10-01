@@ -2,10 +2,11 @@
 
 import plotly.graph_objects as go
 
-from modules.charts import num_cols as _num_cols, chart_layout, COLORS
+from modules.charts import chart_layout, COLORS
+from services.column_roles import role_pools
 
 
-def run_descriptive(df, **kwargs):
+def run_descriptive(df, roles=None, **kwargs):
     """Return a descriptive statistics table for all numeric columns in *df*.
 
     Pure function: takes the DataFrame explicitly and returns a Plotly
@@ -13,7 +14,7 @@ def run_descriptive(df, **kwargs):
     other analysis runner and renders through the existing
     PlotlyView/ChartCard pipeline. No Streamlit, no session state.
     """
-    num = _num_cols(df)
+    num = role_pools(df, roles=roles)["num"]
     if not num:
         return []
 
@@ -26,8 +27,18 @@ def run_descriptive(df, **kwargs):
 
     desc.columns = [c.title() if c != "index" else "Column" for c in desc.columns]
 
-    num_desc_cols = desc.select_dtypes("number").columns
-    desc[num_desc_cols] = desc[num_desc_cols].round(4)
+    # Round the statistic columns, leaving the leading "Column" label alone.
+    # Named rather than discovered by dtype: every column of ``describe().T``
+    # except "Column" is a number by construction, and re-selecting by dtype
+    # here would be exactly the chart-specific detection this codebase
+    # forbids (see services/column_roles).
+    for _stat_col in desc.columns:
+        if _stat_col == "Column":
+            continue
+        try:
+            desc[_stat_col] = desc[_stat_col].round(4)
+        except Exception:
+            pass
 
     fig = go.Figure(data=[go.Table(
         header=dict(

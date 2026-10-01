@@ -30,6 +30,13 @@ class KpiCard(QFrame):
     move_down_requested = Signal(int)   # kpi index
     remove_requested = Signal(int)      # kpi index
 
+    # Drag-to-reorder, the same peer to the arrow buttons that chart cards
+    # have. Emits the index and the global cursor position; the owning page
+    # runs the drop, because it is the one that owns the KPI list.
+    drag_started = Signal(int, object)  # kpi index, QPoint (global pos)
+    drag_moved = Signal(int, object)    # kpi index, QPoint (global pos)
+    drag_ended = Signal(int)            # kpi index
+
     def __init__(self, label: str, value: str, delta: Optional[str] = None,
                  index: int = 0, parent=None) -> None:
         super().__init__(parent)
@@ -46,6 +53,16 @@ class KpiCard(QFrame):
         btn_style = {"kind": "icon"}
         header = QHBoxLayout()
         header.setSpacing(2)
+        # Drag grip. Deliberately a separate handle rather than "drag the whole
+        # card": the card's whole surface is its content, and a drag that starts
+        # anywhere on it would make the card feel like it might be picked up by
+        # accident.
+        self.grip = QLabel("\u2838")
+        self.grip.setFixedSize(14, 18)
+        self.grip.setCursor(Qt.OpenHandCursor)
+        self.grip.setToolTip("Drag to reorder")
+        self.grip.setAlignment(Qt.AlignCenter)
+        header.addWidget(self.grip)
         header.addStretch()
         self.btn_up = QPushButton("⬆")
         self.btn_up.setFixedSize(18, 18)
@@ -84,6 +101,31 @@ class KpiCard(QFrame):
 
         self.setMinimumWidth(140)
 
+        self.grip.mousePressEvent = self._on_grip_press
+        self.grip.mouseMoveEvent = self._on_grip_move
+        self.grip.mouseReleaseEvent = self._on_grip_release
+
+    # -- Drag to reorder ---------------------------------------------------
+
+    def _on_grip_press(self, event) -> None:
+        self.grip.setCursor(Qt.ClosedHandCursor)
+        self.drag_started.emit(self._index, event.globalPosition().toPoint())
+        self._dragging = True
+
+    def _on_grip_move(self, event) -> None:
+        if getattr(self, "_dragging", False):
+            self.drag_moved.emit(self._index, event.globalPosition().toPoint())
+
+    def _on_grip_release(self, _event) -> None:
+        self.grip.setCursor(Qt.OpenHandCursor)
+        if getattr(self, "_dragging", False):
+            self._dragging = False
+            self.drag_ended.emit(self._index)
+
+    def set_drag_position(self, x: int) -> None:
+        """Live visual feedback while a drag is in progress."""
+        self.move(x, self.y())
+
     def apply_style(self, style: dict) -> None:
         """Re-skin from a dashboard export-style dict, same pattern as
         ``ChartCard.apply_style`` -- in-place QSS update, no rebuild."""
@@ -98,3 +140,7 @@ class KpiCard(QFrame):
         self.lbl_value.setStyleSheet(
             f"font-size: {val_size}px; color: {text_color}; font-weight: 700;"
         )
+        # The grip sits on the card surface, so it has to be re-coloured with
+        # it -- left on the dark-theme default it is invisible in light mode.
+        self.lbl_label.setStyleSheet(f"color: {text_color};")
+        self.grip.setStyleSheet(f"color: {text_color};")

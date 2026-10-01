@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QPoint
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QTextEdit, QFrame, QSizePolicy, QDialog, QDialogButtonBox,
@@ -40,6 +40,14 @@ class ChartCard(QFrame):
                                          # a session save instead of only living on the
                                          # in-memory ChartCard instance
     fullwidth_toggled = Signal(str, bool)  # uid, is_full_width -- dashboard grid only
+
+    # -- Dashboard tiling ---------------------------------------------------
+    # Emitted with the GLOBAL cursor position when a drag/resize gesture
+    # starts on the card's grip or resize handle. The owning canvas tracks the
+    # rest of the gesture (it knows the grid geometry; the card does not) and
+    # moves the card itself, so the card never needs to know about columns.
+    drag_started = Signal(str, QPoint)     # uid, global_pos
+    resize_started = Signal(str, QPoint)   # uid, global_pos
 
     def __init__(self, uid: str, title: str, fig: Any, chart_type: str = "",
                  meta: Optional[dict] = None, parent=None) -> None:
@@ -154,9 +162,28 @@ class ChartCard(QFrame):
         hb = QHBoxLayout(bar)
         hb.setContentsMargins(0, 0, 0, 0)
         hb.setSpacing(4)
+        # Drag grip on the LEFT of the action bar. Placed as a sibling rather
+        # than by making the whole card draggable, because the card's whole
+        # surface is a live Plotly canvas: dragging the chart itself would
+        # fight panning/selecting, and a drag needs a deliberate grip.
+        self.grip = QLabel("\u2838")
+        self.grip.setFixedSize(20, 28)
+        self.grip.setCursor(Qt.OpenHandCursor)
+        self.grip.setToolTip("Drag to move \u00b7 drag the corner to resize")
+        self.grip.setAlignment(Qt.AlignCenter)
+        hb.addWidget(self.grip)
         self._reparent_buttons(bar, hb)
         layout.addWidget(self.plot_view, 0, 0)
         layout.addWidget(bar, 0, 0, Qt.AlignTop | Qt.AlignRight)
+
+        # -- Resize handle (bottom-right corner) --
+        self.resize_handle = QLabel("\u25e2")
+        self.resize_handle.setFixedSize(18, 18)
+        self.resize_handle.setCursor(Qt.SizeFDiagCursor)
+        self.resize_handle.setToolTip("Drag to resize")
+        self.resize_handle.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.resize_handle, 0, 0,
+                         Qt.AlignBottom | Qt.AlignRight)
         # Widgets sharing a grid cell are z-ordered by insertion; the bar is
         # added second so it is already in front, and raise_() makes that
         # explicit and survives later re-layouts of the plot.
@@ -174,6 +201,34 @@ class ChartCard(QFrame):
         # leave the notes unreadable after toggling to light mode.
         self.notes.textChanged.connect(self._on_notes_changed)
         layout.addWidget(self.notes, 1, 0)
+
+        self.grip.mousePressEvent = self._on_grip_pressed
+        self.grip.mouseReleaseEvent = self._on_grip_released
+        self.resize_handle.mousePressEvent = self._on_resize_pressed
+
+    def set_tiling_enabled(self, enabled: bool) -> None:
+        """Show or hide the drag grip and resize handle.
+
+        The Analysis page shows one chart at a time in a tab strip, so there is
+        nothing to tile there and the handles would just be decoration.
+        """
+        self.grip.setVisible(enabled)
+        self.resize_handle.setVisible(enabled)
+
+    # -- Tiling gestures ---------------------------------------------------
+    # These only REPORT that a gesture started (with the global cursor
+    # position). The canvas owns the gesture: it knows the grid geometry, and
+    # moving the card is its job, so the card stays a dumb tile.
+
+    def _on_grip_pressed(self, event) -> None:
+        self.grip.setCursor(Qt.ClosedHandCursor)
+        self.drag_started.emit(self.uid, event.globalPosition().toPoint())
+
+    def _on_grip_released(self, _event) -> None:
+        self.grip.setCursor(Qt.OpenHandCursor)
+
+    def _on_resize_pressed(self, event) -> None:
+        self.resize_started.emit(self.uid, event.globalPosition().toPoint())
 
     def _reparent_buttons(self, bar: QWidget, hb: QHBoxLayout) -> None:
         """Move the action buttons into the floating overlay bar.
@@ -223,26 +278,6 @@ class ChartCard(QFrame):
     def note_text(self) -> str:
         """Return the current notes text."""
         return self.notes.toPlainText()
-
-    def current_figure(self) -> Any:
-        """Return the figure currently shown on this card (styled)."""
-        return self._fig
-
-    def refresh_view(self) -> None:
-        """Re-push the current figure into the web view.
-
-        Called when the card's tab becomes visible again: a
-        ``QWebEngineView`` inside a hidden ``QTabWidget`` page does not
-        reliably run its pending page load while off-screen, so a chart
-        created while another tab was selected can stay blank until its
-        figure is replayed after the tab is shown. ``Plotly.react`` is
-        in-place, so replaying the already-computed figure is flicker-free.
-        """
-        try:
-            if self._fig is not None and hasattr(self, "plot_view"):
-                self.plot_view.set_figure(self._fig)
-        except Exception:
-            log.debug("ChartCard.refresh_view failed", exc_info=True)
 
     def current_figure(self) -> Any:
         """Return the figure currently shown on this card (styled)."""

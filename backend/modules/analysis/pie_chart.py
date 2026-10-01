@@ -1,10 +1,18 @@
-"""modules/analysis/pie_chart.py -- Pie / Donut chart runner."""
+"""modules/analysis/pie_chart.py -- Pie / Donut chart runner.
+
+The default dimension comes from the shared role pools
+(``services.column_roles``) rather than a local ``select_dtypes("object")``
+call, so ``category``/``string``/``bool`` columns and a column the user
+reclassified as a dimension are both offered. See ``correlation.py`` for the
+full rationale.
+"""
 
 
 import plotly.express as px
 import pandas as pd
-from modules.charts import chart_layout, COLORS, cat_cols as _cat_cols
+from modules.charts import chart_layout, COLORS
 from modules.analysis.apply_lytrize_standard import apply_lytrize_standard
+from services.column_roles import role_pools
 
 
 
@@ -41,10 +49,10 @@ def _apply_top_n(df_agg, name_col: str, val_col: str, top_n, group_others: bool 
 
 
 def run_pie_chart(df, x_cols=None, y_cols=None, agg="mean", sort_by=None,
-                  palette=None, top_n=None, **kwargs):
+                  palette=None, top_n=None, roles=None, **kwargs):
     """Generate donut charts for categorical dimensions."""
     charts    = []
-    dims      = x_cols or _cat_cols(df)[:2]
+    dims      = x_cols or role_pools(df, roles=roles)["dim"][:2]
     metrics   = y_cols
     agg_label = agg.title()
     pal       = palette or COLORS

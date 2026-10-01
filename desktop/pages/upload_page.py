@@ -35,6 +35,7 @@ from desktop.pages.dtype_transformer_panel import DtypeTransformerPanel
 from desktop.pages.excel_loader_panel import ExcelLoaderPanel
 from modules.utils.perf import read_csv_fast, mem_mb
 from services.transform_service import classify_columns
+from services.column_roles import resolve_roles, value_sig_map
 
 log = logging.getLogger(__name__)
 
@@ -470,50 +471,49 @@ class UploadPage(QWidget):
     def _effective_classification(self, df: pd.DataFrame) -> tuple:
         """Resolve the active column families for the current df.
 
-        Starts from the user-confirmed classification (bridge), but re-derives
-        any column whose value profile changed since that confirmation (Dtype
-        Transformer conversions like 'Convert to time' produce datetime.time
-        objects in an object-dtype column), so the stats label and the bridge
-        stay in sync with what Analysis will actually use. Unchanged columns
-        keep the user's explicit family.
+        Delegates to ``services.column_roles.resolve_roles`` -- the single
+        source of truth shared with the Analysis page, so the counts shown
+        here and the drop-downs offered there can never disagree. The
+        user's confirmed Column Classification wins; columns whose value
+        profile changed since (a Dtype Transformer conversion) are
+        re-derived; nothing is ever dropped.
         """
-        num = list(self.bridge.get("num_cols") or [])
-        cat = list(self.bridge.get("cat_cols") or [])
-        dt = list(self.bridge.get("dt_cols") or [])
-        fpsig = self.bridge.get("cls_value_sig") or {}
-        cur = {c: self._value_sig(df[c]) for c in df.columns}
-
-        if fpsig and cur == fpsig:
-            # Classification still current -- honor user intent verbatim.
-            return num, cat, dt
-
-        # Re-derive families ONLY for changed/new columns; unchanged columns
-        # keep the user's explicit choice.
-        changed = {c for c in df.columns if cur[c] != fpsig.get(c)}
-        if changed:
-            auto = classify_columns(df[list(changed)])
-        else:
-            auto = {"numeric": [], "categorical": [], "datetime": []}
-        num = [c for c in num if c in df.columns and c not in changed] + auto["numeric"]
-        cat = [c for c in cat if c in df.columns and c not in changed] + auto["categorical"]
-        dt = [c for c in dt if c in df.columns and c not in changed] + auto["datetime"]
+        roles = resolve_roles(
+            df,
+            explicit=self._confirmed_classification(),
+            value_sig_map=self.bridge.get("cls_value_sig") or None,
+        )
+        num, cat, dt = (roles["numeric"], roles["categorical"],
+                        roles["datetime"])
 
         # Persist so Analysis / other pages agree with what the label shows.
         self.bridge.set("num_cols", num)
         self.bridge.set("cat_cols", cat)
         self.bridge.set("dt_cols", dt)
-        self.bridge.set("cls_value_sig", cur)
+        self.bridge.set("cls_value_sig", value_sig_map(df))
         return num, cat, dt
+
+    def _confirmed_classification(self) -> Optional[dict]:
+        """The user's Column Classification in resolver shape, or None."""
+        num = self.bridge.get("num_cols")
+        cat = self.bridge.get("cat_cols")
+        dt = self.bridge.get("dt_cols")
+        if not (num or cat or dt):
+            return None
+        return {"numeric": list(num or []),
+                "categorical": list(cat or []),
+                "datetime": list(dt or [])}
 
     def _update_preview_label(self) -> None:
         """Update the stats label with column type counts.
 
         Counts mirror the app's pipeline truth via
-        ``_effective_classification``: the user-confirmed Column
-        Classification (bridge keys num_cols/cat_cols/dt_cols), self-healed
-        after dtype conversions -- NOT raw pandas dtypes, which disagree
-        with the pipeline (e.g. a column converted to 'date'/'time' keeps
-        pandas dtype ``object`` but is datetime-family for analysis).
+        ``_effective_classification`` -> ``services.column_roles``: the
+        user-confirmed Column Classification (bridge keys
+        num_cols/cat_cols/dt_cols), self-healed after dtype conversions --
+        NOT raw pandas dtypes, which disagree with the pipeline (e.g. a
+        column converted to 'date'/'time' keeps pandas dtype ``object``
+        but is datetime-family for analysis).
         """
         df = self.bridge.df
         if df is None:

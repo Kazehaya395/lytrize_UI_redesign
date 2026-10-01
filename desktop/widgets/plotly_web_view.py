@@ -46,6 +46,19 @@ log = logging.getLogger(__name__)
 # only stops a permanently 0-height widget from polling forever.
 _RELAYOUT_MAX_SECONDS = 30.0
 
+# Debounce for the legend refit. A splitter drag or a dashboard re-grid arrives
+# as dozens of resize events within a few frames; recomputing and re-pushing
+# the figure on each one is wasted work and makes the chart visibly stutter.
+# Long enough to coalesce a drag, short enough that the chart has settled
+# before the user looks at it.
+_REFIT_DEBOUNCE_MS = 180
+
+# A refit is only worth doing when the width moved enough to change the
+# answer. Below this the layout is recomputed to a fraction that differs in the
+# third decimal, which is invisible; the threshold is also large enough to
+# absorb the 1-2px jitter a real drag produces.
+_REFIT_MIN_DELTA_PX = 24
+
 
 def _get_plotlyjs_source() -> str:
     """Return the Plotly.js bundle as a string, matching the installed
@@ -250,9 +263,17 @@ class PlotlyWebView(QWidget):
         # True while a "wait until sizeable" relayout chain is in flight, so
         # overlapping callers (set_figure + showEvent) share one chain.
         self._relayout_pending = False
-        # True once the legend column has been re-sized against this view's
-        # real pixel width (charts arrive built on a worker with no width).
-        self._refit_applied = False
+        # Width the legend layout was last laid out against. Charts arrive
+        # built on a worker with no width, so the first real size has to
+        # trigger a refit -- but a resize storm then arrives as dozens of
+        # events in a few frames. The refit is debounced onto this timer and
+        # skipped entirely when the width has not meaningfully moved, so a
+        # dragged splitter reflows once rather than on every tick.
+        self._refit_width = 0
+        self._refit_timer = QTimer(self)
+        self._refit_timer.setSingleShot(True)
+        self._refit_timer.setInterval(_REFIT_DEBOUNCE_MS)
+        self._refit_timer.timeout.connect(self._do_debounced_refit)
 
         try:
             from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -360,19 +381,13 @@ class PlotlyWebView(QWidget):
         """
         if not self._use_web_engine or self._web_view is None:
             return
-        try:
-            # A card that was first shown at 0px (a hidden tab, a collapsed
-            # pane) is only now getting a real width, and the figure it holds
-            # was sized for a guess. Re-derive the legend column against the
-            # pixels we actually have before asking Plotly to re-fit, then push
-            # the corrected figure. Guarded by _refit_applied so this happens
-            # once per figure, not on every resize tick.
-            if not self._refit_applied and self._render_fig is not None:
-                if self._refit_legend_to_width(self._render_fig):
-                    import plotly.io as _pio
-                    self._bridge.figureReady.emit(_pio.to_json(self._render_fig))
-        except Exception as exc:  # pragma: no cover — JS runtime
-            log.debug("legend refit on relayout failed: %s", exc)
+        # A card that was first shown at 0px (a hidden tab, a collapsed
+        # pane) is only now getting a real width, and the figure it holds
+        # was sized for a guess. Re-derive the legend layout against the
+        # pixels we actually have before asking Plotly to re-fit, then push
+        # the corrected figure. Debounced, and skipped when the width has not
+        # meaningfully changed since the last refit.
+        self._schedule_legend_refit()
         try:
             self._web_view.page().runJavaScript(
                 "if(window.Plotly){Plotly.Plots.resize(document.getElementById('chart'))}"
@@ -557,12 +572,18 @@ class PlotlyWebView(QWidget):
             return
         self._current_fig = fig
         render_fig = self._themed(fig)
+        # A NEW figure has not been laid out for this width yet, so forget the
+        # width the previous one was refit against. Otherwise the delta guard
+        # would treat a freshly generated chart at the same card size as
+        # "already correct" and leave it on its worker-time guess.
+        self._refit_width = 0
         # The figure was built without knowing how wide this card ended up
         # (Generate runs on a worker thread), so re-size the reserved legend
-        # column against the live view before pushing. No-op when the view has
+        # layout against the live view before pushing. No-op when the view has
         # no width yet; the first sizeable pass re-runs this via relayout().
         if self._use_web_engine:
-            render_fig = self._refit_legend_to_width(render_fig)
+            if self._refit_legend_to_width(render_fig):
+                self._refit_width = int(self._web_view.width() or 0)
         self._render_fig = render_fig
 
         if self._use_web_engine:
@@ -589,28 +610,82 @@ class PlotlyWebView(QWidget):
                       exc_info=True)
             return fig
 
+    def _schedule_legend_refit(self) -> None:
+        """Ask for a legend refit on the next quiet moment, if one is warranted.
+
+        Called from every relayout, so it is on the hot path of a resize and has
+        to be cheap. Two guards keep the real work rare:
+
+          * a width that has not moved since the last refit is a no-op, and
+          * a pending timer is merely restarted, so a whole drag collapses to
+            one refit at the end rather than one per event.
+        """
+        if not self._use_web_engine or self._web_view is None:
+            return
+        if self._render_fig is None or self._bridge is None:
+            return
+        w = int(self._web_view.width() or 0)
+        if w <= 0:
+            # A hidden tab or collapsed pane has no real width yet; the
+            # self-re-arming _relayout_when_sized() poll will call back once
+            # the widget is genuinely sizeable.
+            return
+        if (self._refit_width and abs(w - self._refit_width) < _REFIT_MIN_DELTA_PX):
+            return
+        self._refit_timer.start()
+
+    def _do_debounced_refit(self) -> None:
+        """Re-lay the legend out for the settled width and push the figure.
+
+        Only fires after the resize storm has paused, so the expensive part
+        (deep-copying, re-measuring, re-serialising) happens once. The width
+        is recorded afterwards so an unchanged size is never recomputed.
+        """
+        if not self._use_web_engine or self._web_view is None:
+            return
+        fig = self._render_fig
+        if fig is None:
+            return
+        w = int(self._web_view.width() or 0)
+        if w <= 0:
+            return
+        if (self._refit_width and abs(w - self._refit_width) < _REFIT_MIN_DELTA_PX):
+            return
+        try:
+            if not self._refit_legend_to_width(fig):
+                self._refit_width = w
+                return
+            self._refit_width = w
+            import plotly.io as _pio
+            self._bridge.figureReady.emit(_pio.to_json(fig))
+        except Exception as exc:  # pragma: no cover — JS/serialisation
+            log.debug("debounced legend refit failed: %s", exc)
+
     def _refit_legend_to_width(self, fig):
-        """Re-derive the reserved legend column against the REAL view width.
+        """Re-derive the reserved legend layout against the REAL view width.
 
         Figures are generated on a worker thread, which has no view and
-        therefore no width, so the legend column falls back to a flat fraction
-        of an assumed card. On a full-width chart that reserved a few hundred
-        px for a legend box that needs ~76px -- the "big gap between chart and
-        legend" report.
+        therefore no width, so the legend layout falls back to an assumed card
+        width. On a full-width chart that reserved a few hundred px for a legend
+        box that needs ~76px -- the "big gap between chart and legend" report --
+        and on a narrow dashboard tile it could not fit a column at all.
 
-        The figure is built once, but this view knows its own width by the time
-        it paints, so the domain is recomputed here against those pixels.
-        Charts with no reserved legend column are left untouched.
+        This view knows its own width by the time it paints, so the layout is
+        recomputed here against those pixels. It is safe to call repeatedly:
+        ``refit_legend_width`` restores the baseline first and converges, so a
+        second call at the same width is a no-op rather than a compounding strip.
+
+        Returns True when the figure's layout actually changed, so the caller
+        knows whether it needs to re-push it to the browser.
         """
         if fig is None or not self._use_web_engine or self._web_view is None:
-            return fig
+            return False
         try:
             from chart_display import refit_legend_width
-            if refit_legend_width(fig, self._web_view.width()):
-                self._refit_applied = True
+            return bool(refit_legend_width(fig, self._web_view.width()))
         except Exception:
             log.debug("legend width refit skipped", exc_info=True)
-        return fig
+            return False
 
     def apply_theme(self) -> None:
         """Re-colour and repaint the current figure after a dark<->light switch.
@@ -644,6 +719,8 @@ class PlotlyWebView(QWidget):
         self._current_fig = None
         self._render_fig = None
         self._pending_fig_json = None
+        self._refit_width = 0
+        self._refit_timer.stop()
         if self._use_web_engine and self._web_view is not None:
             self._push_figure('{"data": [], "layout": {}}')
         elif self._fallback_label is not None:

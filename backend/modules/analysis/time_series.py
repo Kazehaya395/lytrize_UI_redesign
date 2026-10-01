@@ -8,6 +8,7 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 from modules.charts import chart_layout, COLORS
 from modules.analysis.apply_lytrize_standard import apply_lytrize_standard
+from services.column_roles import role_pools
 
 
 
@@ -24,7 +25,8 @@ _WEEKDAY = {d: i for i, d in enumerate(
 
 
 def run_time_series(df, x_cols=None, y_cols=None, agg="mean", date_part=None,
-                    palette=None, dual_y_col=None, dual_y_agg=None, **_):
+                    palette=None, dual_y_col=None, dual_y_agg=None,
+                    roles=None, **_):
     """Generate time-series line charts for selected numeric metrics."""
     charts       = []
     df           = df.copy()
@@ -33,10 +35,19 @@ def run_time_series(df, x_cols=None, y_cols=None, agg="mean", date_part=None,
     pal          = palette or COLORS
     dual_agg     = dual_y_agg or agg
     dual_agg_lbl = dual_agg.title()
+    _tried       = set()
 
 
     if not dt_col:
-        for c in df.columns:
+        # Try the shared datetime pool FIRST (services/column_roles), so the
+        # chart uses the same date column the form offered. Only if that pool
+        # is empty or unusable do we fall back to probing every column --
+        # which is a "can this be parsed as a date?" test, not a role
+        # derivation, and must never override the resolved roles.
+        for c in role_pools(df, roles=roles)["dt"] + list(df.columns):
+            if c in _tried:
+                continue
+            _tried.add(c)
             try:
                 df[c] = pd.to_datetime(df[c])
                 dt_col = c

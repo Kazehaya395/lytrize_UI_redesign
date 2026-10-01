@@ -15,6 +15,7 @@ import plotly.graph_objects as go
 
 
 from modules.charts import chart_layout, COLORS
+from services.column_roles import role_pools
 
 
 
@@ -30,10 +31,18 @@ def _df_fingerprint(df: pd.DataFrame) -> str:
 
 
 
-def _compute_outliers(df: pd.DataFrame, cols: list, multiplier: float) -> dict:
-    """Run IQR outlier detection on the given columns."""
+def _compute_outliers(df: pd.DataFrame, cols: list, multiplier: float,
+                      num_available=None) -> dict:
+    """Run IQR outlier detection on the given columns.
+
+    ``num_available`` is the set of columns arithmetic is safe on. It comes
+    from the caller's role pools (see ``run_outlier``) so the same metric
+    family the user sees drives detection; when omitted it is derived from
+    the frame for the benefit of direct callers of this helper.
+    """
     results = {}
-    num_available = set(df.select_dtypes(include="number").columns)
+    if num_available is None:
+        num_available = set(role_pools(df)["num"])
 
 
     for col in cols:
@@ -170,14 +179,18 @@ def remove_outlier_rows(df: pd.DataFrame, indices: list) -> pd.DataFrame:
     return df.drop(index=list(indices)).reset_index(drop=True)
 
 
-def run_outlier(df, x_cols=None, y_cols=None, palette=None, **kwargs):
+def run_outlier(df, x_cols=None, y_cols=None, palette=None, roles=None,
+                **kwargs):
     """IQR outlier scatter plots -- legacy runner."""
-    from modules.charts import num_cols as _num_cols
+    from modules.charts import COLORS
 
 
     charts = []
-    num    = x_cols or _num_cols(df)[:6]
-    pal    = palette or COLORS
+    # Shared role pools: a column the user reclassified as a dimension is no
+    # longer a candidate here, matching every other chart type.
+    num_pool    = role_pools(df, roles=roles)["num"]
+    num         = x_cols or num_pool[:6]
+    pal         = palette or COLORS
 
 
     for col in num:

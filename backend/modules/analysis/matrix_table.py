@@ -3,8 +3,9 @@ import logging
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from modules.charts import chart_layout, COLORS, num_cols as _num_cols, cat_cols as _cat_cols
+from modules.charts import chart_layout, COLORS
 from modules.utils.perf import cached_pivot
+from services.column_roles import numeric_subset, role_pools
 
 
 _DIVERGING_AGGS   = {"mean", "median", "std"}
@@ -79,15 +80,28 @@ def _cell_bg_gradient(val, vmin, vmax, base_dark="#0f172a", accent="#2563eb") ->
 
 
 
-def _build_pivot(df, index_col, columns_col, values_col, agg, sort_rows, top_n_rows):
-    """Shared pivot-building logic for both heatmap and table views."""
-    cats = _cat_cols(df)
-    num = _num_cols(df)
+def _build_pivot(df, index_col, columns_col, values_col, agg, sort_rows,
+                 top_n_rows, roles=None):
+    """Shared pivot-building logic for both heatmap and table views.
+
+    The index/columns defaults are dimensions and the value default is a
+    metric, both taken from the shared role pools (``services.column_roles``)
+    rather than from local ``select_dtypes`` calls, so a pivot obeys the
+    user's Column Classification just like every other chart. See
+    ``correlation.py`` for the full rationale.
+    """
+    pools = role_pools(df, roles=roles)
+    cats = pools["dim"]
+    num = pools["num"]
 
     idx = index_col or (cats[0] if cats else df.columns[0])
     cols = columns_col or (cats[1] if len(cats) > 1 else df.columns[1])
-    num_fallback = list(df.select_dtypes("number").columns)
-    vals = values_col or (num[0] if num else (num_fallback[0] if num_fallback else None))
+    # Fall back to the first genuinely-numeric column when the metric pool is
+    # empty (no metric classified at all). This is a last-resort safety net
+    # for a pivot, not a second pool: `numeric_subset` asks only "will the
+    # aggregation work", never "is this a metric".
+    vals = values_col or (num[0] if num else next(
+        iter(numeric_subset(df, list(df.columns))), None))
 
     if not vals or idx not in df.columns or cols not in df.columns or vals not in df.columns:
         return None, None, None, None, None
@@ -107,10 +121,11 @@ def _build_pivot(df, index_col, columns_col, values_col, agg, sort_rows, top_n_r
 
 
 def run_matrix_heatmap(df, index_col=None, columns_col=None, values_col=None,
-                       agg="mean", palette=None,
+                       agg="mean", palette=None, roles=None,
                        sort_rows="value_desc", top_n_rows=None, **kwargs):
     """Generate a matrix heatmap chart (always heatmap view)."""
-    result = _build_pivot(df, index_col, columns_col, values_col, agg, sort_rows, top_n_rows)
+    result = _build_pivot(df, index_col, columns_col, values_col, agg, sort_rows,
+                          top_n_rows, roles=roles)
     idx, cols, vals, pivot, agg = result
     if pivot is None:
         return []
@@ -222,10 +237,11 @@ def run_matrix_heatmap(df, index_col=None, columns_col=None, values_col=None,
 
 
 def run_matrix_table(df, index_col=None, columns_col=None, values_col=None,
-                     agg="mean", palette=None,
+                     agg="mean", palette=None, roles=None,
                      sort_rows="value_desc", top_n_rows=None, **kwargs):
     """Generate a pivot table chart (always table view)."""
-    result = _build_pivot(df, index_col, columns_col, values_col, agg, sort_rows, top_n_rows)
+    result = _build_pivot(df, index_col, columns_col, values_col, agg, sort_rows,
+                          top_n_rows, roles=roles)
     idx, cols, vals, pivot, agg = result
     if pivot is None:
         return []
@@ -344,6 +360,15 @@ def run_matrix_table(df, index_col=None, columns_col=None, values_col=None,
     data_cols_fmt   = [[_fmt(row[j]) for row in z_values] for j in range(n_cols_p)]
     _data_cells = [index_vals_disp] + data_cols_fmt + [value_col_fmt]
 
+    # Keep the RAW numbers beside the pre-formatted labels. The "Num format"
+    # Layout control is applied after the figure is built, and a formatted
+    # string cannot be re-formatted to a different precision -- so the runner
+    # stashes what it needs and ``chart_display`` re-renders the labels from
+    # these when the user picks a different format. Without this the control
+    # had nothing to act on and every table kept its 2-decimal labels.
+    _raw_number_cols = ([[row[j] for row in z_values] for j in range(n_cols_p)]
+                        + [_val_series.tolist()])
+
     value_header_label = _VALUE_HEADER_MAP.get(agg, f"{agg.upper()}({vals})")
     col_headers = ([f"<b>{idx}</b>"] + [f"<b>{h}</b>" for h in x_labels]
                    + [f"<b>{value_header_label}</b>"])
@@ -381,5 +406,8 @@ def run_matrix_table(df, index_col=None, columns_col=None, values_col=None,
         "x_axis": cols, "y_axis": idx, "legend": None,
         "supports_axis_editing": True,
         "matrix_view": "table",
+        # Consumed once by chart_display's table pass; see above.
+        "table_index_labels": list(y_labels),
+        "table_raw_number_cols": _raw_number_cols,
     }
     return [(f"Matrix Table: {idx} × {cols}", fig)]

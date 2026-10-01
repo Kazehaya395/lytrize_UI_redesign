@@ -44,24 +44,21 @@ __all__ = [
     "num_cols",
     "cat_cols",
     "dt_cols",
+    "dim_cols",
 ]
 
 
 # -- Column-type helpers (pure, no session state) -----------------------
+#
+# Re-exported from analysis_service, which in turn delegates to
+# services.column_roles -- the single source of truth for what counts as a
+# metric vs a dimension. These used to be independent select_dtypes calls,
+# which is how the two services drifted apart and how category/string/bool
+# columns ended up in no pool at all.
 
-def num_cols(df: pd.DataFrame) -> list:
-    """Return the list of numeric column names in *df*."""
-    return df.select_dtypes(include="number").columns.tolist()
-
-
-def cat_cols(df: pd.DataFrame) -> list:
-    """Return the list of categorical (object) column names in *df*."""
-    return df.select_dtypes(include="object").columns.tolist()
-
-
-def dt_cols(df: pd.DataFrame) -> list:
-    """Return the list of datetime column names in *df*."""
-    return df.select_dtypes(include="datetime").columns.tolist()
+from services.analysis_service import (  # noqa: E402  (kept next to re-exports)
+    num_cols, cat_cols, dt_cols, dim_cols,
+)
 
 
 # -- Chart serialisation (no session state) -----------------------------

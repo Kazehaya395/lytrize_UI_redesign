@@ -56,13 +56,19 @@ class ChartGenerationWorker(QThread):
 
     def __init__(self, aid: str, df: pd.DataFrame, widget_values: dict,
                  parent=None, *, layout_opts: Optional[dict] = None,
-                 typography_opts: Optional[dict] = None) -> None:
+                 typography_opts: Optional[dict] = None,
+                 roles: Optional[dict] = None) -> None:
         super().__init__(parent)
         self._aid = aid
         self._df = df
         self._widget_values = widget_values
         self._layout_opts = dict(layout_opts) if layout_opts else None
         self._typo_opts = dict(typography_opts) if typography_opts else None
+        # Resolved column families from the page. Passing them keeps the
+        # service-side defaults (e.g. "first four metrics") consistent with
+        # the drop-downs the user actually saw, so the user's Column
+        # Classification governs generation as well as the form.
+        self._roles = roles
 
     def run(self) -> None:
         try:
@@ -70,7 +76,9 @@ class ChartGenerationWorker(QThread):
             from services.chart_service import apply_hover_format
             from chart_display import apply_display_options
 
-            results = run_analysis_with_config(self._aid, self._df, self._widget_values)
+            results = run_analysis_with_config(self._aid, self._df,
+                                                self._widget_values,
+                                                roles=self._roles)
             apply_display = (self._layout_opts is not None
                              or self._typo_opts is not None)
             out = []
@@ -96,7 +104,7 @@ class ExportWorker(QThread):
     def __init__(self, charts, session_name: str, state: dict,
                  orientation: str = "portrait", kpis=None,
                  dashboard_title: str = "", grid_cols_n: int = 2,
-                 parent=None) -> None:
+                 tile_geometry: dict = None, parent=None) -> None:
         super().__init__(parent)
         self._charts = charts
         self._session_name = session_name
@@ -105,6 +113,9 @@ class ExportWorker(QThread):
         self._kpis = kpis
         self._dashboard_title = dashboard_title
         self._grid_cols_n = grid_cols_n
+        # Snapshot the arrangement now: the worker runs on its own thread, so
+        # reading it lazily later would race with further user drags.
+        self._tile_geometry = dict(tile_geometry or {})
 
     def run(self) -> None:
         try:
@@ -117,6 +128,7 @@ class ExportWorker(QThread):
                 kpis=self._kpis,
                 dashboard_title=self._dashboard_title,
                 grid_cols_n=self._grid_cols_n,
+                tile_geometry=self._tile_geometry,
             )
             self.finished_ok.emit(html, safe_file)
         except Exception as exc:

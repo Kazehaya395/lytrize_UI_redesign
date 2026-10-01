@@ -1,17 +1,24 @@
-"""modules/analysis/statistical.py -- Statistical aggregation chart runner."""
+"""modules/analysis/statistical.py -- Statistical aggregation chart runner.
+
+Metrics come from the shared role pools (``services.column_roles``) via the
+``roles`` kwarg, so this chart offers exactly the metrics the whole app
+offers. See ``correlation.py`` for the full rationale.
+"""
 
 
 import pandas as pd
 import plotly.express as px
-from modules.charts import chart_layout, COLORS, num_cols as _num_cols
+from modules.charts import chart_layout, COLORS
 from modules.analysis.apply_lytrize_standard import apply_lytrize_standard
+from services.column_roles import role_pools
 
 
 
-def run_statistical(df, x_cols=None, y_cols=None, palette=None, **kwargs):
+def run_statistical(df, x_cols=None, y_cols=None, palette=None, roles=None,
+                    **kwargs):
     """Generate statistical aggregation bar charts with Mean, Min, Max, Std always shown."""
     charts = []
-    num = y_cols or _num_cols(df)
+    num = y_cols or role_pools(df, roles=roles)["num"]
     grp = x_cols[0] if x_cols else None
     pal = palette or COLORS
 

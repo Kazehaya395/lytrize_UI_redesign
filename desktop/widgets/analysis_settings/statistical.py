@@ -2,8 +2,13 @@
 from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLineEdit, QCheckBox, QPushButton, QLabel, QSizePolicy
-from .base import (AnalysisSettingsBase, section_label, hint_label, cap_widget, multi_select_combo, slider_with_readout, color_swatch, live_preview_label, apply_preview_font, COMPACT_W, PAGE_MARGINS, PAGE_SPACING, ROW_SPACING, HINT_GAP, SECTION_GAP, page_root, section_box, grid_row)
-NONE_SENTINEL = 'None'
+from .base import (AnalysisSettingsBase, section_label, hint_label, cap_widget, multi_select_combo, slider_with_readout, color_swatch, live_preview_label, apply_preview_font, COMPACT_W, GEN_W, PAGE_MARGINS, PAGE_SPACING, ROW_SPACING, HINT_GAP, SECTION_GAP, page_root, section_box, grid_row, FlowGrid)
+NONE_SENTINEL = ''
+# The "no grouping" entry renders as a blank field, not the literal word
+# "None". "None" read like an actual selectable value sitting in the combo,
+# and the backend already treats both '' and 'None' as "no grouping"
+# (see analysis_service._single_choice_value), so a blank is unambiguous.
+# The hint under the field carries the meaning instead.
 # Only offer font families that are actually installed. Offering 33 names when
 # the machine has 5 of them is what made the picker look broken: every missing
 # family silently fell back to the same default, so most choices changed
@@ -195,12 +200,12 @@ class StatisticalSettings(AnalysisSettingsBase):
         self._build()
         root, rl = page_root()
         rl.addWidget(hint_label('Adjust options below. All selections are live \u2014 no submit needed until Generate.'))
-        cols = QWidget()
-        cl = QHBoxLayout(cols)
-        cl.setContentsMargins(0, 0, 0, 0)
-        cl.setSpacing(SECTION_GAP)
-        # Compact Generate fields: fixed ~210px widths per annotated design.
-        GEN_W = 210
+        # Sections flow across the pane (see FlowGrid): as many per line as
+        # fit, each line stretched to the pane's full width, the remainder on
+        # the next line at the left. A fixed three-per-row grid instead left
+        # the right-hand side of the tab empty and made the page taller than
+        # the pane it sits in.
+        flow = FlowGrid()
         gbody = QWidget()
         gl = QVBoxLayout(gbody)
         gl.setContentsMargins(0, 0, 0, 0)
@@ -217,7 +222,7 @@ class StatisticalSettings(AnalysisSettingsBase):
         self._combo_groupby.currentTextChanged.connect(self._on_groupby)
         gl.addWidget(self._combo_groupby)
         gl.addStretch()
-        cl.addWidget(section_box('Group by (optional)', gbody, 'None = summarise the whole dataset'))
+        flow.add_section(section_box('Group by (optional)', gbody, 'Leave blank to summarise the whole dataset'))
         mbody = QWidget()
         ml = QVBoxLayout(mbody)
         ml.setContentsMargins(0, 0, 0, 0)
@@ -234,7 +239,7 @@ class StatisticalSettings(AnalysisSettingsBase):
             pass
         ml.addWidget(self._combo_metrics)
         ml.addStretch()
-        cl.addWidget(section_box('Metrics', mbody, 'Dropdown with checkboxes; click to expand'))
+        flow.add_section(section_box('Metrics', mbody, 'One or more numeric columns'))
         pbody = QWidget()
         pl = QVBoxLayout(pbody)
         pl.setContentsMargins(0, 0, 0, 0)
@@ -250,9 +255,8 @@ class StatisticalSettings(AnalysisSettingsBase):
         self._combo_palette.currentTextChanged.connect(self._on_palette)
         pl.addWidget(self._combo_palette)
         pl.addStretch()
-        cl.addWidget(section_box('\U0001f3a8 Palette', pbody))
-        cl.addStretch()
-        rl.addWidget(cols)
+        flow.add_section(section_box('\U0001f3a8 Palette', pbody))
+        rl.addWidget(flow)
         rl.addStretch()
         return root
     @staticmethod
@@ -273,8 +277,14 @@ class StatisticalSettings(AnalysisSettingsBase):
         The Layout/Typography tabs lay several of these side by side (as in
         chart_designs.pdf) so every control stays visible inside the short
         top pane of the analysis splitter instead of clipping/scrolling.
+
+        The ``option_column`` property is how a builder that inherits this page
+        finds the column again in order to append its own type-specific rows to
+        it (see ``AnalysisSettingsBase._add_option_row``).
         """
         col = QWidget()
+        col.setProperty('option_column', True)
+        col.setProperty('option_column', True)
         lay = QVBoxLayout(col)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(HINT_GAP)

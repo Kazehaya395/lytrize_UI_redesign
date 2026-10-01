@@ -3,6 +3,7 @@ from __future__ import annotations
 
 
 import re
+import logging
 import unicodedata
 from functools import lru_cache
 from typing import Optional
@@ -15,6 +16,9 @@ import plotly.express as px
 
 from modules.charts import chart_layout, COLORS
 from modules.utils.perf import sample_for_plot
+from services.column_roles import is_numeric_column, role_pools
+
+log = logging.getLogger(__name__)
 
 
 _MAP_SAMPLE = 5_000
@@ -483,10 +487,14 @@ def get_unresolved_values(series: pd.Series, col_name: str = "") -> list[str]:
 
 
 
-def detect_geo_column(df: pd.DataFrame) -> Optional[str]:
+def detect_geo_column(df: pd.DataFrame, roles=None) -> Optional[str]:
     """Heuristically find a likely geographic name column (string dtype, ≥ 10"""
     country_map = _build_country_map()
-    for col in df.select_dtypes("object").columns:
+    # The candidate list is the shared categorical pool, not a local
+    # `select_dtypes("object")`: the old call could not see `category` /
+    # `string` columns, and it ignored a user who had classified a country
+    # column some other way. See correlation.py for the full rationale.
+    for col in role_pools(df, roles=roles)["cat"]:
         unique_vals = df[col].dropna().unique()
         if len(unique_vals) < 2:
             continue
@@ -553,6 +561,7 @@ def run_map_plot(
     choropleth_projection: str = "natural earth",
     choropleth_scope: str = "world",
     choropleth_show_borders: bool = True,
+    roles=None,
     **kwargs,
 ):
     """Unified map runner."""
@@ -572,7 +581,9 @@ def run_map_plot(
         )
 
 
-    num_cols = [c for c in df.select_dtypes("number").columns]
+    # Lat/lon are coordinates, so the candidate pool is the shared metric
+    # family (the user may have reclassified a numeric column away from it).
+    num_cols = role_pools(df, roles=roles)["num"]
     lat = lat_col or next((c for c in df.columns if "lat" in c.lower()), None)
     lon = lon_col or next(
         (c for c in df.columns
@@ -584,8 +595,8 @@ def run_map_plot(
 
     if (not lat or not lon or
             lat not in df.columns or lon not in df.columns or
-            lat not in df.select_dtypes("number").columns):
-        detected_geo = geo_col or detect_geo_column(df)
+            not is_numeric_column(df, lat)):
+        detected_geo = geo_col or detect_geo_column(df, roles=roles)
         if detected_geo and detected_geo in df.columns:
             return _run_choropleth(
                 df, geo_col=detected_geo, value_col=value_col,
@@ -784,6 +795,15 @@ def _run_scatter_map(
     )
 
 
+    # A scattermap marker carries no ``line`` (only opacity/size/color/symbol)
+    # and ``layout.map`` -- the basemap subplot px.scatter_map draws on --
+    # exposes no showcountries/showland either, so unlike the choropleth and
+    # scatter-geo paths there is genuinely NOTHING on this trace for a "Borders"
+    # box to switch. The old Streamlit app only ever forwarded ``show_borders``
+    # to the choropleth branch too; this mode simply has no such control, and
+    # pretending otherwise would mean silently dropping the user's choice.
+
+
     if sampled:
         fig.add_annotation(
             text=f"⚠ {n_pts:,}-point sample — zoom in for detail",
@@ -871,15 +891,19 @@ def _run_choropleth(
 
 
     if geo_type == "unknown":
-        import streamlit as _st
-        _sample = ', '.join(str(v) for v in plot_df[geo_col].dropna().unique()[:6])
-        _st.warning(
-            f"⚠️ **Map cannot render** — '{geo_col}' values could not be matched to "
-            "countries, US states, world regions, or known cities.  \n"
-            f"**Sample values:** {_sample}  \n"
-            "Try using the **Geo Location Standardise** tool on the Upload page first, "
-            "or make sure values are standard country names, ISO-2/3 codes, US state names, "
-            "Indian/Canadian/Australian state names, or major city names."
+        # This app has no Streamlit (it is a Qt desktop build), so calling
+        # st.warning() here raised ModuleNotFoundError and aborted the ENTIRE
+        # analysis run, not just the map. Report it the way this app reports a
+        # problem -- a returned empty list, which the caller already turns into
+        # a visible "no charts" state -- and keep the actionable text in the log.
+        log.warning(
+            "Map cannot render: '%s' values could not be matched to countries, "
+            "US states, world regions, or known cities. Sample values: %s. Use "
+            "the Geo Location Standardise tool on the Upload page first, or use "
+            "standard country names, ISO-2/3 codes, US state names, "
+            "Indian/Canadian/Australian state names, or major city names.",
+            geo_col,
+            ', '.join(str(v) for v in plot_df[geo_col].dropna().unique()[:6]),
         )
         return []
 

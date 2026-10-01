@@ -28,8 +28,9 @@ from desktop.widgets.chart_card import ChartCard
 from desktop.workers import ChartGenerationWorker
 from services.analysis_service import (
     ANALYSIS_OPTIONS, WIDGET_SPEC, run_analysis_with_config, run_analysis,
-    num_cols, cat_cols, dt_cols,
+    num_cols, cat_cols, dt_cols, dim_cols,
 )
+from services.column_roles import resolve_roles
 from services.chart_service import PALETTES, apply_hover_format
 
 log = logging.getLogger(__name__)
@@ -334,8 +335,29 @@ class AnalysisPage(QWidget):
             aid = current.data(Qt.UserRole)
             self._build_config_panel(aid, prefill=self._pending_prefill)
             self._pending_prefill = None
+            # The chart tab strip is scoped to the selected analysis type, so
+            # it has to be rebuilt on every type change -- otherwise the tabs
+            # keep showing the previous type's charts.
+            self._refresh_charts()
 
     # -- Config panel construction -----------------------------------------
+
+    def _user_classification(self) -> Optional[dict]:
+        """The user's confirmed Column Classification, in resolver shape.
+
+        Returns ``None`` when the user never confirmed one, which tells
+        ``column_roles.resolve_roles`` to auto-detect every column. Any
+        column named here keeps the user's family regardless of its dtype.
+        """
+        b = self.bridge
+        num = b.get("num_cols")
+        cat = b.get("cat_cols")
+        dt = b.get("dt_cols")
+        if not (num or cat or dt):
+            return None
+        return {"numeric": list(num or []),
+                "categorical": list(cat or []),
+                "datetime": list(dt or [])}
 
     def _build_config_panel(self, aid: str, prefill: Optional[dict] = None,
                             target_uid: Optional[str] = None,
@@ -367,9 +389,24 @@ class AnalysisPage(QWidget):
         self._config_widgets = {}
 
         # Refresh column pools for the settings builder context.
-        self._num = num_cols(df)
-        self._cat = cat_cols(df)
-        self._dt = dt_cols(df)
+        #
+        # These MUST come from the user's Column Classification (confirmed on
+        # the Upload page), not from raw pandas dtypes: a user who
+        # deliberately reclassified an id-like numeric as a dimension has to
+        # see it in "Group by" everywhere, or the app silently ignores them.
+        # ``column_roles`` owns the precedence rules (user wins, auto-detect
+        # is the fallback, no column is ever dropped) so every chart type
+        # behaves identically without each one re-deriving anything.
+        roles = resolve_roles(
+            df,
+            explicit=self._user_classification(),
+            value_sig_map=self.bridge.get("cls_value_sig") or None,
+        )
+        self._roles = roles
+        self._num = num_cols(df, roles=roles)
+        self._cat = cat_cols(df, roles=roles)
+        self._dt = dt_cols(df, roles=roles)
+        self._dims = dim_cols(df, roles=roles)
         self._all_cols = df.columns.tolist()
 
         opt = next((o for o in ANALYSIS_OPTIONS if o["id"] == aid), None)
@@ -383,7 +420,12 @@ class AnalysisPage(QWidget):
         self.config_panel.set_context(
             num_cols=self._num, cat_cols=self._cat, dt_cols=self._dt,
             palette_names=list(PALETTES.keys()), all_cols=self._all_cols,
-            group_cols=self._all_cols,
+            # "Group by" offers every dimension (text AND datetime), because a
+            # date is a legitimate grouping key. Passing all_cols here -- as
+            # this used to -- instead advertised raw metrics as grouping
+            # choices, while the *default* pool (cat_cols alone) hid the
+            # category/string/bool columns entirely.
+            dim_cols=self._dims,
         )
         self.config_panel.set_active(aid, name, editing=(target_uid is not None))
 
@@ -703,6 +745,7 @@ class AnalysisPage(QWidget):
             self._active_analysis, df, self._collect_at_generate, self,
             layout_opts=self._collect_layout,
             typography_opts=self._collect_typo,
+            roles=self._roles,
         )
         self._gen_worker.finished_ok.connect(self._on_generate_finished)
         self._gen_worker.failed.connect(self._on_generate_failed)
@@ -836,8 +879,25 @@ class AnalysisPage(QWidget):
         if prev_uid is None and 0 <= cur_idx < len(self._tab_order):
             prev_uid = self._tab_order[cur_idx]
 
-        charts = self.bridge.get("charts", [])
-        wanted = [c[0] for c in charts]
+        all_charts = self.bridge.get("charts", [])
+        # Stale-card removal is keyed off EVERY chart in the bridge, never the
+        # filtered view: cards for other analysis types are merely not shown,
+        # and deleting them here would destroy (and on return reload) their
+        # QWebEngineView.
+        wanted = [c[0] for c in all_charts]
+
+        # The tab strip shows the SELECTED analysis type only. A flat strip
+        # mixed every type together, so with Statistical selected you could
+        # still see (and land on) a Distribution chart, and the numbered tab
+        # labels had to carry the type name to disambiguate. Cards of the
+        # other types stay alive in _chart_cards and are re-attached when the
+        # user switches back, so nothing is regenerated.
+        aid = self._active_analysis
+        if aid and aid != "descriptive":
+            charts = [c for c in all_charts
+                      if self.bridge.get(f"chart_type_{c[0]}", "") == aid]
+        else:
+            charts = list(all_charts)
 
         # Drop the cards whose chart is gone -- and ONLY those.  A ChartCard
         # owns a QWebEngineView, and destroying/recreating one reloads the
@@ -854,6 +914,20 @@ class AnalysisPage(QWidget):
             if stale_idx >= 0:
                 self.charts_tabs.removeTab(stale_idx)
             stale.deleteLater()
+
+        # Detach the cards of the other analysis types from the tab strip.
+        # removeTab only unparents -- the card and its loaded QWebEngineView
+        # stay alive in _chart_cards, so switching back re-attaches the very
+        # same widget (no plotly.js reload, no re-generation, no flash).
+        # This must run for every non-visible card, otherwise a type switch
+        # would APPEND the new type's charts and leave the old ones in place.
+        visible_uids = {c[0] for c in charts}
+        for uid, card in list(self._chart_cards.items()):
+            if uid in visible_uids or card is None:
+                continue
+            idx = self.charts_tabs.indexOf(card)
+            if idx >= 0:
+                self.charts_tabs.removeTab(idx)
 
         self._tab_order = []
         type_counter: dict = {}
@@ -874,18 +948,11 @@ class AnalysisPage(QWidget):
                 for _btn in (card.btn_up, card.btn_down, card.btn_style):
                     _btn.setVisible(False)
                 card.note_changed.connect(self._on_note_changed)
-
-                # Compact per-chart tab: keep short stable labels (see
-                # _chart_tab_label) so N charts of one analysis can't widen
-                # the strip into the chart area.
-                label = self._chart_tab_label(title, chart_type, type_counter)
-                self.charts_tabs.addTab(card, label)
                 self._chart_cards[uid] = card
             else:
                 # Existing tile: refresh it in place.  The tab keeps the
                 # label/number it was created with (stable under the user's
                 # cursor), so the counter is advanced without renaming it.
-                self._chart_tab_label(title, chart_type, type_counter)
                 card.set_title(title)
                 card.set_note(note)
                 # Only re-push when the bridge actually holds a different
@@ -894,6 +961,19 @@ class AnalysisPage(QWidget):
                 # cost a full Plotly.react for nothing).
                 if fig is not card._fig:
                     card.set_figure(fig)
+
+            # Compact per-chart tab: keep short stable labels (see
+            # _chart_tab_label) so N charts of one analysis can't widen
+            # the strip into the chart area.
+            label = self._chart_tab_label(title, chart_type, type_counter)
+            tab_idx = self.charts_tabs.indexOf(card)
+            if tab_idx < 0:
+                # First time this card belongs to the visible strip (it was
+                # built while another analysis type was selected). Re-attach
+                # the existing widget -- do NOT build a new one, or its
+                # web view would have to reload plotly.js from scratch.
+                self.charts_tabs.addTab(card, label)
+                tab_idx = self.charts_tabs.indexOf(card)
 
             tab_idx = self.charts_tabs.indexOf(card)
             if tab_idx >= 0:

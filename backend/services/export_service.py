@@ -165,6 +165,7 @@ def build_export_report(
     kpis: Optional[list] = None,
     dashboard_title: str = "",
     grid_cols_n: int = 2,
+    tile_geometry: Optional[dict] = None,
 ) -> tuple[str, str]:
     """Generate an export-ready HTML report and a safe file name.
 
@@ -184,6 +185,10 @@ def build_export_report(
         Override title.
     grid_cols_n : int
         Number of grid columns.
+    tile_geometry : dict, optional
+        Free-form dashboard arrangement, ``{uid: {x, y, w, h}}`` in grid units,
+        as held by the live tiling canvas. Pass it so the exported HTML
+        reproduces the board the user arranged.
 
     Returns
     -------
@@ -201,5 +206,6 @@ def build_export_report(
         dashboard_title=dash_title,
         grid_cols_n=grid_cols_n,
         theme=export_theme,
+        tile_geometry=tile_geometry,
     )
     return html, safe_file

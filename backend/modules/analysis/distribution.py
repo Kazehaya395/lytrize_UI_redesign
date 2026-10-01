@@ -1,19 +1,26 @@
-"""modules/analysis/distribution.py -- Distribution histogram runner."""
+"""modules/analysis/distribution.py -- Distribution histogram runner.
+
+The numeric columns come from the shared role pools (``services.column_roles``)
+so the histogram list matches the metric pool everywhere else. See
+``correlation.py`` for the full rationale.
+"""
 
 
 import logging
 
 import plotly.express as px
-from modules.charts import chart_layout, COLORS, num_cols as _num_cols
+from modules.charts import chart_layout, COLORS
 from modules.utils.perf import sample_for_histogram
 from modules.analysis.apply_lytrize_standard import apply_lytrize_standard
+from services.column_roles import role_pools
 
 log = logging.getLogger(__name__)
 
 
 
 
-def run_distribution(df, x_cols=None, y_cols=None, palette=None, **kwargs):
+def run_distribution(df, x_cols=None, y_cols=None, palette=None, roles=None,
+                     **kwargs):
     """Generate histogram + box-plot marginal charts for numeric columns.
 
     Pure function: no UI side effects. If the caller wants to surface the
@@ -26,7 +33,7 @@ def run_distribution(df, x_cols=None, y_cols=None, palette=None, **kwargs):
 
 
     charts    = []
-    num       = x_cols or _num_cols(df)[:6]
+    num       = x_cols or role_pools(df, roles=roles)["num"][:6]
     pal       = palette or COLORS
     color_col = y_cols[0] if y_cols else None
 

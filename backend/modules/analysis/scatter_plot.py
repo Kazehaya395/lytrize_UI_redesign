@@ -4,7 +4,8 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from modules.charts import chart_layout, COLORS, num_cols as _num_cols
+from modules.charts import chart_layout, COLORS
+from services.column_roles import role_pools
 from modules.utils.perf import sample_for_plot
 
 
@@ -156,9 +157,11 @@ def _adaptive_sample_limit(n_color_groups: int, base_limit: int = 3_500) -> int:
 
 
 def run_scatter_plot(df, x_col=None, y_col=None, color_col=None, size_col=None,
-                     trendline=None, palette=None, render_mode="svg", **kwargs):
+                     trendline=None, palette=None, render_mode="svg",
+                     roles=None, **kwargs):
     charts = []
-    num = _num_cols(df)
+    # Shared role pools: the axis defaults are the user's metric family.
+    num = role_pools(df, roles=roles)["num"]
     pal = palette or COLORS
 
 
