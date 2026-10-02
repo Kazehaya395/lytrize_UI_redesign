@@ -387,6 +387,28 @@ QFrame#config_panel {{ background: palette(alternate-base); border: 1px solid pa
    Give it the same opaque card surface as the other panels. */
 QFrame#analysis_config_panel {{ background: palette(alternate-base); border: 1px solid palette(midlight); border-radius: 8px; }}
 QFrame#user_card {{ background: palette(alternate-base); border: 1px solid palette(midlight); border-radius: 10px; }}
+
+/* Tiling affordances on a dashboard card.
+   These were previously unstyled QLabels: the drag grip was a bare braille
+   glyph and the resize corner a bare triangle, both painted directly onto the
+   Plotly canvas in the plot's own text colour. They were technically there but
+   read as chart decoration, which is why the handles were reported as missing
+   and the cards as un-repositionable. Giving them an opaque plate, a border
+   and a hover state makes them legible as controls at any chart colour. */
+QLabel#card_grip {{
+    background: {t["card_bg"]}; color: {t["text"]};
+    border: 1px solid {t["border"]}; border-radius: 5px;
+    font-size: 13px;
+}}
+QLabel#card_grip:hover {{ border-color: {ACCENT}; color: {ACCENT}; }}
+QLabel#card_resize_right, QLabel#card_resize_bottom, QLabel#card_resize_corner {{
+    background: {t["card_bg"]}; color: {t["text_muted"]};
+    border: 1px solid {t["border"]}; border-radius: 4px;
+    font-size: 11px;
+}}
+QLabel#card_resize_right:hover, QLabel#card_resize_bottom:hover, QLabel#card_resize_corner:hover {{
+    border-color: {ACCENT}; color: {ACCENT};
+}}
 """
 
 

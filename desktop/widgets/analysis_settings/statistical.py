@@ -2,7 +2,7 @@
 from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLineEdit, QCheckBox, QPushButton, QLabel, QSizePolicy
-from .base import (AnalysisSettingsBase, section_label, hint_label, cap_widget, multi_select_combo, slider_with_readout, color_swatch, live_preview_label, apply_preview_font, COMPACT_W, GEN_W, PAGE_MARGINS, PAGE_SPACING, ROW_SPACING, HINT_GAP, SECTION_GAP, page_root, section_box, grid_row, FlowGrid)
+from .base import (AnalysisSettingsBase, section_label, hint_label, cap_widget, multi_select_combo, slider_with_readout, color_swatch, live_preview_label, apply_preview_font, legend_position_row, legend_orientation_row, colorbar_position_row, COMPACT_W, GEN_W, PAGE_MARGINS, PAGE_SPACING, ROW_SPACING, HINT_GAP, SECTION_GAP, page_root, section_box, grid_row, FlowGrid)
 NONE_SENTINEL = ''
 # The "no grouping" entry renders as a blank field, not the literal word
 # "None". "None" read like an actual selectable value sitting in the combo,
@@ -37,7 +37,10 @@ def _fonts() -> list:
 FSTYLES = ['Normal', 'Bold', 'Italic', 'Bold Italic', 'Underline']
 LPOS = ['outside', 'inside', 'auto']
 BMODES = ['group', 'stack', 'relative', 'overlay']
-LPOS_FRIENDLY = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left']
+# The legend placement choices are NOT listed here: they are read from the
+# backend by ``legend_position_row`` (see ``.base``) so the UI can never offer a
+# position the renderer does not understand. A second local list is exactly how
+# a control ends up offering a value that silently renders as the default.
 # Header alignment. Lower-case keys are what chart_display stores; the
 # friendly labels are what the combo shows. Kept in the same style as the
 # other option lists above.
@@ -54,7 +57,7 @@ class StatisticalSettings(AnalysisSettingsBase):
             self._layout_opts = {}
             self._typo_opts = {}
         self._pending = {'x': None, 'y': [], 'palette': None}
-        for attr in ('_as_slider', '_as_spin', '_axs_slider', '_axs_spin', '_cb_bmode', '_cb_fam', '_cb_fstyle', '_cb_halign', '_cb_hfont', '_cb_hfstyle', '_cb_legpos', '_cb_lpos', '_ck_border', '_ck_grid', '_ck_vals', '_combo_groupby', '_combo_metrics', '_combo_palette', '_gap_slider', '_gap_spin', '_hs_slider', '_hs_spin', '_le_leg', '_le_title', '_le_x', '_le_y', '_ls_slider', '_ls_spin', '_prev1', '_prev2', '_sw_acol', '_sw_hcol', '_sw_lcol', '_sw_tcol', '_ts_slider', '_ts_spin'):
+        for attr in ('_as_slider', '_as_spin', '_axs_slider', '_axs_spin', '_cb_bmode', '_cb_fam', '_cb_fstyle', '_cb_halign', '_cb_hfont', '_cb_hfstyle', '_cb_legclick', '_cb_legorder', '_cb_legorient', '_cb_legpos', '_cb_lpos', '_ck_border', '_ck_grid', '_ck_vals', '_combo_groupby', '_combo_metrics', '_combo_palette', '_gap_slider', '_gap_spin', '_hs_slider', '_hs_spin', '_le_leg', '_le_title', '_le_x', '_le_y', '_ls_slider', '_ls_spin', '_prev1', '_prev2', '_sw_acol', '_sw_hcol', '_sw_lcol', '_sw_tcol', '_ts_slider', '_ts_spin'):
             if not hasattr(self, attr):
                 setattr(self, attr, None)
     def prefill(self, values):
@@ -110,13 +113,47 @@ class StatisticalSettings(AnalysisSettingsBase):
                     w.blockSignals(False)
             except Exception:
                 pass
-        for attr, key in (("_cb_lpos", "label_position"), ("_cb_bmode", "bar_mode"), ("_cb_legpos", "legend_position")):
+        for attr, key, dflt in (("_cb_lpos", "label_position", "outside"),
+                                ("_cb_bmode", "bar_mode", "group"),
+                                ("_cb_legpos", "legend_position", "Top Right"),
+                                ("_cb_legorient", "legend_orientation", "Auto"),
+                                ("_cb_legorder", "legend_order", "Normal"),
+                                ("_cb_legclick", "legend_itemclick", "toggle")):
             try:
                 w = getattr(self, attr, None)
-                if w is not None:
-                    w.blockSignals(True)
-                    w.setCurrentText(str(self._layout_opts.get(key, "")))
-                    w.blockSignals(False)
+                if w is None:
+                    continue
+                w.blockSignals(True)
+                want = str(self._layout_opts.get(key, dflt) or dflt)
+                # The click control shows a FRIENDLY label ("Toggle item") for a
+                # stored key ("toggle"), so the two are mapped in both directions
+                # here. Comparing the raw key against the combo's items would find
+                # no match and snap every saved click action back to the default.
+                #
+                # The STORED value must stay a key, because that is what
+                # ``collect_layout`` returns and what ``chart_display`` reads --
+                # storing the label here would make the option dead on reload.
+                friendly = {"toggle": "Toggle item",
+                            "toggleothers": "Toggle others",
+                            "false": "Do nothing"}
+                if key == "legend_itemclick":
+                    want = friendly.get(want, "")
+                    if want not in [w.itemText(i) for i in range(w.count())]:
+                        # Unrecognised (a hand-edited config, or a build that had
+                        # different keys): snap the STORED key too, so the option
+                        # is not silently dead on the next generate.
+                        want = friendly[dflt]
+                        self._layout_opts[key] = dflt
+                elif want not in [w.itemText(i) for i in range(w.count())]:
+                    # A chart saved by an older build (or hand-edited config) can
+                    # name a value this build does not offer. Snapping the stored
+                    # value back keeps ``collect_layout`` and the visible combo
+                    # in agreement -- otherwise the chart would render one way and
+                    # the settings pane would claim another.
+                    want = dflt
+                    self._layout_opts[key] = want
+                w.setCurrentText(want)
+                w.blockSignals(False)
             except Exception:
                 pass
         try:
@@ -314,12 +351,18 @@ class StatisticalSettings(AnalysisSettingsBase):
         ll_.addWidget(grid_row('Legend title', self._le_leg))
         # The mockup's Layout tab lists no legend-position row; it stays with
         # the other legend control (still exercised) rather than being dropped.
-        self._cb_legpos = QComboBox()
-        cap_widget(self._cb_legpos, 200)
-        self._cb_legpos.addItems(LPOS_FRIENDLY)
-        self._cb_legpos.setCurrentText(str(self._layout_opts.get('legend_position', 'Top Right')))
-        self._cb_legpos.currentTextChanged.connect(lambda t: self._set_layout(legend_position=t))
-        ll_.addWidget(grid_row('Legend position', self._cb_legpos))
+        # All eight placements are offered, plus the direction the items run in
+        # and the order they appear -- a Top/Bottom band is only legible when
+        # the row is horizontal, and a reversed order is what makes a stacked
+        # band read top-down instead of bottom-up.
+        _leg_row, self._cb_legpos = legend_position_row(self._layout_opts,
+                                                        self._set_layout)
+        (_lo_row, self._cb_legorient, self._cb_legorder, self._cb_legclick,
+         _click_row) = legend_orientation_row(self._layout_opts,
+                                              self._set_layout)
+        ll_.addWidget(_leg_row)
+        ll_.addWidget(_lo_row)
+        ll_.addWidget(_click_row)
         ll_.addStretch()
         # -- Right column: the design's display rows, in design order --------
         self._ck_vals = QCheckBox('Show value labels')

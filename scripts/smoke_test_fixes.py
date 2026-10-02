@@ -2165,7 +2165,10 @@ def test_legend_column_tracks_card_width():
         """
         m = fig.layout.margin.to_plotly_json() or {}
         area = w - int(m.get("l") or 0) - int(m.get("r") or 0)
-        side = legend_anchor(pos)[0]
+        # legend_anchor() returns a DICT ({"side": ...}); it used to return a
+        # tuple whose element 0 was the side, so this indexed [0]. Reading the
+        # key keeps the test aligned with the eight-position legend API.
+        side = legend_anchor(pos)["side"]
         d = list(fig.layout.xaxis.domain)
         return (1.0 - d[1] if side == "right" else d[0]) * area
 
@@ -2298,7 +2301,7 @@ def test_legend_never_overlaps_the_axis_it_shares_a_column_with():
         m = fig.layout.margin.to_plotly_json() or {}
         area = w - int(m.get("l") or 0) - int(m.get("r") or 0)
         d = list(fig.layout.xaxis.domain)
-        side = legend_anchor(pos)[0]
+        side = legend_anchor(pos)["side"]
         return (1.0 - d[1] if side == "right" else d[0]) * area
 
     def band_px(fig):
@@ -2320,7 +2323,7 @@ def test_legend_never_overlaps_the_axis_it_shares_a_column_with():
             f = apply_display_options(dual_axis(),
                                       {"legend_position": pos}, None,
                                       width_px=w)
-            side = legend_anchor(pos)[0]
+            side = legend_anchor(pos)["side"]
             names = [t.name for t in f.data
                      if getattr(t, "showlegend", True) is not False]
             box = _legend_need_px(names, "", side, axis_px=0)
@@ -3486,9 +3489,11 @@ def test_correlation_settings_match_statistical_design():
           boxes == ["Annotations", "Show border"], str(boxes))
     check("layout: Show border is checked by default",
           cs._ck_border.isChecked(), str(cs._ck_border.isChecked()))
-    check("layout: the colorbar position offers Left and Right",
+    # Top and Bottom were added with the colorbar overhaul, so the bar is no
+    # longer confined to the two vertical sides.
+    check("layout: the colorbar position offers all four sides",
           [cs._cb_cbpos.itemText(i) for i in range(cs._cb_cbpos.count())]
-          == ["Right", "Left"],
+          == ["Right", "Left", "Top", "Bottom"],
           str([cs._cb_cbpos.itemText(i) for i in range(cs._cb_cbpos.count())]))
 
     # -- Typography: family, font_style, header, axis_tick -- and nothing else.
@@ -4772,14 +4777,19 @@ def test_masked_controls_stay_masked():
                   "Axis color"]
     _LB_LEGEND = ["Chart title", "X-axis", "Y-axis", "Legend title",
                   "Legend position", "Label pos", "Bar mode", "Bar gap"]
+    # Rows the legend overhaul added on top of the original Streamlit set:
+    # a legend LAYOUT (wrap / horizontal orientation) and the click-action
+    # selector. They ship on every type that actually draws a legend, so they
+    # are declared once here rather than repeated in each entry below.
+    _LEGEND_EXTRA = ["Legend layout", "Click"]
     _LB_CHECKS = ["Show value labels", "Show grid", "Show border"]
     EXPECTED = {
         # old controls: title, axes_labels, legend_labels, show_value_labels,
         # label_position, bar_gap, bar_mode (+ the template's grid/border).
-        "statistical": (_LB_LEGEND, _LB_CHECKS,
+        "statistical": (_LB_LEGEND + _LEGEND_EXTRA, _LB_CHECKS,
                         _TYPOTHREE + ["Legend size", "Legend color"]),
         # old controls: + histogram_bins, histogram_opacity.
-        "distribution": (_LB_LEGEND + ["Bins", "Opacity"], _LB_CHECKS,
+        "distribution": (_LB_LEGEND + ["Bins", "Opacity"] + _LEGEND_EXTRA, _LB_CHECKS,
                          _TYPOTHREE + ["Legend size", "Legend color"]),
         # has_axes=False, has_legend=False: title, colorscale, colour-bar
         # styling, annotations (+ the two requested colour-bar rows), and no
@@ -4797,7 +4807,7 @@ def test_masked_controls_stay_masked():
         # draw a key. Typography is the shared tab, legend group included.
         "categorical": (["Chart title", "X-axis", "Y-axis (left)",
                          "Y-axis (right)", "Legend title", "Legend position",
-                         "Label pos", "Bar mode", "Bar gap", "Line width"],
+                         "Label pos", "Bar mode", "Bar gap", "Line width"] + _LEGEND_EXTRA,
                         ["Show value labels", "Show grid", "Show border"],
                         list(_TYPOTHREE) + ["Legend size", "Legend color"]),
         # ---- the six types migrated in the final pass --------------------
@@ -4808,7 +4818,7 @@ def test_masked_controls_stay_masked():
         # legend block + the pie-specific rows, and NO axis-title typography.
         "pie_chart": (["Chart title", "Legend title", "Legend position",
                        "Label pos", "Text info", "Donut", "Pull", "Rotation",
-                       "Direction", "Value size", "Value color"],
+                       "Direction", "Value size", "Value color"] + _LEGEND_EXTRA,
                       ["Show value labels", "Show border"],
                       ["Header size", "Header color", "Header font",
                        "Header font style", "Header align", "Font family",
@@ -4818,14 +4828,14 @@ def test_masked_controls_stay_masked():
         # render-mode combo; its typography therefore matches the axes types.
         "time_series": (["Chart title", "X-axis", "Y-axis", "Legend title",
                          "Legend position", "Label pos", "Line width",
-                         "Line shape", "Fill"],
+                         "Line shape", "Fill"] + _LEGEND_EXTRA,
                         ["Show value labels", "Show grid", "Show border",
                          "Markers"],
                         _TYPOTHREE + ["Legend size", "Legend color"]),
         "scatter_plot": (["Chart title", "X-axis", "Y-axis", "Legend title",
                           "Legend position", "Label pos", "Line width",
                           "Line shape", "Fill", "M. size", "M. opacity",
-                          "Render mode"],
+                          "Render mode"] + _LEGEND_EXTRA,
                          ["Show value labels", "Show grid", "Show border",
                           "Markers"],
                          _TYPOTHREE + ["Legend size", "Legend color"]),

@@ -27,7 +27,8 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from PySide6.QtCore import Qt, QPoint, QRect, Signal
+from PySide6.QtCore import Qt, QPoint, QRect, QTimer, Signal
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QWidget, QSizePolicy
 
 log = logging.getLogger(__name__)
@@ -37,8 +38,27 @@ DEFAULT_ROW_HEIGHT = 320
 MIN_COL_SPAN = 1
 MIN_ROW_SPAN = 1
 MIN_CARD_H = 160
+# A card narrower than this is unreadable: the Plotly canvas loses its axis
+# labels and the action bar (which is ~180px of buttons) no longer fits, so it
+# spills over the card edge. Previously the canvas just divided the available
+# width by the column count, so shrinking the window squeezed a card to 72px
+# and its contents overlapped -- the "charts are elements of each other"
+# report. Below this the canvas now refuses to shrink further and the
+# surrounding QScrollArea scrolls horizontally instead.
+MIN_CARD_W = 300
 # Gap between cards, matching the grid spacing the dashboard used before.
 GAP = 12
+
+# How long after the last mouse-move a drag is committed, in ms. The gesture is
+# committed on a TIMER rather than on mouse-up alone so that a release outside
+# the canvas (over the scroll bar, or outside the window entirely) still lands
+# the drop instead of leaving the card stuck to the cursor.
+DRAG_COMMIT_MS = 120
+# A drop this close to a cell edge snaps to it, in pixels. Snapping to the cell
+# grid already happens; this is the second half -- a card released a few pixels
+# short of a boundary snaps flush, which is what makes the drop feel deliberate
+# rather than approximate.
+SNAP_PX = 18
 
 
 class TilingCanvas(QWidget):
@@ -56,11 +76,24 @@ class TilingCanvas(QWidget):
         self._cols = 2
         self._row_height = DEFAULT_ROW_HEIGHT
         self._drag: Optional[dict] = None
+        # The card the keyboard is nudging, and the cell the pointer is currently
+        # over. Both are drawn as an outline so the drop target is visible BEFORE
+        # the release -- without it a drag is a guess and the "cards end up
+        # overlapping" complaint is really "there was no feedback to aim at".
+        self._selected: Optional[str] = None
+        self._drop_rect: Optional[QRect] = None
         # Guard flag: relayout() resizes the canvas, which re-enters it.
         self._in_relayout: bool = False
+        self._commit_timer = QTimer(self)
+        self._commit_timer.setSingleShot(True)
+        self._commit_timer.setInterval(DRAG_COMMIT_MS)
+        self._commit_timer.timeout.connect(self._end_drag)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
 
         self.setObjectName("tiling_canvas")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        self.setAutoFillBackground(False)
 
     # -- Population -------------------------------------------------------
 
@@ -211,8 +244,26 @@ class TilingCanvas(QWidget):
 
     def _relayout(self) -> None:
         """Body of relayout, run under the re-entrancy guard."""
+        self._fit_min_width()
         self._position_cards()
         self._fit_height()
+
+    def _fit_min_width(self) -> None:
+        """Keep every column at least MIN_CARD_W wide.
+
+        The canvas lives in a QScrollArea, so the right way to survive a narrow
+        window is to stay wide and let the area scroll -- the same trick
+        ``_fit_height`` already uses for rows. Without this the column width
+        was simply ``available / cols``, so narrowing the window squeezed a
+        card below the width its own action bar needs and the buttons spilled
+        over the card edge.
+        """
+        width = (GAP * 2 + self._cols * MIN_CARD_W
+                 + (self._cols - 1) * GAP)
+        if self.minimumWidth() != width:
+            self.setMinimumWidth(width)
+            if self.width() < width:
+                self.resize(width, self.height())
 
     def _position_cards(self) -> None:
         """Place every card from its grid geometry, resolving overlaps."""
@@ -259,43 +310,93 @@ class TilingCanvas(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        # Reposition ONLY. Calling the full relayout() here would re-assert the
-        # height we just reacted to, and inside the scroll area that turns into
-        # an endless resize/relayout cycle.
-        self._position_cards()
+        # Reposition ONLY. Calling the full relayout() here would re-assert
+        # the height we just reacted to, and inside the scroll area that turns
+        # into an endless resize/relayout cycle. The width floor is re-asserted
+        # as well, but only via _fit_min_width(), which is a no-op unless the
+        # canvas has genuinely been squeezed below MIN_CARD_W.
+        self._in_relayout = True
+        try:
+            self._fit_min_width()
+            self._position_cards()
+        finally:
+            self._in_relayout = False
 
     # -- Drag / resize ----------------------------------------------------
 
     def begin_drag(self, uid: str, global_pos: QPoint) -> None:
-        """Start a move gesture for *uid*."""
+        """Start a move gesture for *uid*.
+
+        The grab offset is measured from the card's CURRENT on-screen corner, not
+        from its grid cell: measuring the cell and then subtracting the pointer
+        put the card's top-left under the cursor's previous position, so the
+        first mouse-move teleported it by a whole cell.
+        """
         if uid not in self._geom or uid not in self._cards:
             return
+        self._selected = uid
+        self.setFocus(Qt.MouseFocusReason)
         self._drag = {
             "mode": "move", "uid": uid,
-            "grab": self._cards[uid].mapToGlobal(QPoint(0, 0)) - global_pos,
-            "origin": global_pos,
+            # Card corner minus pointer, both in the same coordinate space.
+            "grab": (self._cards[uid].mapToGlobal(QPoint(0, 0))
+                     - global_pos),
             "start": dict(self._geom[uid]),
+            "moved": False,
         }
         self.grabMouse()
 
-    def begin_resize(self, uid: str, global_pos: QPoint) -> None:
-        """Start a resize gesture for *uid*."""
+    def begin_resize(self, uid: str, global_pos: QPoint,
+                      edge: str = "corner") -> None:
+        """Start a resize gesture for *uid* along *edge*.
+
+        *edge* selects which span the gesture may change: "right" only widens,
+        "bottom" only heightens, "corner" does both. Resizing one axis while
+        the other followed was the behaviour that made a card impossible to
+        place precisely -- you could never make something wider without also
+        making it taller.
+        """
         if uid not in self._geom:
             return
+        self._selected = uid
+        self.setFocus(Qt.MouseFocusReason)
         self._drag = {
             "mode": "resize", "uid": uid,
+            "edge": edge if edge in ("right", "bottom", "corner") else "corner",
             "grab": global_pos,
             "start": dict(self._geom[uid]),
+            "moved": False,
         }
         self.grabMouse()
 
     def _end_drag(self) -> None:
-        if self._drag is not None:
-            self.releaseMouse()
+        self._commit_timer.stop()
+        if self._drag is None:
+            return
+        if not self._drag.get("moved"):
+            # A click on the grip that never moved is not a layout change;
+            # emitting here would churn the persisted blob on every stray click.
             self._drag = None
-            # Commit + emit only on a real gesture, so a stray click on the
-            # grip does not churn the persisted layout.
-            self.layout_changed.emit(self.geometry_map(), self._cols)
+            return
+        self.releaseMouse()
+        self._drag = None
+        self._drop_rect = None
+        self.layout_changed.emit(self.geometry_map(), self._cols)
+        self.update()
+
+
+    def _snap(self, value: int, step: int) -> int:
+        """Round *value* to the nearest multiple of *step* when it is within
+        ``SNAP_PX`` of one.
+
+        This is the difference between "the card moved" and "the card went
+        somewhere deliberate". Without it a card released a few pixels short of
+        a boundary stays a whole cell off, which is what made dragging feel
+        imprecise even though the maths was right.
+        """
+        step = max(1, int(step))
+        nearest = int(round(value / step)) * step
+        return nearest if abs(nearest - value) <= SNAP_PX else int(value)
 
     def mouseMoveEvent(self, event) -> None:
         if self._drag is None:
@@ -305,19 +406,41 @@ class TilingCanvas(QWidget):
         if g is None:
             return
         col_px = self._col_px(max(self.width(), 1))
+        d["moved"] = True
         if d["mode"] == "move":
             top_left = event.globalPosition().toPoint() + d["grab"]
-            g["x"] = self._clamp((top_left.x() - GAP) // (col_px + GAP),
-                                 0, self._cols - g["w"])
-            g["y"] = max(0, (top_left.y() - GAP) // (self._row_height + GAP))
+            # Snap in PIXEL space first, then convert to a cell. Snapping the
+            # cell INDEX instead would make the threshold a fraction of a
+            # column, which on a wide card is well over a hundred pixels.
+            g["x"] = self._clamp(
+                self._snap(top_left.x() - GAP, col_px + GAP) // (col_px + GAP),
+                0, self._cols - g["w"])
+            g["y"] = max(
+                0, self._snap(top_left.y() - GAP,
+                              self._row_height + GAP) // (self._row_height + GAP))
         else:
             delta = event.globalPosition().toPoint() - d["grab"]
-            dw = int(round(delta.x() / float(col_px + GAP)))
-            dh = int(round(delta.y() / float(self._row_height + GAP)))
-            g["w"] = max(MIN_COL_SPAN, min(d["start"]["w"] + dw,
-                                           self._cols - d["start"]["x"]))
-            g["h"] = max(MIN_ROW_SPAN, d["start"]["h"] + dh)
+            edge = d.get("edge", "corner")
+            # Only the span the grabbed edge owns may change. Without this the
+            # height tracked the horizontal drag too, so widening a card also
+            # made it taller and precise placement was impossible.
+            if edge in ("right", "corner"):
+                dw = int(round(delta.x() / float(col_px + GAP)))
+                g["w"] = max(MIN_COL_SPAN, min(d["start"]["w"] + dw,
+                                               self._cols - d["start"]["x"]))
+            if edge in ("bottom", "corner"):
+                dh = int(round(delta.y() / float(self._row_height + GAP)))
+                g["h"] = max(MIN_ROW_SPAN, d["start"]["h"] + dh)
         self.relayout()
+        # The outline shows where the card WILL land, read from the geometry the
+        # drag just wrote. Painting it above the cards is the whole point: the
+        # card itself has already moved, so without the outline there is
+        # nothing left to indicate the target.
+        self._drop_rect = self._rect_for(g, max(self.width(), 1))
+        self.update()
+        # Restarted on every move, so a release that lands outside the canvas
+        # still commits once the pointer settles.
+        self._commit_timer.start()
 
     def mouseReleaseEvent(self, event) -> None:
         if self._drag is not None:
@@ -326,3 +449,96 @@ class TilingCanvas(QWidget):
     @staticmethod
     def _clamp(v, lo, hi):
         return max(lo, min(int(v), hi))
+
+    # -- Keyboard ----------------------------------------------------------
+
+    def select(self, uid: Optional[str]) -> None:
+        """Select a card for keyboard nudging, or clear the selection."""
+        if uid is not None and uid not in self._geom:
+            uid = None
+        self._selected = uid
+        self.update()
+
+    def nudge_selected(self, dx: int, dy: int) -> bool:
+        """Move the selected card by (dx, dy) cells. Returns True if it moved."""
+        if self._selected not in self._geom:
+            return False
+        g = self._geom[self._selected]
+        g["x"] = self._clamp(g["x"] + int(dx), 0, self._cols - g["w"])
+        g["y"] = max(0, g["y"] + int(dy))
+        self.relayout()
+        self.update()
+        # Committed immediately, not on a timer: each press is a discrete,
+        # complete action, and deferring it would lose the change to any later
+        # focus change.
+        self.layout_changed.emit(self.geometry_map(), self._cols)
+        return True
+
+    def keyPressEvent(self, event) -> None:
+        """Arrow keys nudge the selected card; Shift+Down jumps a whole row.
+
+        Dragging needs a pointer, and a layout tool with no keyboard path is not
+        a finished one -- this is the same affordance PowerBI and Tableau both
+        provide for precisely aligned placement.
+        """
+        if self._selected not in self._geom:
+            return
+        key = event.key()
+        # Shift multiplies the step, so one press crosses a full row instead of
+        # a cell. Useful on a tall board, where a single cell is a small move.
+        step = 1
+        if event.modifiers() & Qt.ShiftModifier:
+            step = max(1, self._row_height // DEFAULT_ROW_HEIGHT)
+        moves = {
+            Qt.Key_Left: (-step, 0),
+            Qt.Key_Right: (step, 0),
+            Qt.Key_Up: (0, -step),
+            Qt.Key_Down: (0, step),
+        }
+        delta = moves.get(key)
+        if delta is None:
+            super().keyPressEvent(event)
+            return
+        self.nudge_selected(*delta)
+
+    def tidy(self) -> None:
+        """Re-flow every card, in its current visual order, into a clean grid.
+
+        The escape hatch for a board that has been dragged into a tangle, where
+        fixing it one card at a time is tedious. Order is preserved, so this
+        tidies rather than reorders.
+        """
+        order = self.card_order()
+        for index, uid in enumerate(order):
+            self._geom[uid] = {"x": index % self._cols,
+                               "y": index // self._cols, "w": 1, "h": 1}
+        self.relayout()
+        self.layout_changed.emit(self.geometry_map(), self._cols)
+
+    # -- Drop / selection outline ------------------------------------------
+
+    def paintEvent(self, event) -> None:
+        """Paint the drop-target / selection outline over the cards.
+
+        Drawn here rather than as a child widget so it can sit ABOVE them -- a
+        child would be behind the cards it is meant to outline.
+        """
+        super().paintEvent(event)
+        rect = self._drop_rect
+        if rect is None and self._selected in self._geom:
+            rect = self._rect_for(self._geom[self._selected],
+                                  max(self.width(), 1))
+        if rect is None:
+            return
+        painter = QPainter(self)
+        try:
+            dragging = self._drag is not None
+            pen = QPen(QColor("#6163df"), 2 if dragging else 1)
+            if not dragging:
+                pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+            # Inset so the outline sits INSIDE the card and is not clipped by
+            # the canvas edge for a full-width card.
+            painter.drawRect(rect.adjusted(1, 1, -2, -2))
+        finally:
+            painter.end()

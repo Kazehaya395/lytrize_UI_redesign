@@ -27,6 +27,14 @@ log = logging.getLogger(__name__)
 _TYPE_NAME = {opt["id"]: opt["name"] for opt in ANALYSIS_OPTIONS}
 
 
+# Glyphs for the resize handles. The two plain edges are NOT left blank: an
+# empty QLabel renders as nothing at all, so a border-only handle on a busy
+# chart is effectively invisible (which is how the original corner-only handle
+# came to be reported as "no resize handler"). These are geometric marks that
+# point along the axis each edge controls.
+_RESIZE_GLYPHS = {"right": "\u2502", "bottom": "\u2500", "corner": "\u25e2"}
+
+
 class ChartCard(QFrame):
     """A single chart card with title, plot, notes, and actions."""
 
@@ -46,8 +54,11 @@ class ChartCard(QFrame):
     # starts on the card's grip or resize handle. The owning canvas tracks the
     # rest of the gesture (it knows the grid geometry; the card does not) and
     # moves the card itself, so the card never needs to know about columns.
-    drag_started = Signal(str, QPoint)     # uid, global_pos
-    resize_started = Signal(str, QPoint)   # uid, global_pos
+    drag_started = Signal(str, QPoint)              # uid, global_pos
+    resize_started = Signal(str, QPoint, str)    # uid, global_pos, edge
+                                                 # edge: "right" | "bottom" |
+                                                 # "corner" -- which span the
+                                                 # gesture is allowed to change
 
     def __init__(self, uid: str, title: str, fig: Any, chart_type: str = "",
                  meta: Optional[dict] = None, parent=None) -> None:
@@ -167,23 +178,49 @@ class ChartCard(QFrame):
         # surface is a live Plotly canvas: dragging the chart itself would
         # fight panning/selecting, and a drag needs a deliberate grip.
         self.grip = QLabel("\u2838")
-        self.grip.setFixedSize(20, 28)
+        self.grip.setFixedSize(24, 28)
         self.grip.setCursor(Qt.OpenHandCursor)
-        self.grip.setToolTip("Drag to move \u00b7 drag the corner to resize")
+        self.grip.setToolTip("Drag to move \u00b7 drag a card edge to resize")
         self.grip.setAlignment(Qt.AlignCenter)
+        # Object name so the theme can give the grip a visible plate. Without
+        # one the braille glyph was painted straight onto the chart canvas at
+        # the same weight as the plot's own text, which is why the affordance
+        # read as missing entirely: there WAS a handle, but nothing on screen
+        # said "this is draggable".
+        self.grip.setObjectName("card_grip")
         hb.addWidget(self.grip)
         self._reparent_buttons(bar, hb)
         layout.addWidget(self.plot_view, 0, 0)
         layout.addWidget(bar, 0, 0, Qt.AlignTop | Qt.AlignRight)
 
-        # -- Resize handle (bottom-right corner) --
-        self.resize_handle = QLabel("\u25e2")
-        self.resize_handle.setFixedSize(18, 18)
-        self.resize_handle.setCursor(Qt.SizeFDiagCursor)
-        self.resize_handle.setToolTip("Drag to resize")
-        self.resize_handle.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.resize_handle, 0, 0,
-                         Qt.AlignBottom | Qt.AlignRight)
+        # -- Resize handles -------------------------------------------------
+        # Edge handles plus the corner, rather than one corner dot. A single
+        # corner meant a card could only be resized by dragging right AND down
+        # at once, from the one spot where the scrollbar and the neighbouring
+        # card's border compete for the same pixels. Separate edges give
+        # independent horizontal and vertical control, which is what "adjust
+        # the chart size" means on a grid dashboard.
+        self.resize_handles: dict[str, QLabel] = {}
+        edge_specs = (
+            ("right", Qt.SizeHorCursor, Qt.AlignRight | Qt.AlignVCenter, 18),
+            ("bottom", Qt.SizeVerCursor, Qt.AlignBottom | Qt.AlignHCenter, 18),
+            ("corner", Qt.SizeFDiagCursor, Qt.AlignBottom | Qt.AlignRight, 22),
+        )
+        for name, cursor, alignment, size in edge_specs:
+            handle = QLabel(_RESIZE_GLYPHS[name])
+            handle.setObjectName(f"card_resize_{name}")
+            handle.setFixedSize(size, size)
+            handle.setCursor(cursor)
+            handle.setToolTip(
+                "Drag to resize" if name == "corner"
+                else f"Drag the {name} edge to resize")
+            handle.setAlignment(Qt.AlignCenter)
+            layout.addWidget(handle, 0, 0, alignment)
+            handle.mousePressEvent = self._make_resize_press(name)
+            self.resize_handles[name] = handle
+        # Back-compat alias: the corner is "the" resize handle, which is what
+        # set_tiling_enabled() and the dashboard page already refer to.
+        self.resize_handle = self.resize_handles["corner"]
         # Widgets sharing a grid cell are z-ordered by insertion; the bar is
         # added second so it is already in front, and raise_() makes that
         # explicit and survives later re-layouts of the plot.
@@ -204,16 +241,16 @@ class ChartCard(QFrame):
 
         self.grip.mousePressEvent = self._on_grip_pressed
         self.grip.mouseReleaseEvent = self._on_grip_released
-        self.resize_handle.mousePressEvent = self._on_resize_pressed
 
     def set_tiling_enabled(self, enabled: bool) -> None:
-        """Show or hide the drag grip and resize handle.
+        """Show or hide the drag grip and every resize handle.
 
         The Analysis page shows one chart at a time in a tab strip, so there is
         nothing to tile there and the handles would just be decoration.
         """
         self.grip.setVisible(enabled)
-        self.resize_handle.setVisible(enabled)
+        for handle in self.resize_handles.values():
+            handle.setVisible(enabled)
 
     # -- Tiling gestures ---------------------------------------------------
     # These only REPORT that a gesture started (with the global cursor
@@ -229,6 +266,19 @@ class ChartCard(QFrame):
 
     def _on_resize_pressed(self, event) -> None:
         self.resize_started.emit(self.uid, event.globalPosition().toPoint())
+
+    def _make_resize_press(self, edge: str):
+        """Build the press handler for one resize *edge*.
+
+        Bound per handle so the EDGE is captured in the closure. The signal
+        carries the edge as a third argument so the canvas can change only the
+        span that was actually dragged -- dragging the right edge must not
+        silently resize the card's height as well.
+        """
+        def handler(event) -> None:
+            self.resize_started.emit(self.uid,
+                                     event.globalPosition().toPoint(), edge)
+        return handler
 
     def _reparent_buttons(self, bar: QWidget, hb: QHBoxLayout) -> None:
         """Move the action buttons into the floating overlay bar.

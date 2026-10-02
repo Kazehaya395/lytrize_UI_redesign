@@ -428,6 +428,157 @@ def grid_row(label, widget, label_w=PILL_W):
     hl.addWidget(widget)
     hl.addStretch()
     return row
+
+# --- Legend / colour-bar placement controls ---------------------------------
+# The choice lists live in the backend (``chart_display``) so the UI can never
+# drift from what the renderer actually understands. They are read through a
+# guarded import: the settings panels are importable on their own (tests, the
+# headless builder), and a missing backend must degrade to a still-usable UI
+# rather than an ImportError at module load.
+def _chart_option_list(name, fallback):
+    try:
+        from chart_display import LEGEND_POSITIONS, LEGEND_ORIENTATIONS, LEGEND_ORDERS, COLORBAR_POSITIONS
+        return {'legend_position': LEGEND_POSITIONS,
+                'legend_orientation': LEGEND_ORIENTATIONS,
+                'legend_order': LEGEND_ORDERS,
+                'colorbar_position': COLORBAR_POSITIONS}[name]
+    except Exception:
+        return list(fallback)
+
+
+def legend_position_row(layout_opts, on_change, label='Legend position',
+                        width=COMPACT_W):
+    """A legend-position combo holding all eight placements.
+
+    Returns ``(row, combo)``. The combo keeps the historical attribute name
+    ``_cb_legpos`` on the caller when it is assigned there, so every builder's
+    existing prefill keeps working.
+    """
+    combo = QComboBox()
+    items = _chart_option_list('legend_position',
+                               ['Top Right', 'Top Left', 'Top Center',
+                                'Bottom Right', 'Bottom Left', 'Bottom Center',
+                                'Left', 'Right'])
+    combo.addItems(items)
+    want = str(layout_opts.get('legend_position', 'Top Right') or 'Top Right')
+    if want not in items:
+        want = 'Top Right'
+    combo.setCurrentText(want)
+    combo.setToolTip('Where the legend sits: in a side column, or as a\n'
+                     'horizontal band above / below the plot.')
+    combo.currentTextChanged.connect(lambda t: on_change(legend_position=t))
+    cap_widget(combo, width)
+    return grid_row(label, combo), combo
+
+
+def legend_orientation_row(layout_opts, on_change, label='Legend layout',
+                           width=COMPACT_W):
+    """Auto / Vertical / Horizontal, the series order, and the click action.
+
+    ``Auto`` lets the renderer choose: a side dock draws a vertical stack, a
+    Top/Bottom band (or any position too wide for a column on a narrow card)
+    draws a horizontal row. They are separate controls because they answer
+    different questions -- which way the items run, in what order, and what a
+    click on a legend entry does.
+    """
+    wrap = QWidget()
+    lay = QHBoxLayout(wrap)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(ROW_SPACING)
+    orient = QComboBox()
+    oitems = _chart_option_list('legend_orientation',
+                                ['Auto', 'Vertical', 'Horizontal'])
+    orient.addItems(oitems)
+    owant = str(layout_opts.get('legend_orientation', 'Auto') or 'Auto')
+    orient.setCurrentText(owant if owant in oitems else 'Auto')
+    orient.setToolTip('Direction the legend items run in. Auto follows the\n'
+                      'position: side docks stack, top/bottom run across.')
+    cap_widget(orient, width)
+    order = QComboBox()
+    oitems2 = _chart_option_list('legend_order', ['Normal', 'Reversed'])
+    order.addItems(oitems2)
+    want2 = str(layout_opts.get('legend_order', 'Normal') or 'Normal')
+    order.setCurrentText(want2 if want2 in oitems2 else 'Normal')
+    order.setToolTip('Order the series appear in the legend.\n'
+                     'Reversed puts the first series last.')
+    cap_widget(order, width)
+    lay.addWidget(orient)
+    lay.addWidget(order)
+    lay.addStretch()
+    orient.currentTextChanged.connect(
+        lambda t: on_change(legend_orientation=t))
+    order.currentTextChanged.connect(lambda t: on_change(legend_order=t))
+    wrap._orient = orient
+    wrap._order = order
+    row = grid_row(label, wrap)
+
+    # The click action gets its OWN row: three combos plus a label do not fit a
+    # 240px control column, and squeezing them in is what produced the cramped,
+    # overlapping rows this pane was reported for.
+    click_wrap = QWidget()
+    click_lay = QHBoxLayout(click_wrap)
+    click_lay.setContentsMargins(0, 0, 0, 0)
+    click_lay.setSpacing(ROW_SPACING)
+    click = QComboBox()
+    citems = ['Toggle item', 'Toggle others', 'Do nothing']
+    click.addItems(citems)
+    ckeys = ['toggle', 'toggleothers', 'false']
+    cwant = str(layout_opts.get('legend_itemclick', 'toggle') or 'toggle')
+    click.setCurrentText(citems[ckeys.index(cwant)] if cwant in ckeys else citems[0])
+    click.setToolTip('What clicking a legend entry does in the chart.\n'
+                     '"Toggle others" hides every other series at once.')
+    cap_widget(click, width)
+    click_lay.addWidget(click)
+    click_lay.addStretch()
+    click.currentTextChanged.connect(
+        lambda t: on_change(legend_itemclick=ckeys[citems.index(t)]))
+    click_wrap._click = click
+    click_row = grid_row('Click', click_wrap)
+    return row, orient, order, click, click_row
+
+
+_CB_ORIENTS = ('Auto', 'Vertical', 'Horizontal')
+
+
+def colorbar_position_row(layout_opts, on_change, label='Colorbar pos',
+                          width=COMPACT_W):
+    """Colour-bar placement (Right / Left / Top / Bottom) + its orientation.
+
+    A Top/Bottom bar is drawn horizontally under or over the plot; a Left/Right
+    bar is a vertical strip. ``Auto`` orientation follows the position, so the
+    second control is only needed to override that (e.g. a right-hand bar laid
+    out horizontally is a valid, if unusual, choice).
+    """
+    wrap = QWidget()
+    lay = QHBoxLayout(wrap)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(ROW_SPACING)
+    pos = QComboBox()
+    items = _chart_option_list('colorbar_position',
+                               ['Right', 'Left', 'Top', 'Bottom'])
+    pos.addItems(items)
+    want = str(layout_opts.get('colorbar_position', 'Right') or 'Right')
+    pos.setCurrentText(want if want in items else 'Right')
+    pos.setToolTip('Where the colour range sits: as a side strip, or as a\n'
+                   'horizontal bar above / below the plot.')
+    cap_widget(pos, width)
+    orient = QComboBox()
+    orient.addItems(['Auto', 'Vertical', 'Horizontal'])
+    owant = str(layout_opts.get('colorbar_orientation', 'Auto') or 'Auto')
+    orient.setCurrentText(owant if owant in _CB_ORIENTS else 'Auto')
+    orient.setToolTip('Auto follows the position (Top/Bottom draw across).')
+    cap_widget(orient, width)
+    lay.addWidget(pos)
+    lay.addWidget(orient)
+    lay.addStretch()
+    pos.currentTextChanged.connect(
+        lambda t: on_change(discrete=True, colorbar_position=t))
+    orient.currentTextChanged.connect(
+        lambda t: on_change(discrete=True, colorbar_orientation=t))
+    wrap._pos = pos
+    wrap._orient = orient
+    return grid_row(label, wrap), pos, orient
+
 def slider_with_readout(minimum, maximum, value, is_int=True, step=1, readout_width=60):
     wrap = QWidget()
     hl = QHBoxLayout(wrap)

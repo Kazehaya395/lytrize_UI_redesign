@@ -20,8 +20,8 @@ Design note (why this subclasses StatisticalSettings):
 """
 from __future__ import annotations
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLineEdit, QCheckBox
-from .base import (hint_label, cap_widget, multi_select_combo, slider_with_readout, GEN_W, HINT_GAP, SECTION_GAP, page_root, section_box, grid_row, FlowGrid)
-from .statistical import StatisticalSettings, NONE_SENTINEL, LPOS, BMODES, LPOS_FRIENDLY
+from .base import (hint_label, cap_widget, multi_select_combo, slider_with_readout, legend_position_row, legend_orientation_row, GEN_W, HINT_GAP, SECTION_GAP, page_root, section_box, grid_row, FlowGrid)
+from .statistical import StatisticalSettings, NONE_SENTINEL, LPOS, BMODES
 
 # GEN_W (the compact Generate field width) now comes from ``.base`` so the
 # flow grid's minimum column width cannot drift from it.
@@ -204,12 +204,14 @@ class DistributionSettings(StatisticalSettings):
         self._le_leg = QLineEdit(str(self._layout_opts.get('legend_title', '') or ''))
         self._le_leg.textChanged.connect(lambda t: self._set_layout(legend_title=t))
         ll_.addWidget(grid_row('Legend title', self._le_leg))
-        self._cb_legpos = QComboBox()
-        cap_widget(self._cb_legpos, 200)
-        self._cb_legpos.addItems(LPOS_FRIENDLY)
-        self._cb_legpos.setCurrentText(str(self._layout_opts.get('legend_position', 'Top Right')))
-        self._cb_legpos.currentTextChanged.connect(lambda t: self._set_layout(legend_position=t))
-        ll_.addWidget(grid_row('Legend position', self._cb_legpos))
+        _leg_row, self._cb_legpos = legend_position_row(self._layout_opts,
+                                                        self._set_layout)
+        (_lo_row, self._cb_legorient, self._cb_legorder, self._cb_legclick,
+         _click_row) = legend_orientation_row(self._layout_opts,
+                                              self._set_layout)
+        ll_.addWidget(_leg_row)
+        ll_.addWidget(_lo_row)
+        ll_.addWidget(_click_row)
         ll_.addStretch()
 
         # -- Right column: display rows, in design order --------------------

@@ -53,7 +53,7 @@ dependency is introduced.
 from __future__ import annotations
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLineEdit, QCheckBox, QLabel
 from .base import (hint_label, cap_widget, multi_select_combo, slider_with_readout,
-                   color_swatch, GEN_W, HINT_GAP, SECTION_GAP, page_root,
+                   color_swatch, colorbar_position_row, GEN_W, HINT_GAP, SECTION_GAP, page_root,
                    section_box, grid_row, FlowGrid)
 from .statistical import StatisticalSettings, NONE_SENTINEL
 
@@ -241,16 +241,14 @@ class CorrelationSettings(StatisticalSettings):
         except Exception:
             pass
         ll_.addWidget(grid_row('Precision', prec))
-        # Colour-bar placement. Left/Right is offered rather than the legend's
-        # four corners: a colour bar is a vertical strip, so a corner pair is
-        # meaningless for it.
-        self._cb_cbpos = QComboBox()
-        cap_widget(self._cb_cbpos, 200)
-        self._cb_cbpos.addItems(['Right', 'Left'])
-        self._cb_cbpos.setCurrentText(str(self._layout_opts.get('colorbar_position', 'Right')))
-        self._cb_cbpos.currentTextChanged.connect(
-            lambda t: self._set_layout(discrete=True, colorbar_position=t))
-        ll_.addWidget(grid_row('Colorbar pos', self._cb_cbpos))
+        # The colour bar / colour range. Right/Left give a vertical strip beside
+        # the matrix; Top/Bottom give a horizontal bar above or below it, which
+        # is the only readable choice once the column names are long -- and
+        # reserving it in the margin instead of as a side strip is what removes
+        # the gap between the matrix and the bar.
+        _cb_row, self._cb_cbpos, self._cb_cborient = colorbar_position_row(
+            self._layout_opts, self._set_layout)
+        ll_.addWidget(_cb_row)
         ll_.addStretch()
         # -- Right column: colour-bar styling + the shared display rows -----
         self._le_cb = QLineEdit(str(self._layout_opts.get('colorbar_title', '') or ''))
@@ -330,15 +328,14 @@ class CorrelationSettings(StatisticalSettings):
                     w.blockSignals(False)
             except Exception:
                 pass
-        # Drop-downs: colorscale and colour-bar position. A saved chart can
-        # name a scale that no longer exists, so the value is snapped back to
-        # a real entry rather than left showing something that is not there.
-        _pos = str(self._layout_opts.get("colorbar_position", "Right"))
-        if _pos not in ("Right", "Left"):
-            _pos = "Right"
-            self._layout_opts["colorbar_position"] = _pos
+        # Drop-downs: colorscale and colour-bar placement. A saved chart can
+        # name a scale (or a position) that no longer exists, so the value is
+        # snapped back to a real entry rather than left showing something that
+        # is not there -- which is why the position list is read off the combo
+        # itself instead of being hard-coded.
         for attr, key, dflt in (("_cb_cs", "heatmap_colorscale", "RdBu"),
-                                ("_cb_cbpos", "colorbar_position", "Right")):
+                                ("_cb_cbpos", "colorbar_position", "Right"),
+                                ("_cb_cborient", "colorbar_orientation", "Auto")):
             try:
                 w = getattr(self, attr, None)
                 if w is None:

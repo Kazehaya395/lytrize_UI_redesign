@@ -92,7 +92,7 @@ EXPORT_DEFAULTS = {
     "ex_not_bg": "#1a1732", "ex_not_bd": "#8566fc",
     "ex_density": "Comfortable", "ex_radius": 12, "ex_chart_h": 400,
     "ex_width": "Auto", "ex_meta": True,
-    "ex_kpi_text_color": "#f5f7ff", "ex_kpi_val_size": 14,
+    "ex_kpi_text_color": "#f5f7ff", "ex_kpi_val_size": 26,
     "ex_title_font": "Inter", "ex_title_style": "Normal",
     "ex_title_size": 28, "ex_title_color": "#6163df",
     "ex_notes_font": "Inter", "ex_notes_style": "Normal",
@@ -111,6 +111,124 @@ _WIDTHS = {
     "Wide": "1440px",
     "Full": "100%",
 }
+
+
+# -- Quick theme presets ----------------------------------------------------
+# Ported from the old dashboard's ``_PRESETS`` (modules/pages/dashboard.py:1203),
+# which the Qt rewrite dropped entirely -- the report could only be styled one
+# colour-picker at a time. Every preset sets the SAME set of keys, so applying
+# one is a straight merge over the current style rather than a partial look that
+# leaves, say, the notes box on the previous theme's colour.
+#
+# Keys are the export style keys only. Anything the preset does not mention
+# (density, radius, chart height, fonts) is deliberately left as the user has it:
+# a colour theme should not silently reset the layout they arranged.
+EXPORT_PRESETS: dict[str, dict[str, str]] = {
+    "\u26a1 Midnight Pulse": {
+        "ex_bg": "#08111f", "ex_card": "#101a35", "ex_kpi": "#0c1530",
+        "ex_accent": "#8b5cf6", "ex_border": "#31406e", "ex_text": "#f8fbff",
+        "ex_not_bg": "#1b1736", "ex_not_bd": "#f472b6",
+        "ex_title_color": "#8b5cf6", "ex_notes_color": "#f8fbff",
+        "ex_kpi_text_color": "#f8fbff",
+    },
+    "\U0001f30a Electric Lagoon": {
+        "ex_bg": "#061a24", "ex_card": "#0f2437", "ex_kpi": "#0b1f30",
+        "ex_accent": "#38bdf8", "ex_border": "#0ea5e9", "ex_text": "#ecfeff",
+        "ex_not_bg": "#102a43", "ex_not_bd": "#a855f7",
+        "ex_title_color": "#38bdf8", "ex_notes_color": "#ecfeff",
+        "ex_kpi_text_color": "#ecfeff",
+    },
+    "\U0001f496 Prism Pop": {
+        "ex_bg": "#1b1030", "ex_card": "#251544", "ex_kpi": "#22113f",
+        "ex_accent": "#ec4899", "ex_border": "#8b5cf6", "ex_text": "#fff7ff",
+        "ex_not_bg": "#211638", "ex_not_bd": "#60a5fa",
+        "ex_title_color": "#ec4899", "ex_notes_color": "#fff7ff",
+        "ex_kpi_text_color": "#fff7ff",
+    },
+    "\u2600\ufe0f Solar Flare": {
+        "ex_bg": "#20130a", "ex_card": "#322012", "ex_kpi": "#2f180f",
+        "ex_accent": "#f97316", "ex_border": "#f59e0b", "ex_text": "#fff7ed",
+        "ex_not_bg": "#2d1e0b", "ex_not_bd": "#fb7185",
+        "ex_title_color": "#f97316", "ex_notes_color": "#fff7ed",
+        "ex_kpi_text_color": "#fff7ed",
+    },
+    "\u2744\ufe0f Arctic Neon": {
+        "ex_bg": "#07131f", "ex_card": "#0f2235", "ex_kpi": "#0b1b2d",
+        "ex_accent": "#60a5fa", "ex_border": "#22d3ee", "ex_text": "#eff6ff",
+        "ex_not_bg": "#14213d", "ex_not_bd": "#34d399",
+        "ex_title_color": "#60a5fa", "ex_notes_color": "#eff6ff",
+        "ex_kpi_text_color": "#eff6ff",
+    },
+    "\U0001f33f Forest Electric": {
+        "ex_bg": "#071a12", "ex_card": "#0f281b", "ex_kpi": "#0b2217",
+        "ex_accent": "#22c55e", "ex_border": "#34d399", "ex_text": "#effaf3",
+        "ex_not_bg": "#182817", "ex_not_bd": "#f59e0b",
+        "ex_title_color": "#22c55e", "ex_notes_color": "#effaf3",
+        "ex_kpi_text_color": "#effaf3",
+    },
+    "\u2728 Aurora Bright": {
+        "ex_bg": "#f7fbff", "ex_card": "#ffffff", "ex_kpi": "#eefcf8",
+        "ex_accent": "#14b8a6", "ex_border": "#b7e4d3", "ex_text": "#0f172a",
+        "ex_not_bg": "#fff7e6", "ex_not_bd": "#f59e0b",
+        "ex_title_color": "#14b8a6", "ex_notes_color": "#0f172a",
+        "ex_kpi_text_color": "#0f172a",
+    },
+    "\U0001f305 Sunset Bloom": {
+        "ex_bg": "#fff7fb", "ex_card": "#ffffff", "ex_kpi": "#fff0f5",
+        "ex_accent": "#ec4899", "ex_border": "#f6b3d4", "ex_text": "#3f1634",
+        "ex_not_bg": "#fff6ea", "ex_not_bd": "#fb923c",
+        "ex_title_color": "#ec4899", "ex_notes_color": "#3f1634",
+        "ex_kpi_text_color": "#3f1634",
+    },
+    "\U0001f30a Ocean Breeze": {
+        "ex_bg": "#f4fbff", "ex_card": "#ffffff", "ex_kpi": "#e6f5ff",
+        "ex_accent": "#0284c7", "ex_border": "#9fd7f5", "ex_text": "#0c4a6e",
+        "ex_not_bg": "#effcf8", "ex_not_bd": "#14b8a6",
+        "ex_title_color": "#0284c7", "ex_notes_color": "#0c4a6e",
+        "ex_kpi_text_color": "#0c4a6e",
+    },
+    "\U0001f34b Citrus Glow": {
+        "ex_bg": "#fffdf3", "ex_card": "#ffffff", "ex_kpi": "#fff4cc",
+        "ex_accent": "#f59e0b", "ex_border": "#f7d46b", "ex_text": "#713f12",
+        "ex_not_bg": "#fff7e8", "ex_not_bd": "#ef4444",
+        "ex_title_color": "#f59e0b", "ex_notes_color": "#713f12",
+        "ex_kpi_text_color": "#713f12",
+    },
+    "\U0001f338 Blossom Pop": {
+        "ex_bg": "#fff7fb", "ex_card": "#ffffff", "ex_kpi": "#ffeaf3",
+        "ex_accent": "#db2777", "ex_border": "#f3b0cf", "ex_text": "#7a1f55",
+        "ex_not_bg": "#f4f0ff", "ex_not_bd": "#8b5cf6",
+        "ex_title_color": "#db2777", "ex_notes_color": "#7a1f55",
+        "ex_kpi_text_color": "#7a1f55",
+    },
+    "\U0001fab4 Mint Fresh": {
+        "ex_bg": "#f4fff7", "ex_card": "#ffffff", "ex_kpi": "#e3fcef",
+        "ex_accent": "#16a34a", "ex_border": "#a7e6b8", "ex_text": "#14532d",
+        "ex_not_bg": "#eefcf4", "ex_not_bd": "#10b981",
+        "ex_title_color": "#16a34a", "ex_notes_color": "#14532d",
+        "ex_kpi_text_color": "#14532d",
+    },
+}
+
+# The swatches the preset gallery paints, in the order they are shown.
+PRESET_SWATCH_KEYS = ("ex_bg", "ex_card", "ex_accent", "ex_kpi")
+
+
+def apply_preset(state: dict, preset_name: str) -> dict:
+    """Return *state* with *preset_name* merged over it.
+
+    Unknown names return the state untouched rather than raising: a saved
+    session can name a preset from a build that had one and this one does not,
+    and losing the whole style because of a name would be a far worse outcome
+    than keeping the colours the user can see.
+    """
+    preset = EXPORT_PRESETS.get(str(preset_name or ""))
+    if not preset:
+        return dict(state or {})
+    out = dict(state or {})
+    out.update(preset)
+    return out
+
 
 
 def build_export_theme(state: dict) -> dict:

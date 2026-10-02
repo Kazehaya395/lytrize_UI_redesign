@@ -95,7 +95,7 @@ DEFAULT_THEME = {
     "chart_height":   400,
     "max_width":      "",
     "show_meta":      True,
-    "kpi_val_size":   14,
+    "kpi_val_size":   26,
     "title_font":     "Inter",
     "title_style":    "Normal",
     "title_size":     28,
@@ -226,21 +226,26 @@ def generate_html_report(
     kpi_html = ""
     if kpis:
         def _change_style(k):
-            if "change_pct" not in k:
+            # Only the comparison types carry change_pct, so a card without it
+            # gets the plain accent colour. Keying off ``in`` rather than
+            # truthiness matters for a 0.0% change, which is a real (flat) trend
+            # and must not be drawn as "no trend".
+            if k.get("change_pct") is None:
                 return ""
             clr = "#10b981" if k.get("change_pct", 0) >= 0 else "#ef4444"
             return f"color:{clr};font-weight:700"
 
-
         def _arrow(k):
-            if "change_pct" not in k:
+            if k.get("change_pct") is None:
                 return ""
             return "▲ " if k.get("change_pct", 0) >= 0 else "▼ "
 
-
         def _kpi_val_style(k, base):
             full = f'{k.get("prefix","")}{k.get("value","--")}{k.get("suffix","")}'
-            base_size = t.get("kpi_val_size", 14)
+            base_size = t.get("kpi_val_size", 26)
+            # Same three tiers and the same subtraction as KpiCard.
+            # _apply_value_size, so the card in the report breaks and shrinks at
+            # exactly the same points as the one on the board.
             size = f"{max(base_size - 4, 10)}px" if len(full) > 16 else (
                    f"{max(base_size - 2, 10)}px" if len(full) > 12 else f"{base_size}px")
             kpi_col = t.get("kpi_text_color", "#f5f7ff")
@@ -248,17 +253,33 @@ def generate_html_report(
             colour_part = base if base else f"color:{kpi_col}"
             return f"font-size:{size};{wrap}{colour_part}"
 
+        def _kpi_card(k):
+            # A card whose column vanished after a re-upload says so, exactly as
+            # KpiCard does. A bare "--" is indistinguishable from a genuinely
+            # empty result, which is how a wrong number survives unnoticed.
+            stale = k.get("stale")
+            label = k.get("label", "KPI")
+            if stale:
+                # The em dash is a literal character, not an entity: the label
+                # goes through _h(), so an "&mdash;" here would reach the reader
+                # as the escaped text "&mdash;".
+                label = f'{label} \u2014 pick "{stale}" again'
+                base = "color:#f59e0b;font-weight:700"
+            else:
+                base = _change_style(k)
+            return (
+                f'<div class="kpi-card">'
+                f'<div class="kpi-icon">{_h(k.get("icon","📊"))}</div>'
+                f'<div class="kpi-value" style="{_kpi_val_style(k, base)}">'
+                f'{_h(_arrow(k))}{_h(k.get("prefix",""))}'
+                f'{_h(k.get("value","--"))}{_h(k.get("suffix",""))}</div>'
+                f'<div class="kpi-label" '
+                f'style="color:{_h(t.get("kpi_text_color", "#f5f7ff"))}">'
+                f'{_h(label)}</div>'
+                f'</div>'
+            )
 
-        kpi_items = "".join(
-            f'<div class="kpi-card">'
-            f'<div class="kpi-icon">{_h(k.get("icon","📊"))}</div>'
-            f'<div class="kpi-value" style="{_kpi_val_style(k, _change_style(k))}">'
-            f'{_h(_arrow(k))}{_h(k.get("prefix",""))}{_h(k.get("value","--"))}{_h(k.get("suffix",""))}</div>'
-            f'<div class="kpi-label" style="color:{_h(t.get("kpi_text_color", "#f5f7ff"))}">'
-            f'{_h(k.get("label","KPI"))}</div>'
-            f'</div>'
-            for k in kpis
-        )
+        kpi_items = "".join(_kpi_card(k) for k in kpis)
         kpi_html = f'<div class="kpi-row">{kpi_items}</div>'
 
 

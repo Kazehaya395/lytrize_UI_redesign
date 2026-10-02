@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QGridLayout, QLineEdit, QComboBox, QFileDialog,
     QMessageBox, QFrame, QSplitter, QTextEdit, QCheckBox, QSpinBox,
-    QGroupBox, QFormLayout, QColorDialog, QFontComboBox, QInputDialog,
+    QColorDialog, QFontComboBox, QInputDialog,
     QDialog, QDialogButtonBox,
 )
 
@@ -30,16 +30,27 @@ from desktop.theme import PAGE_MARGINS
 from desktop.session_bridge import SessionBridge
 from desktop.widgets.chart_card import ChartCard
 from desktop.widgets.kpi_card import KpiCard
+from desktop.widgets.kpi_dialog import KpiDialog
+from desktop.widgets.formatting_pane import (
+    CollapsibleSection, FieldRow, PresetGallery,
+)
 from desktop.widgets.tiling_canvas import TilingCanvas, DEFAULT_ROW_HEIGHT
 from desktop.workers import ExportWorker
-from services.export_service import build_export_report, build_export_charts
-from services.chart_service import safe_filename, num_cols
+from services.export_service import (
+    build_export_report, build_export_charts, apply_preset, EXPORT_PRESETS,
+)
+from services.chart_service import safe_filename
 from services.database_service import (
     save_session_db, update_session_db, get_session_charts,
     get_session_meta, clear_draft, invalidate_sessions_cache,
 )
 
 log = logging.getLogger(__name__)
+
+# The page widths the exporter understands, read from the service so the panel
+# cannot offer a width the report writer does not handle. The panel used to
+# hard-code ["Auto", "Fixed"], which made Narrow and Wide unreachable.
+_EXPORT_WIDTHS = ("Auto", "Narrow", "Wide", "Full")
 
 
 # Default values for every export-style key, in one place so the style
@@ -51,7 +62,7 @@ _STYLE_DEFAULTS = {
     "ex_not_bg": "#1a1732", "ex_not_bd": "#8566fc",
     "ex_density": "Comfortable", "ex_radius": 12, "ex_chart_h": 400,
     "ex_width": "Auto", "ex_meta": True,
-    "ex_kpi_text_color": "#f5f7ff", "ex_kpi_val_size": 14,
+    "ex_kpi_text_color": "#f5f7ff", "ex_kpi_val_size": 26,
     "ex_title_font": "Inter", "ex_title_style": "Normal",
     "ex_title_size": 28, "ex_title_color": "#6163df",
     "ex_notes_font": "Inter", "ex_notes_style": "Normal",
@@ -188,6 +199,9 @@ class DashboardPage(QWidget):
         self._color_swatches: dict[str, QPushButton] = {}
         self._viewing_saved = False
         self._kpi_drag_index = None
+        # Set while the panel widgets are being written FROM the bridge, so the
+        # change signals that fires are not mistaken for user edits.
+        self._syncing_widgets = False
 
         self._build_ui()
         self._connect_signals()
@@ -211,6 +225,14 @@ class DashboardPage(QWidget):
         self.btn_back = QPushButton("← Back")
         self.btn_back.setProperty("kind", "ghost")
         header.addWidget(self.btn_back)
+
+        self.btn_tidy = QPushButton("\U0001F9F9 Tidy Layout")
+        self.btn_tidy.setProperty("kind", "ghost")
+        self.btn_tidy.setToolTip(
+            "Re-flow the cards into a clean grid, keeping their order.\n"
+            "Cards are dragged by their grip; the selected one also moves\n"
+            "with the arrow keys.")
+        header.addWidget(self.btn_tidy)
 
         self.btn_export = QPushButton("⬇️ Export HTML")
         self.btn_export.setProperty("kind", "primary")
@@ -272,164 +294,193 @@ class DashboardPage(QWidget):
         root.addWidget(splitter, stretch=1)
 
     def _build_left_panel(self) -> QWidget:
-        """Build the scrollable control column: session/title/layout,
-        KPI management, and the dashboard style controls that were
-        previously only consumed at export time with no UI to set them."""
+        """Build the scrollable control column: session/title/layout, KPI
+        management, the quick themes, and the dashboard style controls.
+
+        The sections are COLLAPSIBLE and share one row geometry (see
+        ``formatting_pane``). That is the fix for the reported "clunky and
+        overlapping" panel: the old version stacked eight always-open QGroupBoxes
+        whose titles were drawn at a fixed top margin, so on a narrow column the
+        caption sat on the first control, and ~32 rows of identical-looking
+        inputs made the panel unreadable.
+        """
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(260)
-        scroll.setMaximumWidth(420)
+        # The pane is user-resizable through the splitter handle, so the
+        # vertical scrollbar is the only one it should ever need. Allowing a
+        # horizontal one is what let a wide control (a font combo) push the
+        # content past the right edge, where it was clipped with no way to
+        # scroll across to it.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # A real minimum, not a token 260px: the field rows need ~96px of label
+        # plus a usable control, and below ~320 the combos start truncating.
+        scroll.setMinimumWidth(320)
+        scroll.setMaximumWidth(440)
 
         content = QWidget()
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(4, 4, 12, 4)
-        layout.setSpacing(10)
+        layout.setContentsMargins(6, 6, 10, 6)
+        layout.setSpacing(8)
 
-        # -- Session / title / layout --
-        meta_group = QGroupBox("📝 Dashboard Info")
-        meta_form = QFormLayout(meta_group)
-        meta_form.setContentsMargins(12, 14, 12, 12)
-        meta_form.setSpacing(8)
-
+        # -- Session / title / layout (open by default: the two things almost
+        #    every user changes first) -----------------------------------
+        info = CollapsibleSection("\U0001F4DD Dashboard Info", expanded=True)
         self.session_name = QLineEdit()
         self.session_name.setPlaceholderText("Session name")
-        meta_form.addRow(self._form_label("Session"), self.session_name)
-
+        info.add(FieldRow("Session", self.session_name,
+                          "Saved with the session; used as the report title "
+                          "when no title is set."))
         self.dash_title = QLineEdit()
         self.dash_title.setPlaceholderText("e.g. Q1 2025 Sales Dashboard")
-        meta_form.addRow(self._form_label("Title"), self.dash_title)
-
+        info.add(FieldRow("Title", self.dash_title,
+                          "The report's heading. Leave blank to reuse the "
+                          "session name."))
         self.layout_mode = QComboBox()
         self.layout_mode.addItems(["Portrait", "Landscape"])
-        meta_form.addRow(self._form_label("Layout"), self.layout_mode)
-
-        # Grid columns -- old codebase's grid_cols_n (2 or 3 per row),
-        # previously this app derived column count from Portrait/Landscape
-        # instead of exposing it directly, which meant Portrait mode was
-        # always stuck at 1 column with no way to get 2 or 3. Decoupled
-        # from orientation entirely now.
+        info.add(FieldRow("Orientation", self.layout_mode,
+                          "Page shape of the exported report."))
+        # Grid columns -- the old codebase's grid_cols_n (2 or 3 per row).
+        # Previously this app derived the column count from
+        # Portrait/Landscape instead of exposing it, so Portrait was stuck at 1
+        # column with no way to reach 2 or 3. Decoupled from orientation.
         self.grid_cols_combo = QComboBox()
         self.grid_cols_combo.addItems(["2 Columns", "3 Columns"])
         current_cols = int(self.bridge.get("grid_cols_n", 2))
         self.grid_cols_combo.setCurrentIndex(0 if current_cols == 2 else 1)
         self.grid_cols_combo.currentIndexChanged.connect(self._on_grid_cols_changed)
-        meta_form.addRow(self._form_label("Grid columns"), self.grid_cols_combo)
+        info.add(FieldRow("Grid columns", self.grid_cols_combo,
+                          "Charts per row in the exported report."))
+        layout.addWidget(info)
 
-        layout.addWidget(meta_group)
-
-        # -- KPIs --
-        kpi_group = QGroupBox("📊 KPI Cards")
-        kpi_layout = QVBoxLayout(kpi_group)
-        kpi_layout.setContentsMargins(12, 14, 12, 12)
-
+        # -- KPIs ----------------------------------------------------------
+        kpi_group = CollapsibleSection("\U0001F4CA KPI Cards", expanded=True)
         self.btn_add_kpi = QPushButton("+ Add KPI")
-        self.btn_add_kpi.setProperty("kind", "ghost")
+        self.btn_add_kpi.setProperty("kind", "primary")
         self.btn_add_kpi.clicked.connect(self._on_add_kpi)
-        kpi_layout.addWidget(self.btn_add_kpi)
+        self.btn_add_kpi.setToolTip(
+            "Add a card: totals, averages, shares, period-over-period change,\n"
+            "running totals, or a custom expression over your columns.")
+        kpi_group.add(self.btn_add_kpi)
+        kpi_hint = QLabel("Hover a card to reorder, edit or remove it.")
+        kpi_hint.setWordWrap(True)
+        kpi_hint.setStyleSheet("font-size: 11px;")
+        kpi_group.add(kpi_hint)
         layout.addWidget(kpi_group)
 
-        # -- Canvas colors --
-        canvas_group = QGroupBox("🎨 Canvas Colors")
-        canvas_form = QFormLayout(canvas_group)
-        canvas_form.setContentsMargins(12, 14, 12, 12)
-        canvas_form.setSpacing(6)
-        for key, label in [("ex_bg", "Background"), ("ex_card", "Card"),
-                            ("ex_kpi", "KPI card"), ("ex_border", "Border")]:
-            canvas_form.addRow(self._form_label(label), self._make_color_field(key))
-        layout.addWidget(canvas_group)
+        # -- Quick themes --------------------------------------------------
+        themes = CollapsibleSection("\U0001F3A8 Quick Themes", expanded=True)
+        self.preset_gallery = PresetGallery(columns=3)
+        self.preset_gallery.preset_selected.connect(self._on_preset_selected)
+        themes.add(self.preset_gallery)
+        self.btn_reset_style = QPushButton("Reset to defaults")
+        self.btn_reset_style.setProperty("kind", "ghost")
+        self.btn_reset_style.clicked.connect(self._on_reset_style)
+        themes.add(self.btn_reset_style)
+        layout.addWidget(themes)
 
-        # -- Text & accent --
-        text_group = QGroupBox("🔤 Text & Accent")
-        text_form = QFormLayout(text_group)
-        text_form.setContentsMargins(12, 14, 12, 12)
-        text_form.setSpacing(6)
-        for key, label in [("ex_text", "Text"), ("ex_accent", "Accent")]:
-            text_form.addRow(self._form_label(label), self._make_color_field(key))
+        # -- Canvas colours (collapsed: the presets cover the common case) ----
+        canvas = CollapsibleSection("\U0001F58C️ Canvas Colours", expanded=False)
+        for key, label in (("ex_bg", "Background"), ("ex_card", "Card"),
+                           ("ex_kpi", "KPI card"), ("ex_border", "Border")):
+            canvas.add(FieldRow(label, self._make_color_field(key)))
+        layout.addWidget(canvas)
+
+        # -- Text & accent --------------------------------------------------
+        text_group = CollapsibleSection("\U0001F524 Text & Accent", expanded=False)
+        for key, label in (("ex_text", "Text"), ("ex_accent", "Accent")):
+            text_group.add(FieldRow(label, self._make_color_field(key)))
         layout.addWidget(text_group)
 
-        # -- Notes styling --
-        notes_group = QGroupBox("🗒️ Notes Styling")
-        notes_form = QFormLayout(notes_group)
-        notes_form.setContentsMargins(12, 14, 12, 12)
-        notes_form.setSpacing(6)
-        for key, label in [("ex_not_bg", "Background"), ("ex_not_bd", "Border")]:
-            notes_form.addRow(self._form_label(label), self._make_color_field(key))
+        # -- Notes styling --------------------------------------------------
+        notes_group = CollapsibleSection("\U0001F5D2️ Notes Styling", expanded=False)
+        for key, label in (("ex_not_bg", "Background"),
+                           ("ex_not_bd", "Border")):
+            notes_group.add(FieldRow(label, self._make_color_field(key)))
         layout.addWidget(notes_group)
 
-        # -- Layout density / sizing --
-        density_group = QGroupBox("📐 Layout")
-        density_form = QFormLayout(density_group)
-        density_form.setContentsMargins(12, 14, 12, 12)
-        density_form.setSpacing(6)
 
+        # -- KPI text -------------------------------------------------------
+        kpi_text_group = CollapsibleSection("\U0001F522 KPI Text", expanded=False)
+        kpi_text_group.add(FieldRow(
+            "Text color", self._make_color_field("ex_kpi_text_color")))
+        self.ex_kpi_val_size = QSpinBox()
+        self.ex_kpi_val_size.setRange(12, 48)
+        self.ex_kpi_val_size.setValue(int(self.bridge.get(
+            "ex_kpi_val_size", _STYLE_DEFAULTS["ex_kpi_val_size"])))
+        self.ex_kpi_val_size.valueChanged.connect(
+            lambda v: self._on_field_changed("ex_kpi_val_size", v))
+        kpi_text_group.add(FieldRow(
+            "Value size", self.ex_kpi_val_size,
+            "Point size for a short KPI value. Longer values step down "
+            "automatically, in the app and in the export alike."))
+        layout.addWidget(kpi_text_group)
+
+        # -- Title / notes typography ----------------------------------------
+        layout.addWidget(self._build_typography_group(
+            "\U0001F170 Title Typography", prefix="ex_title", expanded=False))
+        layout.addWidget(self._build_typography_group(
+            "\U0001F170 Notes Typography", prefix="ex_notes", expanded=False))
+
+        # -- Layout density / sizing -----------------------------------------
+        density_group = CollapsibleSection("\U0001F4D0 Layout", expanded=False)
         self.ex_density = QComboBox()
-        self.ex_density.addItems(["Comfortable", "Compact"])
-        self.ex_density.setCurrentText(self.bridge.get("ex_density", _STYLE_DEFAULTS["ex_density"]))
-        self.ex_density.currentTextChanged.connect(lambda v: self._on_field_changed("ex_density", v))
-        density_form.addRow(self._form_label("Density"), self.ex_density)
+        self.ex_density.addItems(["Compact", "Comfortable", "Spacious"])
+        self.ex_density.setCurrentText(self.bridge.get(
+            "ex_density", _STYLE_DEFAULTS["ex_density"]))
+        self.ex_density.currentTextChanged.connect(
+            lambda v: self._on_field_changed("ex_density", v))
+        density_group.add(FieldRow("Density", self.ex_density,
+                                   "Gap and padding between cards in the report."))
 
         self.ex_radius = QSpinBox()
         self.ex_radius.setRange(0, 32)
-        self.ex_radius.setValue(int(self.bridge.get("ex_radius", _STYLE_DEFAULTS["ex_radius"])))
-        self.ex_radius.valueChanged.connect(lambda v: self._on_field_changed("ex_radius", v))
-        density_form.addRow(self._form_label("Corner radius"), self.ex_radius)
+        self.ex_radius.setValue(int(self.bridge.get(
+            "ex_radius", _STYLE_DEFAULTS["ex_radius"])))
+        self.ex_radius.valueChanged.connect(
+            lambda v: self._on_field_changed("ex_radius", v))
+        density_group.add(FieldRow("Corner radius", self.ex_radius))
 
         self.ex_chart_h = QSpinBox()
         self.ex_chart_h.setRange(200, 900)
         self.ex_chart_h.setSingleStep(20)
-        self.ex_chart_h.setValue(int(self.bridge.get("ex_chart_h", _STYLE_DEFAULTS["ex_chart_h"])))
-        self.ex_chart_h.valueChanged.connect(lambda v: self._on_field_changed("ex_chart_h", v))
-        density_form.addRow(self._form_label("Chart height"), self.ex_chart_h)
+        self.ex_chart_h.setValue(int(self.bridge.get(
+            "ex_chart_h", _STYLE_DEFAULTS["ex_chart_h"])))
+        self.ex_chart_h.valueChanged.connect(
+            lambda v: self._on_field_changed("ex_chart_h", v))
+        density_group.add(FieldRow("Chart height", self.ex_chart_h,
+                                   "Height of each chart in the report."))
 
         self.ex_width = QComboBox()
-        self.ex_width.addItems(["Auto", "Fixed"])
-        self.ex_width.setCurrentText(self.bridge.get("ex_width", _STYLE_DEFAULTS["ex_width"]))
-        self.ex_width.currentTextChanged.connect(lambda v: self._on_field_changed("ex_width", v))
-        density_form.addRow(self._form_label("Width"), self.ex_width)
+        # The exporter understands four widths; the panel only offered
+        # Auto/Fixed, so "Narrow" and "Wide" were unreachable and a session
+        # saved with either came back showing "Auto".
+        self.ex_width.addItems(list(_EXPORT_WIDTHS))
+        self.ex_width.setCurrentText(self.bridge.get(
+            "ex_width", _STYLE_DEFAULTS["ex_width"]))
+        self.ex_width.currentTextChanged.connect(
+            lambda v: self._on_field_changed("ex_width", v))
+        density_group.add(FieldRow("Page width", self.ex_width,
+                                   "Fixed page width for the report, or let it "
+                                   "fill the browser."))
 
         self.ex_meta = QCheckBox("Show chart metadata")
-        self.ex_meta.setChecked(bool(self.bridge.get("ex_meta", _STYLE_DEFAULTS["ex_meta"])))
-        self.ex_meta.setStyleSheet("font-size: 12px;")
-        self.ex_meta.toggled.connect(lambda v: self._on_field_changed("ex_meta", v))
-        density_form.addRow(self.ex_meta)
-
+        self.ex_meta.setChecked(bool(self.bridge.get(
+            "ex_meta", _STYLE_DEFAULTS["ex_meta"])))
+        self.ex_meta.toggled.connect(
+            lambda v: self._on_field_changed("ex_meta", v))
+        density_group.add(self.ex_meta)
         layout.addWidget(density_group)
-
-        # -- KPI text --
-        kpi_text_group = QGroupBox("🔢 KPI Text")
-        kpi_text_form = QFormLayout(kpi_text_group)
-        kpi_text_form.setContentsMargins(12, 14, 12, 12)
-        kpi_text_form.setSpacing(6)
-        kpi_text_form.addRow(self._form_label("Text color"), self._make_color_field("ex_kpi_text_color"))
-
-        self.ex_kpi_val_size = QSpinBox()
-        self.ex_kpi_val_size.setRange(10, 48)
-        self.ex_kpi_val_size.setValue(int(self.bridge.get("ex_kpi_val_size", _STYLE_DEFAULTS["ex_kpi_val_size"])))
-        self.ex_kpi_val_size.valueChanged.connect(lambda v: self._on_field_changed("ex_kpi_val_size", v))
-        kpi_text_form.addRow(self._form_label("Value size"), self.ex_kpi_val_size)
-        layout.addWidget(kpi_text_group)
-
-        # -- Title typography --
-        layout.addWidget(self._build_typography_group(
-            "🅰️ Title Typography", prefix="ex_title"
-        ))
-
-        # -- Notes typography --
-        layout.addWidget(self._build_typography_group(
-            "🅰️ Notes Typography", prefix="ex_notes"
-        ))
 
         layout.addStretch()
         scroll.setWidget(content)
         return scroll
 
-    def _build_typography_group(self, title: str, prefix: str) -> QGroupBox:
+    def _build_typography_group(self, title: str, prefix: str,
+                                expanded: bool = True) -> CollapsibleSection:
         """Shared 4-field pattern (font, style, size, color) used for both
         title and notes typography -- avoids writing the same block twice."""
-        group = QGroupBox(title)
-        form = QFormLayout(group)
-        form.setContentsMargins(12, 14, 12, 12)
-        form.setSpacing(6)
+        group = CollapsibleSection(title, expanded=expanded)
 
         font_key = f"{prefix}_font"
         font_combo = QFontComboBox()
@@ -437,7 +488,7 @@ class DashboardPage(QWidget):
         font_combo.currentFontChanged.connect(
             lambda f, k=font_key: self._on_field_changed(k, f.family())
         )
-        form.addRow(self._form_label("Font"), font_combo)
+        group.add(FieldRow("Font", font_combo))
         setattr(self, font_key, font_combo)
 
         style_key = f"{prefix}_style"
@@ -447,7 +498,7 @@ class DashboardPage(QWidget):
         style_combo.currentTextChanged.connect(
             lambda v, k=style_key: self._on_field_changed(k, v)
         )
-        form.addRow(self._form_label("Style"), style_combo)
+        group.add(FieldRow("Style", style_combo))
         setattr(self, style_key, style_combo)
 
         size_key = f"{prefix}_size"
@@ -457,11 +508,11 @@ class DashboardPage(QWidget):
         size_spin.valueChanged.connect(
             lambda v, k=size_key: self._on_field_changed(k, v)
         )
-        form.addRow(self._form_label("Size"), size_spin)
+        group.add(FieldRow("Size", size_spin))
         setattr(self, size_key, size_spin)
 
         color_key = f"{prefix}_color"
-        form.addRow(self._form_label("Color"), self._make_color_field(color_key))
+        group.add(FieldRow("Color", self._make_color_field(color_key)))
 
         return group
 
@@ -481,7 +532,23 @@ class DashboardPage(QWidget):
         dashboard it's supposedly controlling.
         """
         style = self._current_style_dict()
+        # Every write below fires the widget's change signal, and each of those
+        # is wired to ``_on_field_changed`` -- so without this guard the sync
+        # writes the bridge back from the widgets, and a colour that resolves
+        # through the theme is immediately overwritten by the raw stored value.
+        # That is how applying a theme ended up half-reverting itself, and how
+        # loading a session could mark unrelated fields dirty.
+        #
+        # The flag lives on the bridge manager's namespace rather than on the
+        # page so a re-entrant ``_apply_style_to_cards`` sees the same state.
+        self._syncing_widgets = True
+        try:
+            self._sync_widgets_from_style(style)
+        finally:
+            self._syncing_widgets = False
 
+    def _sync_widgets_from_style(self, style: dict) -> None:
+        """Write *style* into the panel widgets. Assumes the sync guard is set."""
         for key, swatch in self._color_swatches.items():
             color = style.get(key, _STYLE_DEFAULTS.get(key, "#000000"))
             swatch.setStyleSheet(
@@ -493,7 +560,7 @@ class DashboardPage(QWidget):
         self.ex_chart_h.setValue(int(style.get("ex_chart_h", 400)))
         self.ex_width.setCurrentText(style.get("ex_width", "Auto"))
         self.ex_meta.setChecked(bool(style.get("ex_meta", True)))
-        self.ex_kpi_val_size.setValue(int(style.get("ex_kpi_val_size", 14)))
+        self.ex_kpi_val_size.setValue(int(style.get("ex_kpi_val_size", 26)))
 
         for prefix in ("ex_title", "ex_notes"):
             font_widget = getattr(self, f"{prefix}_font", None)
@@ -535,17 +602,6 @@ class DashboardPage(QWidget):
         return swatch
 
     @staticmethod
-    def _form_label(text: str) -> QLabel:
-        lbl = QLabel(text)
-        lbl.setProperty("class", "muted")
-        lbl.setStyleSheet("font-size: 12px;")
-        return lbl
-
-    @staticmethod
-    def _group_box_style() -> str:
-        return "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }"
-
-    @staticmethod
     def _input_style() -> str:
         return _theme_mod.input_style()
 
@@ -554,6 +610,7 @@ class DashboardPage(QWidget):
     def _connect_signals(self) -> None:
         self.btn_back.clicked.connect(self._on_back)
         self.btn_export.clicked.connect(self._on_export)
+        self.btn_tidy.clicked.connect(self._on_tidy_layout)
         self.btn_export_png.clicked.connect(self._on_export_png)
         self.btn_save.clicked.connect(self._on_save)
         self.bridge.charts_changed.connect(self._on_charts_changed)
@@ -610,16 +667,74 @@ class DashboardPage(QWidget):
         return _resolve_live_style(self.bridge)
 
     def _export_style_dict(self) -> dict:
-        """Style dict for the exported report (theme-independent)."""
-        return self._current_style_dict(for_export=True)
+        """Style dict for the exported report (theme-independent).
+
+        Carries one extra key beyond the 23 style keys: ``ex_preset``, the name
+        of the quick theme in effect. It is not a colour and the report writer
+        ignores it -- it is stored purely so re-opening the session can re-mark
+        the right swatch in the theme gallery.
+        """
+        out = self._current_style_dict(for_export=True)
+        out["ex_preset"] = str(self.bridge.get("ex_preset", "") or "")
+        return out
 
     def _on_field_changed(self, key: str, value) -> None:
         """Any style control (color, font, size, checkbox...) calls this
         on change. Writes to the bridge, then re-applies styling to the
         already-rendered cards in place -- never rebuilds them, so a
-        color tweak stays instant instead of flashing the whole grid."""
+        color tweak stays instant instead of flashing the whole grid.
+
+        A programmatic sync (``_sync_style_widgets_from_bridge``) also fires
+        these signals; writing the bridge back from it would overwrite a
+        theme-resolved colour with its raw stored value, so the guard makes
+        those writes no-ops."""
+        if getattr(self, "_syncing_widgets", False):
+            return
         self.bridge.set(key, value)
         self._apply_style_to_cards()
+
+    def _on_preset_selected(self, name: str) -> None:
+        """Apply one of the quick themes across the whole board.
+
+        The colours are written as EXPLICIT overrides, which is what makes the
+        live board follow the theme immediately: a value still at its default
+        resolves from the app theme, so a preset would otherwise show on the
+        swatches but not on the cards.
+
+        Layout keys (density, radius, chart height, fonts) are deliberately not
+        touched -- a colour theme must not silently undo the arrangement the
+        user just made.
+        """
+        merged = apply_preset(self._current_style_dict(), name)
+        for key in _OVERRIDABLE_COLORS:
+            value = merged.get(key)
+            if value is not None:
+                self.bridge.set(key, value)
+        self.bridge.set("ex_preset", str(name))
+        self._apply_style_to_cards()
+        self._sync_style_widgets_from_bridge()
+        self.preset_gallery.select(name)
+
+    def _on_reset_style(self) -> None:
+        """Drop every colour override and go back to the app theme's palette.
+
+        Confirmed first, because it discards a whole hand-picked colour scheme
+        and there is no undo.
+        """
+        confirm = QMessageBox.question(
+            self, "Reset styling",
+            "Clear every colour override and return to the app theme?\n\n"
+            "Layout settings (density, sizes, fonts) are kept.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if confirm != QMessageBox.Yes:
+            return
+        for key in _OVERRIDABLE_COLORS:
+            self.bridge.set(key, _STYLE_DEFAULTS.get(key, ""))
+        self.bridge.set("ex_preset", "")
+        self._apply_style_to_cards()
+        self._sync_style_widgets_from_bridge()
+        self.preset_gallery.clear()
+
 
     def _apply_style_to_cards(self) -> None:
         """Re-apply current dashboard style state (colors/typography/
@@ -667,15 +782,20 @@ class DashboardPage(QWidget):
         kpis = self.bridge.get("kpis", [])
         style = self._current_style_dict()
         for i, kpi in enumerate(kpis):
-            card = KpiCard(kpi.get("label", ""), kpi.get("value", ""), kpi.get("delta"), index=i)
+            # The whole dict is handed over, not three extracted strings: the
+            # card needs the icon, the prefix/suffix, change_pct and the stale
+            # marker, and picking the fields here is what made the live card
+            # show less than the exported one.
+            card = KpiCard(kpi, index=i)
             card.apply_style(style)
             card.move_up_requested.connect(self._on_move_kpi_up)
             card.move_down_requested.connect(self._on_move_kpi_down)
             card.remove_requested.connect(self._on_remove_kpi)
+            card.edit_requested.connect(self._on_edit_kpi)
             card.drag_started.connect(self._on_kpi_drag_started)
             card.drag_moved.connect(self._on_kpi_drag_moved)
             card.drag_ended.connect(self._on_kpi_drag_ended)
-            self.kpi_row_layout.addWidget(card)
+            self.kpi_row_layout.addWidget(card, 1)
             self._kpi_widgets.append(card)
         self.kpi_row_layout.addStretch()
         self.kpi_row_container.setVisible(bool(kpis))
@@ -774,64 +894,62 @@ class DashboardPage(QWidget):
         return [i for i, _ in sorted(pos.items(), key=lambda kv: kv[1])]
 
     def _on_add_kpi(self) -> None:
-        """Open a small dialog to add a KPI card: pick a numeric column
-        and an aggregation, compute the value from the current dataset,
-        and append it to bridge state."""
+        """Open the type-driven KPI form and append the card it produces.
+
+        The old dialog was three fixed fields (column / aggregation / label), so
+        only Sum, Average, Count, Min and Max were reachable and a card could
+        not be edited once added. Both are handled by ``KpiDialog`` +
+        ``kpi_service``; this method is now just the dialog host.
+        """
         df = self.bridge.df
         if df is None or df.empty:
-            QMessageBox.warning(self, "No Data", "Load a dataset before adding KPIs.")
-
-        cols = num_cols(df)
-        if not cols:
-            QMessageBox.warning(self, "No Numeric Columns", "No numeric columns available to aggregate.")
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Add KPI")
-        form = QFormLayout(dialog)
-
-        label_edit = QLineEdit()
-        form.addRow(self._form_label("Label"), label_edit)
-
-        col_combo = QComboBox()
-        col_combo.addItems(cols)
-        form.addRow(self._form_label("Column"), col_combo)
-
-        agg_combo = QComboBox()
-        agg_combo.addItems(["Sum", "Average", "Count", "Min", "Max"])
-        form.addRow(self._form_label("Aggregation"), agg_combo)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        form.addRow(buttons)
-
+            QMessageBox.warning(self, "No Data",
+                                "Load a dataset before adding KPIs.")
+            return
+        dialog = KpiDialog(df, parent=self)
         if dialog.exec() != QDialog.Accepted:
             return
-
-        col = col_combo.currentText()
-        agg = agg_combo.currentText()
-        label = label_edit.text().strip() or f"{agg} of {col}"
-
-        try:
-            series = df[col].dropna()
-            if agg == "Sum":
-                value = series.sum()
-            elif agg == "Average":
-                value = series.mean()
-            elif agg == "Count":
-                value = series.count()
-            elif agg == "Min":
-                value = series.min()
-            else:
-                value = series.max()
-            value_str = f"{value:,.2f}" if isinstance(value, float) else f"{value:,}"
-        except Exception as exc:
-            QMessageBox.critical(self, "KPI Error", f"Could not compute KPI: {exc}")
-
+        kpi = dialog.result_kpi()
+        if str(kpi.get("value", "")).startswith("Err:"):
+            # Adding a card that is already broken helps nobody; the form's own
+            # preview showed the same error before OK was pressed.
+            QMessageBox.warning(self, "KPI Error",
+                                f"{kpi['value']}\n\nPick a different column "
+                                "or type.")
+            return
         kpis = list(self.bridge.get("kpis", []))
-        kpis.append({"label": label, "value": value_str})
+        kpis.append(kpi)
         self.bridge.set("kpis", kpis)
         self._refresh_kpis()
+
+    def _on_edit_kpi(self, index: int) -> None:
+        """Re-open an existing card on the form and store the result.
+
+        A card with no ``_recipe`` (saved by the old dialog) is recomputed from
+        the current dataset using a type inferred from its label, so editing
+        upgrades it to a proper card rather than resetting it.
+        """
+        kpis = list(self.bridge.get("kpis", []))
+        if not (0 <= index < len(kpis)):
+            return
+        df = self.bridge.df
+        if df is None or df.empty:
+            QMessageBox.warning(self, "No Data",
+                                "Load a dataset before editing KPIs.")
+            return
+        dialog = KpiDialog(df, parent=self, existing=kpis[index])
+        if dialog.exec() != QDialog.Accepted:
+            return
+        updated = dialog.result_kpi()
+        if str(updated.get("value", "")).startswith("Err:"):
+            QMessageBox.warning(self, "KPI Error",
+                                f"{updated['value']}\n\nPick a different "
+                                "column or type.")
+            return
+        kpis[index] = updated
+        self.bridge.set("kpis", kpis)
+        self._refresh_kpis()
+
 
     def _on_remove_kpi(self, index: int) -> None:
         kpis = list(self.bridge.get("kpis", []))
@@ -1360,6 +1478,20 @@ class DashboardPage(QWidget):
         if all(u in by_uid for u in order):
             self.bridge.set("charts", [by_uid[u] for u in order])
 
+    def _on_tidy_layout(self) -> None:
+        """Re-flow every card into a clean grid, keeping the visual order.
+
+        The escape hatch for a board dragged into a tangle. The canvas emits
+        ``layout_changed`` itself, so the arrangement is persisted and the
+        reorder arrows updated through exactly the same path a drag takes --
+        there is no second, slightly different code path to fall out of sync.
+        """
+        try:
+            self.tiling_canvas.tidy()
+        except Exception:
+            log.debug("tidy layout failed", exc_info=True)
+
+
     def _on_move_up(self, uid: str) -> None:
         """Move a chart earlier via its arrow button.
 
@@ -1428,28 +1560,6 @@ class DashboardPage(QWidget):
         cols = 2 if index == 0 else 3
         self.bridge.set("grid_cols_n", cols)
         self._refresh_charts()
-
-    def _on_move_up(self, uid: str) -> None:
-        """Move a chart earlier in the dashboard's chart order. Reuses
-        the same 'charts' list Analysis page orders charts by -- one
-        shared order rather than a separate dashboard-only arrangement,
-        so reordering here and on Analysis always stay in sync instead
-        of silently drifting apart into two different orders."""
-        charts = list(self.bridge.get("charts", []))
-        idx = next((i for i, c in enumerate(charts) if c[0] == uid), -1)
-        if idx > 0:
-            charts[idx - 1], charts[idx] = charts[idx], charts[idx - 1]
-            self.bridge.set("charts", charts)
-            self._refresh_charts()
-
-    def _on_move_down(self, uid: str) -> None:
-        """Move a chart later in the dashboard's chart order (see _on_move_up)."""
-        charts = list(self.bridge.get("charts", []))
-        idx = next((i for i, c in enumerate(charts) if c[0] == uid), -1)
-        if 0 <= idx < len(charts) - 1:
-            charts[idx], charts[idx + 1] = charts[idx + 1], charts[idx]
-            self.bridge.set("charts", charts)
-            self._refresh_charts()
 
     def _on_fullwidth_toggled(self, uid: str, is_full_width: bool) -> None:
         """Per-chart full-width toggle.
@@ -1553,6 +1663,14 @@ class DashboardPage(QWidget):
                     for key, default in _STYLE_DEFAULTS.items():
                         self.bridge.set(key, saved_style.get(key, default))
                     self._sync_style_widgets_from_bridge()
+                    # Re-mark the theme the session was saved with, so the
+                    # gallery shows which one is in effect instead of appearing
+                    # unselected while its exact colours are on the board.
+                    saved_preset = str(saved_style.get("ex_preset", "") or "")
+                    if saved_preset in EXPORT_PRESETS:
+                        self.preset_gallery.select(saved_preset)
+                    else:
+                        self.preset_gallery.clear()
         else:
             # Not viewing saved — use current session state
             editing_name = self.bridge.get("editing_session_name")

@@ -11,7 +11,10 @@ FONT_FAMILIES = ["Inter", "Arial", "Georgia", "Times New Roman", "Verdana", "Cou
 FONT_STYLES = ["Normal", "Bold", "Italic", "Bold Italic", "Underline"]
 LABEL_POSITIONS = ["outside", "inside", "auto"]
 BAR_MODES = ["group", "stack", "relative", "overlay"]
-LEGEND_POSITIONS = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"]
+LEGEND_POSITIONS = ["Top Right", "Top Left", "Top Center", "Bottom Right", "Bottom Left", "Bottom Center", "Left", "Right"]
+LEGEND_ORIENTATIONS = ["Auto", "Vertical", "Horizontal"]
+LEGEND_ORDERS = ["Normal", "Reversed"]
+COLORBAR_POSITIONS = ["Right", "Left", "Top", "Bottom"]
 
 # Fonts the settings UI offers as choices. Most are NOT installed on a typical
 # box, and asking the browser for a missing family makes it silently substitute
@@ -191,10 +194,18 @@ def _generic_for(name: str) -> str:
 #   left  -> x=0, xanchor "left"   (box extends right, into the strip)
 #   right -> x=1, xanchor "right"  (box extends left, into the strip)
 _LEGEND_ANCHORS = {
-    "Top Right":    ("right", 1.0, "top"),
-    "Top Left":     ("left",  1.0, "top"),
-    "Bottom Right": ("right", 0.0, "bottom"),
-    "Bottom Left":  ("left",  0.0, "bottom"),
+    # name          x     y    xanchor  yanchor  x-strip   edge
+    "Top Right":    (1.0, 1.0, "right",  "top",    "right",  "top"),
+    "Top Left":     (0.0, 1.0, "left",   "top",    "left",   "top"),
+    "Top Center":   (0.5, 1.0, "center", "top",    "",       "top"),
+    "Bottom Right": (1.0, 0.0, "right",  "bottom", "right",  "bottom"),
+    "Bottom Left":  (0.0, 0.0, "left",   "bottom", "left",   "bottom"),
+    "Bottom Center":(0.5, 0.0, "center", "bottom", "",       "bottom"),
+    # Explicit side docks. These keep a reserved COLUMN on their own side; the
+    # four corner names can also collapse to a horizontal band when the card is
+    # too narrow for a column (see ``plan_legend_layout``).
+    "Right":        (1.0, 0.5, "right",  "middle", "right",  "middle"),
+    "Left":         (0.0, 0.5, "left",   "middle", "left",   "middle"),
 }
 
 # Fraction of the plot width handed to the legend column.  Proportional so
@@ -204,7 +215,7 @@ LEGEND_STRIP_MIN = 0.20
 LEGEND_STRIP_MAX = 0.50
 # Extra outer margin on the legend's side, so the y-axis title has somewhere
 # to live that is NOT the legend's column.
-LEGEND_AXIS_MARGIN = 96
+LEGEND_AXIS_MARGIN = 72
 # The reserved column has to hold the legend box AND, on the left, the y-axis
 # tick labels -- those are drawn just outside the axis, i.e. at the RIGHT edge
 # of the column, so a column sized for the box alone leaves the labels under
@@ -220,7 +231,7 @@ _LEGEND_AXIS_PX = 30
 # Gap kept between the legend plate and the axis furniture beside it.  The tick
 # labels are measured (see ``_axis_label_need_px``) but the plate has a border
 # and its own padding, so without a separating gap the two still touch.
-_LEGEND_AXIS_GAP_PX = 16
+_LEGEND_AXIS_GAP_PX = 8
 # Plot width the estimate is calibrated against.  Deliberately smaller than a
 # typical card so the estimate errs on the generous side at small widths; the
 # strip is a fraction, so this only has to be the right order of magnitude.
@@ -334,13 +345,23 @@ def _legend_axis_title_px(fig, side):
 
 
 def legend_anchor(legend_position):
-    """Return the (side, y, yanchor) placement for a legend position.
+    """Return the full placement dict for a legend position, or None.
 
-    ``side`` is the reserved strip ("left"/"right"); the x coordinate and
-    xanchor follow from it, so callers only need the side to lay out the
-    rest of the figure.
+    ``{"x", "y", "xanchor", "yanchor", "side", "edge"}``:
+
+    * ``side`` is the x-strip to reserve out of ``xaxis.domain`` ("left",
+      "right", or "" for the centred Top/Bottom positions, which reserve no
+      side strip at all), so callers only need it to lay out the rest of the
+      figure.
+    * ``edge`` is "top" / "bottom" / "middle" -- which vertical band (if any) a
+      horizontal legend has to be given.
     """
-    return _LEGEND_ANCHORS.get(str(legend_position or "").strip())
+    row = _LEGEND_ANCHORS.get(str(legend_position or "").strip())
+    if not row:
+        return None
+    x, y, xanchor, yanchor, side, edge = row
+    return {"x": x, "y": y, "xanchor": xanchor, "yanchor": yanchor,
+            "side": side, "edge": edge}
 
 
 # Nominal height a reserved band is expressed against, when converting the
@@ -348,6 +369,24 @@ def legend_anchor(legend_position):
 # (the band is a share of the plot height), so this just has to be a plausible
 # card height.
 _LEGEND_BAND_REF_HEIGHT = 400
+
+
+def _band_plan(fig, names, legend_title, edge, side, axis_px):
+    """Describe the horizontal-band layout for a legend.
+
+    Band height follows the ITEM COUNT -- the items now sit side by side, so a
+    long series name costs width, not height -- plus a row for the legend
+    title when one is set. ``edge`` is "top" or "bottom"; "middle" (the Left /
+    Right docks) has no band to reserve and falls back to a plain column.
+    """
+    rows = max(1, len([n for n in (names or []) if str(n or "").strip()]))
+    band_px = rows * _LEGEND_ROW_PX + _LEGEND_BAND_GAP_PX
+    if legend_title:
+        band_px += _LEGEND_ROW_PX
+    return {"mode": "band", "side": side, "top": edge == "top",
+            "band_px": band_px, "rows": rows,
+            "need_px": _legend_need_px(names, legend_title, side or "right",
+                                       axis_px)}
 
 
 def plan_legend_layout(fig, legend_position, names=None, legend_title="",
@@ -375,7 +414,12 @@ def plan_legend_layout(fig, legend_position, names=None, legend_title="",
     place = legend_anchor(legend_position)
     if not place:
         return None
-    side = place[0]
+    side = place["side"]
+    edge = place["edge"]
+    if not side:
+        # A centred Top/Bottom legend has no side strip to reserve; it always
+        # uses a horizontal band so the plot keeps its full width.
+        return _band_plan(fig, names, legend_title, edge, side, None)
     try:
         m = fig.layout.margin.to_plotly_json() or {}
     except Exception:
@@ -403,15 +447,19 @@ def plan_legend_layout(fig, legend_position, names=None, legend_title="",
                 "strip": _legend_strip(names, legend_title, side, area,
                                        axis_px=axis_px)}
 
-    # Too wide for a column: go horizontal. The band height follows the ITEM
-    # COUNT (they now sit side by side, so a long name no longer costs width),
-    # plus the legend title when one is set.
-    rows = max(1, len([n for n in (names or []) if str(n or "").strip()]))
-    band_px = rows * _LEGEND_ROW_PX + _LEGEND_BAND_GAP_PX
-    if legend_title:
-        band_px += _LEGEND_ROW_PX
-    return {"mode": "band", "side": side, "top": place[2] == "top",
-            "band_px": band_px, "rows": rows, "need_px": need}
+    if edge == "middle":
+        # A Left/Right dock has no top/bottom band to collapse into, so the
+        # column is kept and simply capped -- the plot must not be crushed to
+        # nothing by an over-long legend on a narrow card.
+        return {"mode": "column", "side": side, "need_px": need,
+                "axis_px": axis_px,
+                "strip": max(_legend_strip(names, legend_title, side, area,
+                                           axis_px=axis_px),
+                             LEGEND_COLUMN_MAX_SHARE)}
+
+    # Too wide for a column: go horizontal, keeping the requested edge and the
+    # requested left/right alignment of the row.
+    return _band_plan(fig, names, legend_title, edge, side, axis_px)
 
 
 def reserve_legend_band(fig, legend_position, band_px):
@@ -432,8 +480,8 @@ def reserve_legend_band(fig, legend_position, band_px):
     place = legend_anchor(legend_position)
     if not place:
         return False
-    side, _ly, _lya = place
-    top = _lya == "top"
+    side = place["side"]
+    top = place["edge"] == "top"
     try:
         band_px = max(0, int(band_px or 0))
     except Exception:
@@ -466,9 +514,14 @@ def reserve_legend_band(fig, legend_position, band_px):
     try:
         fig.update_layout(legend=dict(
             orientation="h",
-            x=0.0 if side == "left" else 1.0,
+            # A centred position keeps the row centred; otherwise the row is
+            # aligned to the requested side so "Top Left" / "Bottom Right" still
+            # mean what they say once they collapse to a band.
+            x=0.5 if place["xanchor"] == "center"
+            else (0.0 if side == "left" else 1.0),
             y=1.0 if top else 0.0,
-            xanchor="left" if side == "left" else "right",
+            xanchor=place["xanchor"] if place["xanchor"] == "center"
+            else ("left" if side == "left" else "right"),
             yanchor="bottom" if top else "top",
         ))
     except Exception:
@@ -521,7 +574,10 @@ def reserve_legend_column(fig, legend_position, strip=None,
     place = legend_anchor(legend_position)
     if not place:
         return None
-    side = place[0]
+    side = place["side"]
+    if not side:
+        # Centred Top/Bottom: nothing to carve out of the x-domain.
+        return None
     try:
         # NB: ``dict(fig.layout.margin)`` raises ValueError on some Plotly
         # versions (the Margin object iterates keys, not pairs), which silently
@@ -600,11 +656,16 @@ def infer_legend_position(fig):
         return None
     if not anchor:
         return None
+    # A centred row is unambiguous -- there are only the two centred names.
+    if anchor == "center":
+        return "Top Center" if yanchor == "top" else "Bottom Center"
     side = "left" if anchor == "left" else "right"
     if yanchor == "top":
         return "Top Left" if side == "left" else "Top Right"
     if yanchor == "bottom":
         return "Bottom Left" if side == "left" else "Bottom Right"
+    if yanchor == "middle":
+        return "Left" if side == "left" else "Right"
     return None
 
 
@@ -677,7 +738,9 @@ def apply_legend_layout(fig, legend_position, names=None, legend_title="",
     compact horizontal band when a column would take more than
     ``LEGEND_COLUMN_MAX_SHARE`` of the plot area.
 
-    Returns True when the layout was rewritten.
+    Returns the plan dict (or False) so the caller can tell whether the band
+    mode was chosen -- the band writes its own x/y/anchors, which the caller's
+    column anchors would otherwise fight.
     """
     if fig is None:
         return False
@@ -697,7 +760,8 @@ def apply_legend_layout(fig, legend_position, names=None, legend_title="",
         )
     if ok:
         _record_legend_layout(fig, legend_position, plan.get("mode"))
-    return bool(ok)
+        return plan
+    return False
 
 
 def refit_legend_width(fig, width_px):
@@ -884,7 +948,47 @@ def _apply_heatmap_options(fig, lo, typo, width_px=None):
     # bar with a negative x, which would land it on the y tick labels.
     # See reserve_colorbar_strip for the full reason.
     cbpos = str(lo.get("colorbar_position", "Right") or "Right").strip().lower()
+    cborient = str(lo.get("colorbar_orientation", "Auto") or "Auto").strip().lower()
+    if cbpos in ("top", "bottom") and cborient == "auto":
+        cborient = "horizontal"
+    elif cborient == "auto":
+        cborient = "vertical"
     reserve_colorbar_strip(fig, cbpos, traces=traces, width_px=width_px)
+    # Horizontal Top/Bottom bars: flip the Plotly colorbar itself so it
+    # renders under/over the plot instead of as a side strip.
+    try:
+        _horiz = (cborient == "horizontal")
+        for _tr in traces:
+            _cb = getattr(_tr, "colorbar", None)
+            if _cb is None:
+                continue
+            try:
+                _cb.orientation = "h" if _horiz else "v"
+                if _horiz:
+                    _cb.x = 0.5
+                    _cb.xanchor = "center"
+                    _cb.y = 1.08 if cbpos == "top" else -0.30
+                    _cb.yanchor = "bottom" if cbpos == "top" else "top"
+                    _cb.len = 0.6
+                    try:
+                        _cb.thickness = 14
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        try:
+            _ca = getattr(fig.layout, "coloraxis", None)
+            if _ca is not None and getattr(_ca, "colorbar", None) is not None:
+                _ca.colorbar.orientation = "h" if _horiz else "v"
+                if _horiz:
+                    _ca.colorbar.x = 0.5
+                    _ca.colorbar.xanchor = "center"
+                    _ca.colorbar.y = 1.08 if cbpos == "top" else -0.30
+                    _ca.colorbar.len = 0.6
+        except Exception:
+            pass
+    except Exception:
+        pass
     for tr in traces:
         cb = getattr(tr, "colorbar", None)
         if cb is None:
@@ -897,7 +1001,10 @@ def _apply_heatmap_options(fig, lo, typo, width_px=None):
 
 
 COLORBAR_THICKNESS_PX = 30
-COLORBAR_GAP_PX = 14
+COLORBAR_GAP_PX = 8
+# Extra breathing room between the bar and the y tick labels on the
+# Left position (see reserve_colorbar_strip).
+_COLORBAR_LABEL_GAP_PX = 6
 
 
 # Per-character width for the y tick labels, at the ~12px size the axis ticks
@@ -985,8 +1092,25 @@ def reserve_colorbar_strip(fig, side, traces=(), width_px=None):
     strip is measured from the bar's own thickness, so a thicker bar gets a
     proportionally wider strip.
     """
-    if side not in ("left", "right"):
+    if side not in ("left", "right", "top", "bottom"):
         return False
+    # Top/Bottom bars are horizontal and live in the margins, not in a side
+    # strip -- keep the full plot width and reserve vertical room instead so
+    # there is no side gap (the Image-4 complaint).
+    if side in ("top", "bottom"):
+        try:
+            m = fig.layout.margin.to_plotly_json() or {}
+        except Exception:
+            m = {}
+        try:
+            if side == "top":
+                m["t"] = max(int(m.get("t") or 0), 80)
+            else:
+                m["b"] = max(int(m.get("b") or 0), 80)
+            fig.update_layout(margin=m)
+        except Exception:
+            pass
+        return True
     try:
         thick = COLORBAR_THICKNESS_PX
         for tr in traces or ():
@@ -1005,7 +1129,11 @@ def reserve_colorbar_strip(fig, side, traces=(), width_px=None):
             # measuring them the strip is only wide enough for the bar itself
             # and the labels end up underneath it. Same reasoning as
             # _legend_need_px adding _LEGEND_AXIS_PX on the left.
-            need_px += _axis_label_need_px(fig, side)
+            # The separating gap matters on this side only: Right has the
+            # plot edge to sit against, but on Left the labels sit BETWEEN
+            # the bar and the cells, so without a gap the longest label is
+            # drawn flush against the bar.
+            need_px += _axis_label_need_px(fig, side) + _COLORBAR_LABEL_GAP_PX
         w = int(width_px or 0)
         if w > 0:
             strip = need_px / float(w)
@@ -1455,7 +1583,7 @@ def default_layout_opts():
     # per old _CONTROL_META. map_plot already routes its own colour scale
     # through the shared colorbar_* / heatmap_colorscale keys, which is why they
     # are not repeated here.
-    return {"title": "", "x_label": "", "y_label": "", "legend_title": "", "legend_labels": {}, "show_value_labels": True, "value_label_color": "#ffffff", "label_position": "outside", "bar_mode": "group", "bar_gap": 0.28, "histogram_bins": 30, "histogram_opacity": 0.80, "show_grid": True, "show_border": True, "legend_position": "Top Right", "heatmap_show_text": True, "heatmap_colorscale": "RdBu", "heatmap_annotation_size": 10, "heatmap_annotation_precision": 2, "heatmap_annotation_color": "#ffffff", "colorbar_position": "Right", "colorbar_title": "", "colorbar_tick_size": 10, "colorbar_tick_color": "#94a3b8", "colorbar_title_size": 11, "colorbar_title_color": "#cbd5e1", "donut_hole": 0.0, "pie_textinfo": "label+percent", "pull_slices": 0.0, "pie_rotation": 0, "pie_direction": "clockwise", "pie_value_size": 11, "pie_value_color": "#e2e8f0", "line_shape": "linear", "line_fill": "none", "show_markers": True, "marker_opacity": 0.8, "marker_size": 6, "render_mode": "svg", "table_font_size": 11, "table_header_font_size": 12, "table_row_height": 26, "table_header_height": 28, "table_index_align": "left", "table_data_align": "right", "table_number_format": ",.2f", "table_font_color": "#f1f5f9", "table_header_color": "#6163df", "table_stripe_even_color": "#1e293b", "table_stripe_odd_color": "#0f172a", "show_colorbar": True, "size_by_value": False}
+    return {"title": "", "x_label": "", "y_label": "", "legend_title": "", "legend_labels": {}, "show_value_labels": True, "value_label_color": "#ffffff", "label_position": "outside", "bar_mode": "group", "bar_gap": 0.28, "histogram_bins": 30, "histogram_opacity": 0.80, "show_grid": True, "show_border": True, "legend_position": "Top Right", "legend_orientation": "Auto", "legend_order": "Normal", "legend_itemclick": "toggle", "heatmap_show_text": True, "heatmap_colorscale": "RdBu", "heatmap_annotation_size": 10, "heatmap_annotation_precision": 2, "heatmap_annotation_color": "#ffffff", "colorbar_position": "Right", "colorbar_orientation": "Auto", "colorbar_title": "", "colorbar_tick_size": 10, "colorbar_tick_color": "#94a3b8", "colorbar_title_size": 11, "colorbar_title_color": "#cbd5e1", "donut_hole": 0.0, "pie_textinfo": "label+percent", "pull_slices": 0.0, "pie_rotation": 0, "pie_direction": "clockwise", "pie_value_size": 11, "pie_value_color": "#e2e8f0", "line_shape": "linear", "line_fill": "none", "show_markers": True, "marker_opacity": 0.8, "marker_size": 6, "render_mode": "svg", "table_font_size": 11, "table_header_font_size": 12, "table_row_height": 26, "table_header_height": 28, "table_index_align": "left", "table_data_align": "right", "table_number_format": ",.2f", "table_font_color": "#f1f5f9", "table_header_color": "#6163df", "table_stripe_even_color": "#1e293b", "table_stripe_odd_color": "#0f172a", "show_colorbar": True, "size_by_value": False}
 
 def default_typo_opts():
     # Sizes mirror the readouts on the Typography Options tab of
@@ -1745,7 +1873,6 @@ def apply_display_options(fig, layout_opts=None, typo_opts=None,
     # reserved moments earlier, which is why a left-hand colour bar ended up
     # on top of the y tick labels.
     if place and _figure_has_legend(f2):
-        side, ly, lyanchor = place
         # Reserve the column AFTER the xaxis showgrid/title updates above,
         # so this domain is not clobbered by a later update_layout.
         #
@@ -1758,27 +1885,27 @@ def apply_display_options(fig, layout_opts=None, typo_opts=None,
         # widget's resize refit calls), so a chart first drawn at an assumed
         # width and then refit to its real width always ends up on the same
         # rule rather than two different ones. When a width is known it may
-        # also return a horizontal band instead of a column; the anchors are
-        # written after, so they win in that case and the band stays put.
-        apply_legend_layout(
+        # also return a horizontal band instead of a column; the band writes
+        # its own x/y/anchors, so those are only written here for a column.
+        _plan = apply_legend_layout(
             f2, lp,
             names=[getattr(tr, "name", "") for tr in f2.data
                    if getattr(tr, "showlegend", True) is not False],
             legend_title=lo.get("legend_title", ""),
             width_px=width_px,
         )
-        f2.update_layout(legend=dict(
-            x=0.0 if side == "left" else 1.0,
-            y=ly,
-            xanchor="left" if side == "left" else "right",
-            yanchor=lyanchor,
+        _leg = dict(
             # A translucent plate keeps the legend readable wherever it
             # lands, without hiding the plot behind an opaque slab.
             bgcolor="rgba(15, 23, 42, 0.72)",
             bordercolor=(LEGEND_BORDER_COLOR if show_border
                          else "rgba(0, 0, 0, 0)"),
             borderwidth=1 if show_border else 0,
-        ))
+        )
+        if not _plan or _plan.get("mode") != "band":
+            _leg.update(x=place["x"], y=place["y"],
+                        xanchor=place["xanchor"], yanchor=place["yanchor"])
+        f2.update_layout(legend=_leg)
 
     # Colour bars (heatmaps, matrices, choropleths) draw their own frame and
     # are not reached by the legend block above, so the same toggle is applied
@@ -1895,6 +2022,28 @@ def apply_display_options(fig, layout_opts=None, typo_opts=None,
             f2.update_layout(legend=leg)
         except Exception:
             pass
+    # -- Legend orientation / order / click (PowerBI parity) ------------------
+    # Orientation Auto keeps the engine decision (side=vertical, band=
+    # horizontal); explicit Vertical/Horizontal overrides it. Applied in the
+    # typography pass so it wins over apply_layout placement.
+    try:
+        _lo2 = dict(lo or {})
+        _want_orient = str(_lo2.get("legend_orientation", "Auto") or "Auto").strip().lower()
+        if _want_orient in ("vertical", "horizontal"):
+            f2.update_layout(legend=dict(orientation="v" if _want_orient == "vertical" else "h"))
+    except Exception:
+        pass
+    try:
+        _want_order = str((lo or {}).get("legend_order", "Normal") or "Normal").strip().lower()
+        f2.update_layout(legend=dict(traceorder="reversed" if _want_order == "reversed" else "normal"))
+    except Exception:
+        pass
+    try:
+        _want_click = str((lo or {}).get("legend_itemclick", "toggle") or "toggle").strip().lower()
+        if _want_click in ("toggle", "toggleothers", "false"):
+            f2.update_layout(legend=dict(itemclick=False if _want_click == "false" else _want_click))
+    except Exception:
+        pass
 
     # Body font family/style (global).
     sd = _style_dict(t.get("family", "Inter"), t.get("font_style", "Normal"))
