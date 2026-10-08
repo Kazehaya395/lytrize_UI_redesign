@@ -23,6 +23,16 @@ log = logging.getLogger(__name__)
 
 _MAP_SAMPLE = 5_000
 
+# Spatial cells for the density render.  DENSITY is the DEFAULT for a map
+# plot: every input point contributes to a cell, so no location is dropped and
+# the density pattern is faithful.  SAMPLE exists only as an explicit opt-in
+# escape hatch for when raw per-point markers are wanted despite the cost.
+_DENSITY_CELLS = 2_000
+
+# Render modes for the scatter path.  The first is the default and the only
+# lossless one; the second drops points by design and must be user-selected.
+RENDER_MODES = ["Density (all points)", "Sample 5,000"]
+
 
 _CHOROPLETH_SCALES = [
     "Blues", "Viridis", "Plasma", "YlOrRd", "RdBu", "RdYlGn",
@@ -41,6 +51,128 @@ _SCOPES = ["world", "usa", "europe", "asia", "africa", "north america", "south a
 
 
 
+# -- Base maps --------------------------------------------------------------
+# Each user-facing basemap is described by ONE entry: either a VECTOR style
+# name from plotly.js's bundled MapLibre registry, or a list of raster tile
+# templates (used under ``layout.map.style = "white-bg"``).
+#
+# Why vector for the two "landscape" basemaps
+# -------------------------------------------
+# The reported "map is very blurry" complaint is a RASTER problem. Plotly hardcodes
+# ``tileSize: 256`` for every raster layer it creates from
+# ``layout.map.layers`` (see the source builder in the bundled ``plotly.min.js``:
+# ``a.tileSize=256``), so a 256px PNG is stretched to whatever the display's
+# device pixel ratio demands -- on a HiDPI screen that is a 2x upscale and the
+# labels go soft. ``tileSize`` is NOT a settable Plotly attribute, so no amount of
+# Python-side configuration fixes it; the only real cure is to stop using raster.
+#
+# The bundled plotly.js MapLibre registry already carries CARTO's key-free
+# VECTOR styles, and they are sharp at every zoom because the tiles are vectors:
+#
+#   carto-positron   -> https://basemaps.cartocdn.com/gl/positron-gl-style/style.json
+#   carto-darkmatter -> https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json
+#
+# Both verified reachable (HTTP 200) and both carry their own boundary layers,
+# so they need no API key and no Mapbox token.
+#
+# The earlier objection -- "a vector style is a remote style document, so it needs
+# network and cannot be probed from Python" -- does not hold: the raster tiles
+# this replaced are equally remote, and the chart shell already sets
+# ``LocalContentCanAccessRemoteUrls`` (that is what fixed the blank-map bug). A
+# vector style is therefore strictly better here, not a new dependency.
+#
+# Satellite stays RASTER: there is no free, key-free vector satellite imagery, and
+# Esri World Imagery is the only no-token option. It is accepted as the softer of
+# the three, and the style name says so.
+#
+# ``stamen-terrain`` is NOT in the registry any more (an orphan literal survives
+# in the bundle pointing at stadiamaps.com with an EMPTY api_key), so selecting it
+# raises MapLibre's ``missingStyleErrorMsg`` and draws a blank canvas -- exactly
+# the reported "grey nothing" map. ``_normalize_map_style`` therefore snaps every
+# stored/legacy value onto one of these three before it can reach MapLibre.
+MAP_STYLES = ["OpenStreetMap (Light)", "OpenStreetMap (Dark)", "Satellite (Earth)"]
+
+_MAP_DEFAULT = "OpenStreetMap (Light)"
+
+# style name (plotly registry) OR tile templates, per user-facing basemap.
+# A dict with "style" is rendered as a VECTOR MapLibre style; a dict with
+# "tiles" is rendered as ``white-bg`` + explicit raster layers.
+_MAP_STYLE_SPECS: dict = {
+    "OpenStreetMap (Light)": {"style": "carto-positron"},
+    "OpenStreetMap (Dark)": {"style": "carto-darkmatter"},
+    # No free key-less vector satellite exists, so this one is raster.
+    "Satellite (Earth)": {
+        "tiles": ["https://server.arcgisonline.com/ArcGIS/rest/services/"
+                  "World_Imagery/MapServer/tile/{z}/{y}/{x}"],
+    },
+}
+
+# Free, key-less Esri reference layer drawing translucent country borders +
+# place labels.  Honours the "Borders" checkbox on the tile path, where
+# borders are otherwise baked into (or absent from) the base imagery.
+_MAP_BORDERS_OVERLAY = [
+    "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/"
+    "World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
+]
+
+
+def _normalize_map_style(map_style) -> str:
+    """Map any stored/legacy style value onto one of the three ``MAP_STYLES``.
+
+    Keeps older saved charts working: dark-ish -> Dark, genuine imagery-ish ->
+    Satellite, everything else -> Light.  This also absorbs the registry names
+    (carto-*, white-bg, open-street-map) and the dead ones (``stamen-terrain``
+    and friends), so no stored value can reach MapLibre as an unknown style name
+    and blank the canvas.
+
+    Only names that really mean AERIAL IMAGERY reach the Satellite basemap.  It
+    is the one raster basemap of the three (no free key-less vector satellite
+    exists), so it is also the only soft one; routing a landscape style such as
+    ``stamen-terrain``, ``stamen-toner``, ``watercolor``, ``outdoors`` or
+    ``streets`` into it would hand the user the blurry basemap for a request
+    that never asked for imagery.  Those names describe terrain and scenery, so
+    they belong on the sharp default.
+    """
+    s = str(map_style or "").lower()
+    if any(k in s for k in ("dark", "matter", "night", "moon")):
+        return "OpenStreetMap (Dark)"
+    if any(k in s for k in ("satellite", "earth", "imagery", "esri", "aerial")):
+        return "Satellite (Earth)"
+    return "OpenStreetMap (Light)"
+
+
+_TILE_PROBE_HOSTS = (
+    ("server.arcgisonline.com", 443),  # satellite raster tiles
+    ("basemaps.cartocdn.com", 443),    # CARTO vector style documents + tiles
+    ("tile.openstreetmap.org", 443),   # boundaries overlay
+)
+_TILE_PROBE_TIMEOUT = 1.5
+_tiles_online_cache: Optional[bool] = None
+
+
+def _tiles_online() -> bool:
+    """One-shot (cached) probe: are raster tile servers reachable?
+
+    Tile basemaps are rendered client-side by plotly.js, so Python cannot know
+    whether the browser can load them -- but if this machine can open a TCP
+    connection to a tile host the tiles will resolve too.  Falls back to the
+    offline ``scatter_geo`` renderer when every host is unreachable.
+    """
+    global _tiles_online_cache
+    if _tiles_online_cache is not None:
+        return _tiles_online_cache
+    import socket
+    _online = False
+    for host, port in _TILE_PROBE_HOSTS:
+        try:
+            with socket.create_connection((host, port), timeout=_TILE_PROBE_TIMEOUT):
+                _online = True
+                break
+        except OSError:
+            continue
+    _tiles_online_cache = _online
+    log.info("Tile basemap probe: online=%s", _online)
+    return _online
 def _norm(s: str) -> str:
     """Lowercase + strip accents + collapse whitespace."""
     nfkd = unicodedata.normalize("NFKD", s)
@@ -533,6 +665,160 @@ def _normalise_size(series: pd.Series, lo: float, hi: float) -> pd.Series:
 
 
 
+# -- Colour classification --------------------------------------------------
+_BINARY_TEXT_SETS = [
+    {"yes", "no"}, {"y", "n"}, {"true", "false"}, {"t", "f"},
+    {"1", "0"}, {"pass", "fail"}, {"male", "female"},
+]
+
+
+def classify_colour_column(series: pd.Series) -> str:
+    """Classify a colour column into one of four encoding classes.
+
+    Returns
+    -------
+    "binary_numeric" : numeric column with <= 2 distinct values (e.g. 0/1)
+    "binary_text"    : boolean dtype, or strings forming a yes/no style pair
+    "categorical"    : non-numeric string column (discrete legend)
+    "continuous"     : numeric column with > 2 distinct values (coloraxis)
+    """
+    s = series.dropna()
+    if s.empty:
+        return "categorical"
+    if pd.api.types.is_bool_dtype(series):
+        return "binary_text"
+    if pd.api.types.is_numeric_dtype(series):
+        if s.nunique() <= 2:
+            return "binary_numeric"
+        return "continuous"
+    vals = {str(v).strip().lower() for v in pd.unique(s)}
+    if len(vals) <= 2 and any(vals == pair for pair in _BINARY_TEXT_SETS):
+        return "binary_text"
+    return "categorical"
+
+
+def _canonical_binary_label(v) -> str:
+    """Map yes/no / true/false style values onto canonical "Yes"/"No" labels."""
+    if pd.isna(v):
+        return "(unknown)"
+    t = str(v).strip().lower()
+    if t in ("yes", "y", "true", "t", "1"):
+        return "Yes"
+    if t in ("no", "n", "false", "f", "0"):
+        return "No"
+    return str(v)
+
+
+def _binary_colour_map(pal, invert=False, colour_class="binary_numeric"):
+    """Two flat colours for binary colour columns -- no scale, no variation.
+
+    Category "1" (or "Yes") gets the TOP colour of the palette range and "0"
+    (or "No") gets the BOTTOM colour, honouring the Invert toggle.
+    """
+    colors = list(reversed(pal)) if invert else list(pal)
+    bottom, top = colors[0], colors[-1]
+    if colour_class == "binary_text":
+        return {"No": bottom, "Yes": top}
+    return {"0": bottom, "1": top}
+
+
+def _format_colour_labels(plot_df: pd.DataFrame, color: str,
+                          colour_class: str) -> str:
+    """Convert a colour column IN-PLACE to its renderable form.
+
+    Binary and categorical columns become clean string categories so Plotly
+    always renders a DISCRETE legend with one entry per value.  Continuous
+    columns are left untouched so they KEEP the coloraxis encoding -- this is
+    the guard that stops a high-cardinality NUMERIC colour column (a measure
+    with thousands of distinct values) from being silently collapsed to a
+    single flat colour with no colour bar at all.
+    """
+    if colour_class == "binary_text":
+        _bt = plot_df[color].astype(object)
+        _bt = _bt.mask(
+            _bt.astype(str).str.strip().str.lower().isin({"nan", "none", "null", ""})
+        )
+        _bt = _bt.where(_bt.notna(), "(unknown)")
+        plot_df[color] = _bt.map(_canonical_binary_label).astype(str)
+    elif colour_class == "binary_numeric":
+        plot_df[color] = plot_df[color].map(
+            lambda v: "(unknown)" if pd.isna(v) else (
+                str(int(v)) if float(v).is_integer() else str(v))
+        ).astype(str)
+    elif colour_class == "categorical":
+        _s = plot_df[color].astype(object).where(plot_df[color].notna(), "(unknown)")
+        _s = _s.astype(str).str.strip()
+        # CSVs often carry literal nan-like strings ("NaN", "none", "", ...)
+        # -- treat them exactly like real NaN so they never leak into the
+        # legend / hover as a bogus category.
+        _nanlike = {"", "nan", "NaN", "NAN", "Nan", "none", "None", "null",
+                    "NULL", "Null", "<NA>"}
+        _s = _s.where(~_s.isin(_nanlike), "(unknown)")
+        plot_df[color] = _s
+    return colour_class
+
+
+def _density_aggregate(
+    df: pd.DataFrame,
+    lat: str,
+    lon: str,
+    n_cells: int = _DENSITY_CELLS,
+    extra_cols: Optional[list] = None,
+    agg_overrides: Optional[dict] = None,
+) -> pd.DataFrame:
+    """Bin ALL points into a spatial grid and aggregate counts per cell.
+
+    Uses the full dataset (no sampling) so no point is dropped and the spatial
+    density pattern stays accurate -- which is the whole point of a map plot,
+    since a sample silently removes locations and so misstates the analysis.
+    Returns a small DataFrame (~n_cells rows) with mean lat/lon per cell and a
+    ``_count`` column for colouring/sizing.  ``extra_cols`` (e.g. the location /
+    colour columns) are carried per cell using their most frequent value so
+    hover tooltips keep showing meaningful labels instead of an empty box.
+    ``agg_overrides`` maps a column to a pandas aggregation (e.g.
+    ``{"is_fraud": "max"}``) to replace the modal default -- used so binary
+    colour columns surface minority classes.
+    """
+    lat_min, lat_max = float(df[lat].min()), float(df[lat].max())
+    lon_min, lon_max = float(df[lon].min()), float(df[lon].max())
+
+    # Guard against degenerate (single-point) bounds.
+    if lat_max == lat_min:
+        lat_max = lat_min + 1e-6
+    if lon_max == lon_min:
+        lon_max = lon_min + 1e-6
+
+    # Aim for a roughly square grid: n_cells total, sqrt per axis.
+    side = max(int(round(n_cells ** 0.5)), 1)
+    lat_edges = np.linspace(lat_min, lat_max, side + 1)
+    lon_edges = np.linspace(lon_min, lon_max, side + 1)
+
+    lat_bin = np.clip(np.digitize(df[lat].values, lat_edges) - 1, 0, side - 1)
+    lon_bin = np.clip(np.digitize(df[lon].values, lon_edges) - 1, 0, side - 1)
+    cell_id = lat_bin * side + lon_bin
+
+    def _modal(s: pd.Series):
+        """Most frequent value in the cell (falls back to first)."""
+        if s.empty:
+            return None
+        m = s.mode()
+        return m.iat[0] if not m.empty else s.iloc[0]
+
+    data = {"cell": cell_id, lat: df[lat].values, lon: df[lon].values}
+    for c in (extra_cols or []):
+        if c and c in df.columns and c not in data and c != "cell":
+            data[c] = df[c].values
+    agg = pd.DataFrame(data)
+    agg_dict = {lat: (lat, "mean"), lon: (lon, "mean"), "_count": (lat, "size")}
+    for c in (extra_cols or []):
+        if c and c in df.columns and c not in agg_dict and c != "cell":
+            agg_dict[c] = (c, _modal)
+    for c, how in (agg_overrides or {}).items():
+        if c in agg_dict:
+            agg_dict[c] = (c, how)
+    return agg.groupby("cell", as_index=False).agg(**agg_dict)
+
+
 def _pal_to_continuous(colors, invert=False):
     c = list(reversed(colors)) if invert else list(colors)
     n = max(len(c) - 1, 1)
@@ -553,18 +839,33 @@ def run_map_plot(
     agg_func=None,
     invert_colorscale=False,
     palette=None,
-    map_style: str = "carto-positron",
+    map_style: str = _MAP_DEFAULT,
     marker_opacity: float = 0.82,
     marker_size_min: int = 4,
     marker_size_max: int = 22,
+    render_mode: str = RENDER_MODES[0],
+    show_borders: bool = True,
     choropleth_colorscale: str = "Blues",
     choropleth_projection: str = "natural earth",
     choropleth_scope: str = "world",
     choropleth_show_borders: bool = True,
+    hover_dims: Optional[list] = None,
+    hover_values: Optional[list] = None,
     roles=None,
     **kwargs,
 ):
-    """Unified map runner."""
+    """Unified map runner.
+
+    ``show_borders`` and ``render_mode`` are declared EXPLICITLY on purpose.
+    They used to arrive only as named arguments from the service and be
+    swallowed by ``**kwargs``, which made both controls dead in scatter mode
+    without any error -- the form looked connected and changed nothing.
+
+    ``hover_dims`` / ``hover_values`` are the extra tooltip fields the Generate
+    form offers ("Hover Dim 1/2", "Hover Value 1/2" + "Agg 1/2").  They are
+    declared here so the service can pass them by name; without that they would
+    land in ``**kwargs`` and the six controls would be inert.
+    """
     pal = palette or COLORS
 
 
@@ -578,6 +879,7 @@ def run_map_plot(
             show_borders=choropleth_show_borders,
             invert=invert_colorscale,
             pal=pal,
+            hover_dims=hover_dims, hover_values=hover_values,
         )
 
 
@@ -607,6 +909,7 @@ def run_map_plot(
                 show_borders=choropleth_show_borders,
                 invert=invert_colorscale,
                 pal=pal,
+                hover_dims=hover_dims, hover_values=hover_values,
             )
         return []
 
@@ -620,9 +923,76 @@ def run_map_plot(
         marker_opacity=marker_opacity,
         marker_size_min=marker_size_min,
         marker_size_max=marker_size_max,
+        render_mode=render_mode,
+        show_borders=show_borders,
+        hover_dims=hover_dims, hover_values=hover_values,
     )
 
 
+
+
+_HOVER_AGG_FUNCS = {
+    "sum": "sum", "mean": "mean", "median": "median",
+    "count": "count", "max": "max", "min": "min",
+}
+
+
+def _modal(s):
+    """Most frequent non-null value of a Series (for categorical hover dims)."""
+    if s is None or len(s) == 0:
+        return None
+    m = s.mode()
+    return m.iat[0] if not m.empty else s.iloc[0]
+
+
+def _hover_agg_extras(df, group_col, hover_dims, hover_values, skip_cols=()):
+    """Turn the form's hover selections into ``(src, agg_fn, display_name)``.
+
+    The old Generate panel offered six extra tooltip fields -- "Hover Dim 1/2"
+    plus "Hover Value 1/2" each with its own "Agg".  They were the only map
+    controls with no counterpart in this runner, so the panel could not offer them
+    and the six fields were simply missing.
+
+    Dims contribute the MODAL value per group (a location spans many rows, so one
+    representative label is what a tooltip should show); values contribute the
+    requested aggregation under an ``AGG(col)`` display name.  The same source
+    column may legitimately appear twice -- ``amount``/Sum and ``amount``/Mean --
+    which is why callers aggregate temporary copies (see
+    ``_add_hover_temp_cols``); a pandas agg dict cannot repeat a key.
+    """
+    triples, seen = [], set()
+    for c in (hover_dims or []):
+        if c and c in df.columns and c != group_col and c not in skip_cols \
+                and c not in seen:
+            seen.add(c)
+            triples.append((c, _modal, c))
+    for c, a in (hover_values or []):
+        if c and c in df.columns and c != group_col and c not in skip_cols:
+            disp = f"{str(a or 'sum').upper()}({c})"
+            if disp in seen:
+                continue
+            seen.add(disp)
+            triples.append((c, _HOVER_AGG_FUNCS.get(str(a or "sum").lower(), "sum"),
+                            disp))
+    return triples
+
+
+def _add_hover_temp_cols(frame, triples):
+    """Temp copies of each extra's source column, ready for a groupby agg.
+
+    Returns ``(agg_map, rename_map)``.  The temp columns let one source column be
+    aggregated several ways; they are renamed back to the tooltip display names
+    after the groupby so the tooltip reads ``SUM(amount)``, not ``__hx_1``.
+    """
+    agg_map, rename_map = {}, {}
+    for i, (src, fn, disp) in enumerate(triples):
+        if src not in frame.columns:
+            continue
+        tcol = f"__hx_{i}"
+        frame[tcol] = frame[src]
+        agg_map[tcol] = fn
+        rename_map[tcol] = disp
+    return agg_map, rename_map
 
 
 def _run_scatter_map(
@@ -630,10 +1000,20 @@ def _run_scatter_map(
     location_col, value_col, size_col, color_col,
     agg_func, invert_colorscale, pal,
     map_style, marker_opacity, marker_size_min, marker_size_max,
+    render_mode=None, show_borders=False,
+    hover_dims=None, hover_values=None,
 ):
+    hover_triples = _hover_agg_extras(
+        df, location_col, hover_dims, hover_values, skip_cols=(value_col,)
+    )
+    hover_srcs = list(dict.fromkeys(t[0] for t in hover_triples))
+
     needed = list({lat, lon})
     for c in (size_col, color_col, location_col, value_col):
         if c and c in df.columns:
+            needed.append(c)
+    for c in hover_srcs:
+        if c in df.columns:
             needed.append(c)
     clean_df = df[list(set(needed))].dropna(subset=[lat, lon]).copy()
     clean_df = clean_df[~((clean_df[lat] == 0) & (clean_df[lon] == 0))]
@@ -643,31 +1023,70 @@ def _run_scatter_map(
 
     agg_label = ""
     sampled   = False
+    densified = False
     loc_col   = location_col if location_col and location_col in clean_df.columns else None
     val_col   = value_col    if value_col    and value_col    in clean_df.columns else None
+
+    # Anything other than the explicit opt-in sample runs DENSITY, so the
+    # default path can never drop a location.  Sampling a map silently
+    # removes points and therefore misstates the spatial analysis, which is
+    # why it has to be a deliberate user choice rather than a silent fallback.
+    want_sample = str(render_mode or "").strip().lower().startswith("sample")
 
 
     if loc_col and val_col:
         agg = agg_func or "mean"
         agg_dict: dict = {lat: "first", lon: "first", val_col: agg}
-        if color_col and color_col in clean_df.columns:
+        # Colour rides along as the group's first value.  When the Colour and Value
+        # columns are the SAME column they collapse into a single aggregate, so
+        # note that and follow the renamed column below -- otherwise the rename
+        # deletes the colour column and the Colour control silently does
+        # nothing in the most common setup (colour by the measure itself).
+        colour_follows_value = bool(color_col) and color_col == val_col
+        if color_col and color_col in clean_df.columns and not colour_follows_value:
             agg_dict[color_col] = "first"
         if size_col and size_col in clean_df.columns and size_col != val_col:
             agg_dict[size_col] = agg
+        _hamap, _hren = _add_hover_temp_cols(clean_df, hover_triples)
+        agg_dict.update(_hamap)
         plot_df   = clean_df.groupby(loc_col, as_index=False).agg(agg_dict)
+        plot_df.rename(columns=_hren, inplace=True)
         agg_label = f" · {agg.upper()}({val_col})"
         if val_col in plot_df.columns:
             new_val_name = f"{agg}({val_col})"
             plot_df.rename(columns={val_col: new_val_name}, inplace=True)
             val_col = new_val_name
+            if colour_follows_value:
+                # The colour was the value column, so it now lives under the
+                # aggregate's name and keeps its continuous encoding.
+                color_col = new_val_name
+                size_col = new_val_name if not size_col else size_col
         if size_col and size_col in plot_df.columns and size_col != val_col:
             new_size_name = f"{agg}({size_col})"
             plot_df.rename(columns={size_col: new_size_name}, inplace=True)
             size_col = new_size_name
         elif not size_col and val_col in plot_df.columns:
             size_col = val_col
-    else:
+    elif want_sample:
         plot_df, sampled = sample_for_plot(clean_df, n=_MAP_SAMPLE)
+    else:
+        # Density: bin EVERY point into a spatial cell.  Colour/size default
+        # to the per-cell count so the aggregate is meaningful, and the
+        # original colour column rides along (modal value) for the legend.
+        # The hover extras ride along the same way so their fields are not lost
+        # when the default density render aggregates the points away.
+        _extra = [c for c in (color_col, loc_col) if c and c in clean_df.columns]
+        _extra += [c for c in hover_srcs
+                   if c and c in clean_df.columns and c not in _extra]
+        plot_df = _density_aggregate(clean_df, lat, lon,
+                                     extra_cols=_extra)
+        densified = True
+        if color_col and color_col not in plot_df.columns:
+            color_col = None
+        if size_col and size_col not in plot_df.columns:
+            size_col = "_count"
+        if color_col is None and size_col is None:
+            color_col = "_count"
 
 
     if plot_df.empty:
@@ -679,8 +1098,34 @@ def _run_scatter_map(
     hover = loc_col   if loc_col   and loc_col   in plot_df.columns else None
 
 
-    if color and plot_df[color].nunique() > 25:
-        color = None
+    # Colour encoding: classify FIRST, then drop only what is genuinely
+    # unroutable.  The old code did ``if plot_df[color].nunique() > 25: color =
+    # None`` UNCONDITIONALLY, which threw away any numeric measure with
+    # thousands of distinct values -- the exact common case -- leaving a
+    # single flat colour with no colour bar, which is the "colour bar not
+    # changing" report.  Only a CATEGORICAL column with an unusable number of
+    # categories is discarded now; continuous numerics keep their coloraxis.
+    colour_class = "categorical"
+    if color:
+        try:
+            colour_class = classify_colour_column(plot_df[color])
+        except Exception:
+            colour_class = "categorical"
+        if colour_class == "categorical":
+            n_cat = int(plot_df[color].nunique(dropna=True))
+            if n_cat > 25:
+                # Too many categories to legend legibly AND not a measure we
+                # could fall back to: drop the encoding rather than draw 800
+                # unreadable legend entries.
+                log.info("Scatter map: colour column has %d categories; "
+                         "dropping colour encoding.", n_cat)
+                color = None
+                colour_class = "categorical"
+        if color:
+            plot_df = plot_df.copy()
+            colour_class = _format_colour_labels(plot_df, color, colour_class)
+    else:
+        colour_class = "continuous"
 
 
     if size:
@@ -723,13 +1168,36 @@ def _run_scatter_map(
     hover_data[lat] = False
     hover_data[lon] = False
 
+    # The six extra tooltip fields the Generate form offers.  Their display
+    # names survive on the grouped paths (``SUM(amount)``); the ungrouped /
+    # density paths keep the raw source column name, so both are accepted.
+    # This runs AFTER the hide-everything loop above, which would otherwise
+    # reset each of these entries straight back to False.
+    hover_extra_cols: list = []
+    for src, _fn, disp in hover_triples:
+        for cand in (disp, src):
+            if cand in plot_df.columns and cand not in hover_extra_cols:
+                hover_extra_cols.append(cand)
+                break
+    for col in hover_extra_cols:
+        hover_data[col] = True
+
 
     n_pts     = len(plot_df)
     loc_label = hover or "Locations"
-    sample_str = f" ({n_pts:,} sample of {len(clean_df):,})" if sampled else f" ({n_pts:,} locations)"
-    title     = f"Map: {loc_label}{agg_label}{sample_str}"
+    if sampled:
+        detail = f" ({n_pts:,} sample of {len(clean_df):,})"
+    elif densified:
+        # Say plainly that this is an aggregate of ALL rows -- the user needs to
+        # know markers are cells, and that nothing was dropped.
+        detail = f" ({len(clean_df):,} points in {n_pts:,} cells)"
+    else:
+        detail = f" ({n_pts:,} locations)"
+    title = f"Map: {loc_label}{agg_label}{detail}"
 
 
+    # After _format_colour_labels a binary/categorical column is text, so this
+    # is exactly the continuous case and drives the colour-bar decision.
     color_is_numeric = (
         color is not None and color in plot_df.columns
         and pd.api.types.is_numeric_dtype(plot_df[color])
@@ -750,22 +1218,82 @@ def _run_scatter_map(
         map_kwargs["color"] = color
         if color_is_numeric:
             map_kwargs["color_continuous_scale"] = _pal_to_continuous(pal, invert=invert_colorscale)
+        elif colour_class in ("binary_numeric", "binary_text"):
+            # Binary: exactly two flat palette endpoint colours -- no colour
+            # scale, no variation.
+            map_kwargs["color_discrete_map"] = _binary_colour_map(
+                pal, invert=invert_colorscale, colour_class=colour_class)
         else:
             map_kwargs["color_discrete_sequence"] = list(reversed(pal)) if invert_colorscale else pal
     if size and size in plot_df.columns:
         map_kwargs["size"] = size
 
 
+    # Basemap.  ``_normalize_map_style`` guarantees the value is one of our own
+    # three names, so an unknown/legacy style can never reach MapLibre and blank
+    # the canvas.
+    #
+    # Two routes, chosen per basemap by ``_MAP_STYLE_SPECS``:
+    #   * "style" -> a VECTOR style from the bundled plotly.js MapLibre registry
+    #     (carto-positron / carto-darkmatter).  Sharp at any zoom, which is what
+    #     fixes the "very blurry" report; see the note above ``_MAP_STYLE_SPECS``.
+    #   * "tiles" -> ``white-bg`` + an explicit RASTER layer (satellite only: no
+    #     free key-less vector imagery exists).
+    # ``plotly_map_style`` is the value handed to plotly; ``_layers`` is only
+    # populated for the raster route so a vector style is not painted over.
+    style = _normalize_map_style(map_style)
+    _spec = _MAP_STYLE_SPECS.get(style) or _MAP_STYLE_SPECS[_MAP_DEFAULT]
+    plotly_map_style = _spec.get("style") or "white-bg"
+    _layers = []
+    if "tiles" in _spec:
+        _layers.append({"sourcetype": "raster", "source": list(_spec["tiles"]),
+                        "below": "traces"})
+    # Raster borders overlay -- SATELLITE (raster) basemaps ONLY.
+    #
+    # On a vector basemap (Light/Dark) the CARTO style already draws its own
+    # administrative boundaries AND its place labels as vectors, so the Esri
+    # reference layer there added a 256px raster of the SAME labels on top of
+    # the sharp ones: soft, slightly offset duplicate text on HiDPI -- the
+    # "map looks low quality / blurry" report. Plotly hardcodes tileSize 256
+    # for layers (see the note at the top of this file), so a raster overlay
+    # can never be sharp next to a vector base; skipping it on vector styles
+    # is the only way to keep the basemap crisp.
+    #
+    # On the Satellite basemap the imagery has no borders or labels at all,
+    # so the overlay is the ONLY thing drawing them and the Borders checkbox
+    # stays a real control there.
+    if show_borders and _MAP_BORDERS_OVERLAY and "tiles" in _spec:
+        _layers.append({"sourcetype": "raster",
+                        "source": list(_MAP_BORDERS_OVERLAY),
+                        "below": "traces"})
+
+
     try:
         try:
-            fig = px.scatter_map(plot_df, **map_kwargs, map_style=map_style)
-            fig.update_layout(map=dict(style=map_style))
+            fig = px.scatter_map(plot_df, **map_kwargs,
+                                 map_style=plotly_map_style)
+            fig.update_layout(map=dict(style=plotly_map_style))
         except AttributeError:
-            fig = px.scatter_mapbox(plot_df, **map_kwargs, mapbox_style=map_style)
+            fig = px.scatter_mapbox(plot_df, **map_kwargs,
+                                    mapbox_style=plotly_map_style)
     except Exception as e:
         import traceback
         print(f"[Lytrize] scatter map error: {e}\n{traceback.format_exc()}")
         return []
+
+
+    # Raster basemap (+ optional borders overlay) and the data extent.  Both
+    # live on the subplot, so this is written under whichever key the plotly
+    # build actually used rather than assuming ``map``.
+    try:
+        _sub = fig.layout.map if hasattr(fig.layout, "map") else fig.layout.mapbox
+        _sub.layers = _layers
+        _sub.bounds = dict(
+            west=float(plot_df[lon].min()), east=float(plot_df[lon].max()),
+            south=float(plot_df[lat].min()), north=float(plot_df[lat].max()),
+        )
+    except Exception:
+        pass
 
 
     if color_is_numeric:
@@ -795,18 +1323,19 @@ def _run_scatter_map(
     )
 
 
-    # A scattermap marker carries no ``line`` (only opacity/size/color/symbol)
-    # and ``layout.map`` -- the basemap subplot px.scatter_map draws on --
-    # exposes no showcountries/showland either, so unlike the choropleth and
-    # scatter-geo paths there is genuinely NOTHING on this trace for a "Borders"
-    # box to switch. The old Streamlit app only ever forwarded ``show_borders``
-    # to the choropleth branch too; this mode simply has no such control, and
-    # pretending otherwise would mean silently dropping the user's choice.
-
+    # "Borders" on the raster (Satellite) path is honoured by the extra raster
+    # overlay layer added above (see _MAP_BORDERS_OVERLAY): the base imagery
+    # has no borders or place labels of its own, so the toggle overlays a
+    # translucent boundaries+labels reference layer to draw them, and omits it
+    # to remove them. On the VECTOR basemaps (Light/Dark) the CARTO style
+    # already carries its own sharp boundaries and labels, so no overlay is
+    # added there -- an extra raster on top would only soften them (which is
+    # exactly what the "blurry map" report was).
 
     if sampled:
         fig.add_annotation(
-            text=f"⚠ {n_pts:,}-point sample — zoom in for detail",
+            text=f"⚠ Showing a {n_pts:,}-point sample of {len(clean_df):,} — "
+                 f"zoom in for detail, or switch Render to \"Density (all points)\"",
             xref="paper", yref="paper", x=0.5, y=0.0,
             showarrow=False, xanchor="center", yanchor="bottom",
             font=dict(size=10, color="#f59e0b"),
@@ -817,6 +1346,8 @@ def _run_scatter_map(
         "analysis_type": "map_plot",
         "x_axis": None, "y_axis": None,
         "legend": color,
+        "colour_encoding": colour_class,
+        "sampled": sampled,
         "supports_notes": True,
         "supports_axis_editing": False,
         "supports_legend_editing": True,
@@ -829,29 +1360,44 @@ def _run_scatter_map(
 def _run_choropleth(
     df, geo_col, value_col, color_col, agg_func,
     colorscale, projection, scope, show_borders, invert, pal,
+    hover_dims=None, hover_values=None,
 ):
+    hover_triples = _hover_agg_extras(
+        df, geo_col, hover_dims, hover_values, skip_cols=(value_col,)
+    )
+    hover_srcs = [c for c in dict.fromkeys(t[0] for t in hover_triples)
+                  if c in df.columns]
+
     if not value_col or value_col not in df.columns:
-        plot_df = df[[geo_col]].copy().dropna()
+        plot_df = df[[geo_col] + hover_srcs].copy().dropna(subset=[geo_col])
         plot_df["_count"] = 1
-        plot_df = plot_df.groupby(geo_col, as_index=False)["_count"].sum()
+        agg_map = {"_count": "sum"}
+        _hamap, _hren = _add_hover_temp_cols(plot_df, hover_triples)
+        agg_map.update(_hamap)
+        plot_df = plot_df.groupby(geo_col, as_index=False).agg(agg_map)
+        plot_df.rename(columns=_hren, inplace=True)
         value_col = "_count"
         agg_label = "COUNT"
     else:
-        needed = [geo_col, value_col]
+        needed = list(dict.fromkeys([geo_col, value_col] + hover_srcs))
         plot_df = df[needed].dropna(subset=[geo_col, value_col]).copy()
         agg = agg_func or "sum"
         agg_label = agg.upper()
         if pd.api.types.is_numeric_dtype(plot_df[value_col]):
             agg_funcs = {"sum": "sum", "mean": "mean", "median": "median",
                          "count": "count", "max": "max", "min": "min"}
-            plot_df = plot_df.groupby(geo_col, as_index=False).agg(
-                {value_col: agg_funcs.get(agg, "sum")}
-            )
+            _agg_map = {value_col: agg_funcs.get(agg, "sum")}
         else:
-            plot_df = plot_df.groupby(geo_col, as_index=False).agg(
-                {value_col: "count"}
-            )
+            _agg_map = {value_col: "count"}
             agg_label = "COUNT"
+        _hamap, _hren = _add_hover_temp_cols(plot_df, hover_triples)
+        _agg_map.update(_hamap)
+        plot_df = plot_df.groupby(geo_col, as_index=False).agg(_agg_map)
+        plot_df.rename(columns=_hren, inplace=True)
+
+    # Display names of the extras that actually made it into the plotted frame.
+    hover_extra_cols = [disp for _, _, disp in hover_triples
+                        if disp in plot_df.columns]
 
 
     if plot_df.empty:
@@ -874,6 +1420,7 @@ def _run_choropleth(
                 name_col="_region_name",
                 colorscale=colorscale, invert=invert,
                 show_borders=show_borders, projection=projection, scope=scope,
+                hover_extra_cols=hover_extra_cols,
             )
 
 
@@ -887,6 +1434,7 @@ def _run_choropleth(
                 name_col="_city_name",
                 colorscale=colorscale, invert=invert,
                 show_borders=show_borders, projection=projection, scope=scope,
+                hover_extra_cols=hover_extra_cols,
             )
 
 
@@ -943,7 +1491,12 @@ def _run_choropleth(
             locationmode=locationmode,
             color=value_col,
             hover_name=geo_col,
-            hover_data={value_col: True, "_iso_code": False},
+            hover_data={value_col: True, "_iso_code": False,
+                       **{c: True for c in hover_extra_cols
+                          if c in plot_df.columns},
+                       **{c: False for c in plot_df.columns
+                          if c not in (geo_col, value_col, "_iso_code")
+                          and c not in hover_extra_cols}},
             color_continuous_scale=_cs,
             projection=projection if geo_type != "us_states" else "albers usa",
             scope=scope,
@@ -1002,8 +1555,15 @@ def _render_scatter_geo(
     plot_df, geo_col, value_col, agg_label,
     lat_col, lon_col, coord_df, name_col,
     colorscale, invert, show_borders, projection, scope,
+    hover_extra_cols=None,
 ):
     """Render a scatter_geo for world regions / cities where Plotly choropleth"""
+    _geo_hover = {value_col: True, lat_col: False, lon_col: False,
+                  name_col: False}
+    for _c in (hover_extra_cols or []):
+        if _c in plot_df.columns:
+            _geo_hover[_c] = True
+
     merged = pd.concat(
         [plot_df.reset_index(drop=True), coord_df.reset_index(drop=True)], axis=1
     ).dropna(subset=[lat_col, lon_col])
@@ -1030,8 +1590,7 @@ def _render_scatter_geo(
             size=value_col,
             color=value_col,
             hover_name=geo_col,
-            hover_data={value_col: True, lat_col: False, lon_col: False,
-                        name_col: False},
+            hover_data=_geo_hover,
             color_continuous_scale=_cs,
             projection=projection,
             title=title,

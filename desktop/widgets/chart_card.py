@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from PySide6.QtCore import Qt, Signal, QPoint
+from PySide6.QtCore import Qt, Signal, QPoint, QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QTextEdit, QFrame, QSizePolicy, QDialog, QDialogButtonBox,
@@ -40,6 +40,7 @@ class ChartCard(QFrame):
 
     delete_requested = Signal(str)      # uid
     edit_requested = Signal(str)        # uid
+    slicer_requested = Signal(str)      # uid -- add a slicer scoped to this chart
     move_up_requested = Signal(str)     # uid
     move_down_requested = Signal(str)   # uid
     note_changed = Signal(str, str)     # uid, note_text
@@ -75,6 +76,14 @@ class ChartCard(QFrame):
         self._chart_type = chart_type
         self._meta = meta or {}
         self._style = dict(self._meta.get("display_options", {}))
+        # Style ticks (slider drags) stream in as a flood, and each apply is
+        # a full Plotly re-push. Coalesce them: the LAST style wins ~150ms
+        # after the user pauses, instead of stalling the UI per tick.
+        self._style_debounce = QTimer(self)
+        self._style_debounce.setSingleShot(True)
+        self._style_debounce.setInterval(150)
+        self._style_debounce.timeout.connect(self._flush_style)
+        self._pending_style = None
 
         self.setObjectName("chart_card")
         # No title label on the card, so the full (often long, elided in
@@ -130,6 +139,18 @@ class ChartCard(QFrame):
         self.btn_edit.setProperty("kind", "icon")
         self.btn_edit.clicked.connect(lambda: self.edit_requested.emit(self.uid))
         header.addWidget(self.btn_edit)
+
+        # Per-chart slicer entry point: opens the same slicer form the
+        # dashboard uses, born on "One chart" with this chart pre-picked.
+        # Lives on the card because that is where the user is when they think
+        # "filter THIS chart" -- the dashboard's left panel is a different page.
+        self.btn_slicer = QPushButton("⊞")
+        self.btn_slicer.setFixedSize(28, 28)
+        self.btn_slicer.setToolTip("Add a slicer for this chart")
+        self.btn_slicer.setProperty("kind", "icon")
+        self.btn_slicer.clicked.connect(
+            lambda: self.slicer_requested.emit(self.uid))
+        header.addWidget(self.btn_slicer)
 
         self.btn_style = QPushButton("🎨")
         self.btn_style.setFixedSize(28, 28)
@@ -288,7 +309,8 @@ class ChartCard(QFrame):
         that were added to the old `header` layout.
         """
         for btn in (self.btn_fullwidth, self.btn_up, self.btn_down,
-                    self.btn_edit, self.btn_style, self.btn_delete):
+                    self.btn_edit, self.btn_slicer, self.btn_style,
+                    self.btn_delete):
             # Re-adding a widget to another layout removes it from the first,
             # so the old `header` layout is left empty and collapses to 0.
             hb.addWidget(btn)
@@ -404,6 +426,32 @@ class ChartCard(QFrame):
         dialog.exec()
 
     def _on_style_changed(self, style: dict) -> None:
+        """Queue a style change; the heavy re-push happens on pause.
+
+        Slider drags emit a flood of ticks and each apply is a full Plotly
+        re-render, which was the "chart style dialog freezes the app" report.
+        The LAST style wins ~150ms after the user pauses. Tests that need a
+        deterministic apply call flush_style() directly -- it is idempotent.
+        """
+        self._pending_style = dict(style)
+        self._style_debounce.start()
+
+    def flush_style(self) -> None:
+        """Apply the queued style immediately (no-op when nothing queued)."""
+        style = self._pending_style
+        self._pending_style = None
+        try:
+            self._style_debounce.stop()
+        except Exception:
+            pass
+        if style is None:
+            return
+        self._apply_style_now(style)
+
+    def _flush_style(self) -> None:
+        self.flush_style()
+
+    def _apply_style_now(self, style: dict) -> None:
         """Live-apply a style change: re-derive from the ORIGINAL figure
         (self._base_fig), never from self._fig, so toggling a control on
         then off always gives a clean result instead of compounding on

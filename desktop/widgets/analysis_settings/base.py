@@ -306,6 +306,7 @@ class FlowGrid(QWidget):
         self._min_col = int(min_col)
         self._gap = int(gap)
         self._items = []
+        self._hidden = set()
         self._lines = []
         self._cols = 0
         outer = QVBoxLayout(self)
@@ -336,6 +337,31 @@ class FlowGrid(QWidget):
         self._relayout(force=True)
         return widget
 
+    def set_section_hidden(self, widget, hidden):
+        """Show or hide one section box and re-flow the survivors.
+
+        A hidden box must leave the LINE MATHS as well as the screen: the
+        re-flow divides the visible boxes into equal-width slots per line, so a
+        box that merely had ``setVisible(False)`` would still be counted and
+        every surviving section on its line would keep a hole where it was.
+        This is what lets the map form show only the fields the selected mode
+        actually reads without the remaining rows packing unevenly.
+        """
+        was = widget in self._hidden
+        now = bool(hidden)
+        if was == now:
+            return
+        if now:
+            self._hidden.add(widget)
+        else:
+            self._hidden.discard(widget)
+        widget.setVisible(not now)
+        self._relayout(force=True)
+
+    def visible_sections(self):
+        """The boxes currently shown, in slot order (what the maths uses)."""
+        return tuple(w for w in self._items if w not in self._hidden)
+
     def columns(self):
         """Columns per line at the last re-flow (0 before the first one)."""
         return self._cols
@@ -349,7 +375,9 @@ class FlowGrid(QWidget):
 
     # -- Layout ------------------------------------------------------------
     def _col_count(self):
-        n = len(self._items)
+        # Only VISIBLE sections count: a hidden box takes no slot on screen, so
+        # counting it would leave a hole at the end of every line it touched.
+        n = len(self.visible_sections())
         if n <= 0:
             return 1
         avail = self.width() if self.isVisible() else 0
@@ -383,8 +411,17 @@ class FlowGrid(QWidget):
         return self._lines[index]
 
     def _relayout(self, force=False):
-        n = len(self._items)
+        # The re-flow maths runs over the VISIBLE boxes; hidden ones stay
+        # registered in ``_items`` (so showing one again restores its slot in
+        # the original order) but are simply not placed.
+        items = self.visible_sections()
+        n = len(items)
         if n <= 0:
+            # Everything hidden: drop the lines rather than leaving the last
+            # layout's boxes stranded on screen.
+            for _row, lay in self._lines:
+                while lay.count():
+                    lay.takeAt(0)
             return
         cols = self._col_count()
         rows = (n + cols - 1) // cols
@@ -399,7 +436,7 @@ class FlowGrid(QWidget):
                 lay.takeAt(0)
         for line in range(rows):
             _row, lay = self._ensure_line(line)
-            in_line = self._items[line * cols:(line + 1) * cols]
+            in_line = items[line * cols:(line + 1) * cols]
             for w in in_line:
                 lay.addWidget(w, 1)
             # Pad the last line with the slots it does not use, so its

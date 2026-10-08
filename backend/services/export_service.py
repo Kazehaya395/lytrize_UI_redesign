@@ -93,9 +93,31 @@ EXPORT_DEFAULTS = {
     "ex_density": "Comfortable", "ex_radius": 12, "ex_chart_h": 400,
     "ex_width": "Auto", "ex_meta": True,
     "ex_kpi_text_color": "#f5f7ff", "ex_kpi_val_size": 26,
+    # KPI customisation. ``ex_kpi_val_color`` empty means "use the accent",
+    # which is what every report looked like before these existed.
+    "ex_kpi_val_color": "", "ex_kpi_label_size": 12,
+    "ex_kpi_label_upper": True,
+    # Slicer theming (note 3: a slicer has its own design section). Empty
+    # means "inherit the KPI chrome", which is what every slicer looked like
+    # before these existed -- so a report without slicer colours is unchanged.
+    "ex_slicer_bg": "", "ex_slicer_bd": "", "ex_slicer_text": "",
+    "ex_slicer_accent": "",
+    # Background image. The picker stores a DATA URI here (see
+    # ``desktop.pages.dashboard_page._image_to_data_uri``) rather than a path,
+    # so the saved HTML is self-contained and the same document renders on a
+    # machine that has never seen the file the user chose.
+    "ex_bg_image": "", "ex_bg_image_opacity": 35, "ex_bg_blend": "normal",
+    # Per-CARD background image, same data-URI contract as ``ex_bg_image``:
+    # the picker embeds the file so the exported HTML carries the picture
+    # rather than a path to it. ``ex_card_image_groups`` is the comma-separated
+    # list of card kinds it applies to -- "charts", "kpi", "title" -- so one
+    # picture can go behind only the charts, or only the KPI strip, instead of
+    # every card at once.
+    "ex_card_image": "", "ex_card_image_opacity": 35, "ex_card_blend": "normal",
+    "ex_card_image_groups": "charts,kpi,title",
     "ex_title_font": "Inter", "ex_title_style": "Normal",
     "ex_title_size": 28, "ex_title_color": "#6163df",
-    "ex_notes_font": "Inter", "ex_notes_style": "Normal",
+    "ex_notes_font": "Inter", "ex_notes_style": "Italic",
     "ex_notes_size": 14, "ex_notes_color": "#f5f7ff",
 }
 
@@ -263,6 +285,20 @@ def build_export_theme(state: dict) -> dict:
         "show_meta":      g("ex_meta"),
         "kpi_text_color": g("ex_kpi_text_color"),
         "kpi_val_size":   g("ex_kpi_val_size"),
+        "kpi_val_color":  g("ex_kpi_val_color"),
+        "kpi_label_size": g("ex_kpi_label_size"),
+        "kpi_label_upper": g("ex_kpi_label_upper"),
+        "slicer_bg":      g("ex_slicer_bg"),
+        "slicer_bd":      g("ex_slicer_bd"),
+        "slicer_text":    g("ex_slicer_text"),
+        "slicer_accent":  g("ex_slicer_accent"),
+        "bg_image":       g("ex_bg_image"),
+        "bg_image_opacity": g("ex_bg_image_opacity"),
+        "bg_blend":       g("ex_bg_blend"),
+        "card_image":       g("ex_card_image"),
+        "card_image_opacity": g("ex_card_image_opacity"),
+        "card_blend":       g("ex_card_blend"),
+        "card_image_groups": g("ex_card_image_groups"),
         "title_font":     g("ex_title_font"),
         "title_style":    g("ex_title_style"),
         "title_size":     g("ex_title_size"),
@@ -284,6 +320,16 @@ def build_export_report(
     dashboard_title: str = "",
     grid_cols_n: int = 2,
     tile_geometry: Optional[dict] = None,
+    kpi_geometry: Optional[dict] = None,
+    slicers: Optional[list] = None,
+    slicer_geometry: Optional[dict] = None,
+    slicer_values: Optional[dict] = None,
+    geometry_mode: str = "free",
+    inline_plotly: bool = True,
+    extra_css: str = "",
+    editor: bool = False,
+    report_specs: Optional[dict] = None,
+    report_payload: Optional[dict] = None,
 ) -> tuple[str, str]:
     """Generate an export-ready HTML report and a safe file name.
 
@@ -304,9 +350,49 @@ def build_export_report(
     grid_cols_n : int
         Number of grid columns.
     tile_geometry : dict, optional
-        Free-form dashboard arrangement, ``{uid: {x, y, w, h}}`` in grid units,
-        as held by the live tiling canvas. Pass it so the exported HTML
-        reproduces the board the user arranged.
+        Free-form dashboard arrangement, ``{uid: {x, y, w, h}}`` with ``x``/``w``
+        as fractions of the canvas width and ``y``/``h`` in pixels, as held by
+        the live canvas. Pass it so the exported HTML reproduces the board the
+        user arranged.
+    kpi_geometry : dict, optional
+        The same, for the KPI cards: ``{index: {x, y, w, h}}``.
+    slicers : list, optional
+        Slicer definitions (see ``services.slicer_service``). Rendered as
+        cards on the board exactly like KPIs.
+    slicer_geometry : dict, optional
+        Placement for those cards, keyed by BARE index (``{"0": {...}}``) --
+        the same spelling ``kpi_geometry`` uses. ``generate_html_report``
+        namespaces them internally as it merges them into the board's map, so
+        handing it ``"slicer:0"`` here would make both of its lookups miss and
+        the stored placement would be silently discarded.
+    slicer_values : dict, optional
+        ``{index: [values]}`` -- the candidate values each list/dropdown slicer
+        offers. Computed by the caller from the dataset rather than here: the
+        export path is deliberately headless and receives no DataFrame.
+    geometry_mode : str
+        ``"free"`` (default) for the absolutely-positioned canvas the app edits
+        in; ``"grid"`` for the older cell-based placement, used only to render a
+        session saved before the free canvas existed.
+    inline_plotly : bool
+        Embed the plotly bundle in the file (default, so the saved report is
+        standalone) or emit a ``<script src="lytrize_plotly.js">`` reference.
+        The live in-app canvas passes ``False`` and writes the shared bundle
+        itself -- re-embedding ~4.5 MB on every settings tweak is not viable.
+    extra_css : str
+        Extra CSS injected before ``</style>``. The canvas uses it to offer the
+        app's bundled fonts to Chromium, which cannot see Qt's font database.
+    editor : bool
+        Append the in-app drag/resize/notes overlay. Off for the saved file.
+    report_specs : dict, optional
+        ``{uid: spec}`` from ``modules.chartspec.chart_spec`` -- one JSON spec
+        per chart, so the in-browser engine knows each chart's columns and
+        aggregation. When omitted and the chart tuples carry meta (6-tuples),
+        ``generate_html_report`` derives them itself.
+    report_payload : dict, optional
+        The column-pruned dataset from ``modules.report_data.build_report_payload``,
+        emitted as ``window.LYTRIZE_DATA`` alongside the slicers. A payload over
+        ``report_data.MAX_INLINE_BYTES`` is dropped here rather than embedded:
+        the file still opens and reads, it just does not re-aggregate.
 
     Returns
     -------
@@ -317,6 +403,18 @@ def build_export_report(
 
     export_theme = build_export_theme(state)
 
+    if report_payload is not None:
+        try:
+            from modules.report_data import MAX_INLINE_BYTES, payload_json_size
+            size = payload_json_size(report_payload)
+            if size > MAX_INLINE_BYTES:
+                log.warning(
+                    "export payload %d bytes > MAX_INLINE_BYTES %d; "
+                    "static export without live slicers", size, MAX_INLINE_BYTES)
+                report_payload = None
+        except Exception:
+            log.debug("payload size check failed", exc_info=True)
+
     html = generate_html_report(
         charts, session_name,
         orientation=orientation,
@@ -325,5 +423,15 @@ def build_export_report(
         grid_cols_n=grid_cols_n,
         theme=export_theme,
         tile_geometry=tile_geometry,
+        kpi_geometry=kpi_geometry,
+        slicers=slicers,
+        slicer_geometry=slicer_geometry,
+        slicer_values=slicer_values,
+        geometry_mode=geometry_mode,
+        inline_plotly=inline_plotly,
+        extra_css=extra_css,
+        editor=editor,
+        report_specs=report_specs,
+        report_payload=report_payload,
     )
     return html, safe_file

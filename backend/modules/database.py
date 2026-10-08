@@ -272,6 +272,27 @@ def init_db() -> None:
         )""")
 
 
+        # Datasets that actually reached the analysis stage, keyed by identity.
+        # This is deliberately NOT derived from `sessions`: a session row only
+        # exists once the user manually saves from the dashboard, so counting
+        # those would mean "analysed" silently meant "analysed AND saved".
+        # file_signature is "<name>:<size>" so that re-uploading an updated
+        # version of the same-named file (different size) counts again, while
+        # re-analysing the identical file does not.
+        c.execute("""CREATE TABLE IF NOT EXISTS analysed_datasets (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id        INTEGER NOT NULL,
+            file_name      TEXT NOT NULL,
+            file_signature TEXT NOT NULL,
+            rows_count     INTEGER,
+            cols_count     INTEGER,
+            analysed_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, file_signature),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )""")
+        c.execute("""CREATE INDEX IF NOT EXISTS idx_analysed_user
+                     ON analysed_datasets(user_id)""")
+
         c.execute("""CREATE TABLE IF NOT EXISTS user_activity (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id       INTEGER NOT NULL,
@@ -373,6 +394,31 @@ def init_db() -> None:
                 )
         except Exception:
             log.exception("init_db: failed to backfill session UUIDs")
+
+
+        # One-time backfill for installs upgrading from the version that
+        # derived "Datasets Analyzed" from saved sessions. Those users have no
+        # rows in analysed_datasets yet, so their counter would otherwise drop
+        # to 0 on upgrade. Seed from sessions -- the only history available --
+        # and only while the table is globally empty so it never re-runs or
+        # double-counts. The signature is synthesized from name + shape because
+        # sessions never stored the original file size; that is good enough for
+        # a one-time seed, and genuinely new uploads still record the real one.
+        try:
+            c.execute("SELECT COUNT(*) FROM analysed_datasets")
+            if c.fetchone()[0] == 0:
+                c.execute(
+                    "INSERT OR IGNORE INTO analysed_datasets "
+                    "(user_id, file_name, file_signature, rows_count, cols_count) "
+                    "SELECT user_id, file_name, "
+                    "       file_name || ':' || COALESCE(rows_count, 0) "
+                    "                     || 'x' || COALESCE(cols_count, 0), "
+                    "       rows_count, cols_count "
+                    "FROM sessions "
+                    "WHERE file_name IS NOT NULL AND file_name != ''"
+                )
+        except Exception:
+            log.exception("init_db: failed to backfill analysed_datasets")
 
 
         try:
@@ -526,6 +572,36 @@ def merge_user_data(source_user_id: int, target_user_id: int) -> None:
                     f"UPDATE {table} SET user_id=? WHERE user_id=?",
                     (target_user_id, source_user_id),
                 )
+
+            # analysed_datasets has UNIQUE(user_id, file_signature), so a plain
+            # UPDATE would abort the whole merge if both accounts already saw
+            # the same file (easy to hit: analyse on the guest account, sign
+            # in, analyse again). Drop the guest-side duplicates first so the
+            # count stays a distinct-dataset count rather than being inflated
+            # by the collision; the target's row is kept, so it keeps the
+            # earliest analysed_at of the two.
+            cur.execute("SAVEPOINT analysed_merge")
+            try:
+                cur.execute(
+                    "SELECT file_signature FROM analysed_datasets WHERE user_id=?",
+                    (target_user_id,),
+                )
+                already = {row[0] for row in cur.fetchall()}
+                if already:
+                    placeholders = ",".join("?" * len(already))
+                    cur.execute(
+                        "DELETE FROM analysed_datasets WHERE user_id=? AND "
+                        f"file_signature IN ({placeholders})",
+                        (source_user_id, *already),
+                    )
+                cur.execute(
+                    "UPDATE analysed_datasets SET user_id=? WHERE user_id=?",
+                    (target_user_id, source_user_id),
+                )
+                cur.execute("RELEASE SAVEPOINT analysed_merge")
+            except Exception:
+                cur.execute("ROLLBACK TO SAVEPOINT analysed_merge")
+                raise
 
 
             cur.execute("SAVEPOINT draft_merge")
@@ -836,16 +912,89 @@ def update_session_db(
 
 
 
+def count_datasets_analysed(user_id: int) -> int:
+    """Number of distinct datasets that reached the analysis stage.
+
+    Counted from ``analysed_datasets``, not from saved sessions, so a dataset
+    that was analysed but never saved still counts.
+    """
+    if user_id is None:
+        return 0
+    conn = _connect()
+    try:
+        c = conn.cursor()
+        c.execute(_ph("SELECT COUNT(*) FROM analysed_datasets WHERE user_id=?"),
+                  (user_id,))
+        return int(c.fetchone()[0] or 0)
+    except Exception as e:
+        log.warning("count_datasets_analysed: %s", e)
+        return 0
+    finally:
+        conn.close()
+
+
+def record_dataset_analysed(user_id, file_name: str, file_signature: str,
+                            rows: int = 0, cols: int = 0) -> bool:
+    """Record that a dataset reached the analysis stage.
+
+    Idempotent on ``(user_id, file_signature)`` where the signature is
+    ``"<name>:<size>"``. Re-analysing the same file therefore does not
+    increment the count, while re-uploading the same-named file at a different
+    size (an updated csv/xlsx) does -- which is exactly the "same name, new
+    data" case.
+
+    Returns True when a new row was inserted (i.e. the count went up).
+    """
+    if user_id is None or not file_signature:
+        return False
+    conn = _connect()
+    try:
+        c = conn.cursor()
+        c.execute(
+            _ph("INSERT OR IGNORE INTO analysed_datasets "
+                "(user_id, file_name, file_signature, rows_count, cols_count) "
+                "VALUES (?,?,?,?,?)"),
+            (user_id, str(file_name or ""), str(file_signature),
+             int(rows or 0), int(cols or 0)),
+        )
+        inserted = c.rowcount > 0
+        conn.commit()
+        if inserted:
+            # get_user_stats is TTL-cached for 30s; without this the Home card
+            # would keep showing the old number after the user analyses a new
+            # dataset, which is precisely when they are most likely to look.
+            try:
+                get_user_stats.clear()
+            except Exception:
+                pass
+        return inserted
+    except Exception as e:
+        log.warning("record_dataset_analysed: %s", e)
+        return False
+    finally:
+        conn.close()
+
+
+# NOTE: this decorator belongs to get_user_stats. It is easy to detach by
+# accident when inserting a new function directly above the def -- a function
+# inserted between a decorator and its def silently inherits the decorator
+# (and the original silently loses it), which is exactly what happened here.
 @_ttl_cache(ttl_seconds=30)
-def get_user_stats(user_id: int) -> dict:
+def get_user_stats(user_id: int, analyses_available: int = 0) -> dict:
     """Return summary counts for the Home page stat cards.
 
     - sessions: true total (not capped at 20 like get_user_sessions)
-    - datasets: distinct source filenames across all sessions
-    - analyses: total chart count across all sessions, derived from
-      charts_json's array length rather than get_session_charts() (which
-      fully deserializes every Plotly figure via pio.from_json -- far
-      more expensive than needed just to count them).
+    - datasets: distinct datasets that reached the analysis stage, from
+      analysed_datasets. This used to be COUNT(DISTINCT file_name) over
+      sessions, which was wrong twice over: it only counted datasets the
+      user happened to SAVE (session rows are only written by the manual
+      Save Session action), and it keyed on the filename alone, so
+      re-uploading an updated file of the same name was invisible.
+    - analyses: the number of analysis types the app currently offers,
+      passed in by the caller. It is a property of the build, not of this
+      user's history, so deriving it from stored charts_json (the old
+      behaviour) reported "Analyses Available" as a count of charts the
+      user happened to have made.
     """
     if user_id is None:
         return {"sessions": 0, "datasets": 0, "analyses": 0}
@@ -857,23 +1006,13 @@ def get_user_stats(user_id: int) -> dict:
         session_count = c.fetchone()[0] or 0
 
         c.execute(
-            _ph("SELECT COUNT(DISTINCT file_name) FROM sessions "
-                "WHERE user_id=? AND file_name IS NOT NULL AND file_name != ''"),
+            _ph("SELECT COUNT(*) FROM analysed_datasets WHERE user_id=?"),
             (user_id,),
         )
         dataset_count = c.fetchone()[0] or 0
 
-        c.execute(_ph("SELECT charts_json FROM sessions WHERE user_id=?"), (user_id,))
-        analysis_count = 0
-        for (charts_json,) in c.fetchall():
-            if not charts_json:
-                continue
-            try:
-                analysis_count += len(json.loads(charts_json))
-            except (json.JSONDecodeError, TypeError, ValueError):
-                continue
-
-        return {"sessions": session_count, "datasets": dataset_count, "analyses": analysis_count}
+        return {"sessions": session_count, "datasets": dataset_count,
+                "analyses": analyses_available}
     except Exception as e:
         log.warning("get_user_stats: %s", e)
         return {"sessions": 0, "datasets": 0, "analyses": 0}

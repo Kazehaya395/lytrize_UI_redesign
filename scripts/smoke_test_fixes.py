@@ -1928,6 +1928,10 @@ def test_draft_restore_round_trip():
     b1.set_note("uid_r1", "a note")
     b1.manager.save_df_snapshot(1, b1.df)
     b1.save_draft()
+    # save_draft() hands the SQLite write to a background saver thread, so
+    # the row is not guaranteed visible until the queue drains. Production
+    # never needs immediate durability; the test does -- flush, don't sleep.
+    b1.flush_draft_save()
 
     draft = get_draft(1)
     check("draft: autosave wrote a row", bool(draft))
@@ -3189,6 +3193,14 @@ def test_chart_tabs_scoped_to_selected_type():
         delete_requested = Signal()
         edit_requested = Signal()
         note_changed = Signal()
+        # Kept in step with ChartCard's signal surface: _refresh_charts
+        # connects all of these, and a mock missing one crashes the run
+        # with AttributeError instead of testing anything.
+        slicer_requested = Signal()
+        style_changed = Signal()
+        move_up_requested = Signal()
+        move_down_requested = Signal()
+        fullwidth_toggled = Signal()
 
         def __init__(self, uid, title, fig, chart_type, meta):
             super().__init__()
@@ -3706,15 +3718,24 @@ def test_correlation_alignment_values_and_generation():
           _rgb(first) != _rgb(first6), f"{first} vs {first6}")
 
     # ---- Regression: Show border / colorbar position were unreachable -------
+    # Assert on the colour bar plotly ACTUALLY DRAWS, via real_colorbars, not
+    # on ``layout.coloraxis.colorbar``. This heatmap arrives bound to the shared
+    # colour axis, but _apply_heatmap_options deliberately UNBINDS it (writing
+    # the trace's own colorscale has no effect while the axis binding wins), so
+    # from then on the drawn bar is the TRACE one and the axis copy is an unused
+    # leftover. Asserting on the axis would test an object nothing renders.
+    from chart_display import real_colorbars as _real_cb
+
+    def _drawn_borderwidth(f):
+        bars = list(_real_cb(f))
+        return int(getattr(bars[0], "borderwidth", 0)) if bars else None
+
     fb = apply_display_options(fig, {"show_border": False}, {})
-    cb_off = fb.layout.coloraxis.colorbar
     check("display: Show border off reaches the colorbar",
-          getattr(cb_off, "borderwidth", None) == 0,
-          str(getattr(cb_off, "borderwidth", None)))
+          _drawn_borderwidth(fb) == 0, str(_drawn_borderwidth(fb)))
     fb2 = apply_display_options(fig, {"show_border": True}, {})
     check("display: Show border on reaches the colorbar",
-          getattr(fb2.layout.coloraxis.colorbar, "borderwidth", None) == 1,
-          str(getattr(fb2.layout.coloraxis.colorbar, "borderwidth", None)))
+          _drawn_borderwidth(fb2) == 1, str(_drawn_borderwidth(fb2)))
     # -- Regression: "colour bar & corr. chart meshed together" -------------
     # Placing the bar with a negative x drops it onto the y tick labels, which
     # on a heatmap are the long COLUMN NAMES. The fix reserves a strip of the
@@ -4443,9 +4464,19 @@ def test_newly_migrated_types_match_the_old_metadata():
                            "sort_rows", "top_n_rows"},
         "matrix_table": {"index_col", "columns_col", "values_col", "agg",
                          "sort_rows", "top_n_rows"},
+        # Every key here is read by the service's map branch. The eight that
+        # used to be absent from this app -- choropleth_projection /
+        # choropleth_scope and the six hover_* tooltip fields -- are now
+        # collected by the panel and honoured by the runner, so they belong in
+        # the set rather than in ALLOWED_EXTRA (which permits keys the service
+        # would ignore).
         "map_plot": {"map_mode", "lat_col", "lon_col", "location_col",
                      "color_col", "value_col", "agg_func", "map_style",
-                     "marker_opacity", "invert_colorscale", "show_borders"},
+                     "marker_opacity", "invert_colorscale", "show_borders",
+                     "render_mode", "choropleth_projection",
+                     "choropleth_scope", "hover_dim1", "hover_dim2",
+                     "hover_val1", "hover_val1_agg", "hover_val2",
+                     "hover_val2_agg"},
     }
     # 'x' is a deliberate extra on the matrix types: their prefill reads it
     # back so a saved cross-tab round-trips, and the runner ignores it. The
@@ -4621,6 +4652,16 @@ def test_generate_stage_controls_are_not_dead():
                 "location_col": "country", "value_col": "salary",
                 "agg_func": "Sum"}
         vals.update(over)
+        # The scatter map is a different runner branch with its own border
+        # mechanism (an overlay layer rather than a geo outline), so it needs its
+        # own config; without this the probe would silently re-test the
+        # choropleth and prove nothing about the scattermap.
+        if vals.pop("scatter", False):
+            vals.update({"map_mode": "Scatter (Lat/Lon)",
+                         "lat_col": "lat", "lon_col": "lon"})
+            vals.pop("location_col", None)
+            vals.pop("value_col", None)
+            vals.pop("agg_func", None)
         figs = run_analysis_with_config("map_plot", df, vals)
         return _json.dumps(figs[0][2].to_plotly_json(),
                            sort_keys=True, default=str) if figs else "NONE"
@@ -4629,6 +4670,10 @@ def test_generate_stage_controls_are_not_dead():
           _map(show_borders=True) != "NONE")
     check("map: show_borders changes the choropleth",
           _map(show_borders=True) != _map(show_borders=False))
+    check("map: scatter map renders", _map(scatter=True) != "NONE")
+    check("map: show_borders changes the scatter map",
+          _map(scatter=True, show_borders=True)
+          != _map(scatter=True, show_borders=False))
 
     # A scattermap marker has no outline and layout.map has no country
     # toggle, so the box cannot apply there. It is disabled in the form
@@ -4649,8 +4694,12 @@ def test_generate_stage_controls_are_not_dead():
     check("map form: Borders is enabled for choropleth",
           form._chk_borders.isEnabled())
     form._combo_mode.setCurrentText("Scatter (Lat/Lon)")
-    check("map form: Borders is disabled for lat/lon scatter",
-          not form._chk_borders.isEnabled())
+    # Superseded: "Borders is disabled for lat/lon scatter". The scattermap path
+    # now adds/removes a real boundaries overlay layer, so the checkbox is a LIVE
+    # control in scatter mode -- leaving it enabled and asserting that it reaches
+    # the figure is the stronger claim than asserting it was greyed out.
+    check("map form: Borders is enabled for lat/lon scatter",
+          form._chk_borders.isEnabled())
 
 
 def test_map_runner_degrades_without_streamlit():
@@ -5206,260 +5255,2202 @@ def _viridis_first_stop(fig):
 # ---------------------------------------------------------------------------
 # Dashboard tiling: free-form drag/resize for charts, and export parity.
 #
-# These deliberately use TilingCanvas with plain QFrames instead of real
-# ChartCards. A ChartCard owns a QWebEngineView, and constructing even one
-# headlessly is slow and prone to the known QtWebEngine crash, which would
-# make these tests measure the webview rather than the tiling logic.
+# The drag logic itself lives in the canvas page's JavaScript, so these cover
+# the half that must agree with it: the pure placement maths and the HTML
+# the placement is rendered into.
 # ---------------------------------------------------------------------------
 
 
-def _canvas(cols: int = 2, n: int = 4):
-    from PySide6.QtWidgets import QFrame
-    from desktop.widgets.tiling_canvas import TilingCanvas
-    app()
-    c = TilingCanvas()
-    c.resize(900, 600)
-    c.set_columns(cols)
-    for i in range(n):
-        c.add_card(f"u{i}", QFrame())
-    c.relayout()
-    return c
+def test_tile_geometry_free_placement() -> None:
+    print("[20] Canvas geometry: free placement, not grid cells")
+    from desktop.widgets import tile_geometry as tg
+
+    # A fresh board fills two across, then wraps. This is the arrangement the
+    # old grid produced by construction; on a free canvas it is now a CHOICE,
+    # made by auto_place, rather than the only thing the layout allowed.
+    g = tg.auto_place(["u0", "u1", "u2", "u3"])
+    check("a fresh board fills two across, then wraps",
+          g["u0"]["x"] == 0 and g["u1"]["x"] > 0
+          and g["u2"]["y"] > 0 and g["u3"]["y"] > 0, str(g))
+    check("two half-width cards really do share a row",
+          g["u0"]["y"] == g["u1"]["y"], str(g))
+    check("no overlaps on a fresh board", not tg.overlaps(g), str(tg.overlaps(g)))
+
+    # The units themselves. x/w are fractions of the WIDTH so a card keeps its
+    # proportion when the window narrows; y/h are PIXELS because a chart's
+    # height must not scale with the viewport.
+    check("width is a fraction of the canvas, not a pixel count",
+          all(0 <= t["x"] <= 1 and 0 < t["w"] <= 1
+              for t in tg.clamp_all(g).values()), str(g))
+    check("height is in pixels", all(t["h"] >= tg.MIN_H
+                                    for t in tg.clamp_all(g).values()), str(g))
+
+    # Nothing snaps to a cell. This is the regression that made the resize
+    # handles feel decorative: a drag was rounded to the column width, so a card
+    # could only ever occupy a whole cell and sprang back on release.
+    nudged = tg.clamp({"x": 0.137, "y": 217.5, "w": 0.413, "h": 333.25})
+    check("an arbitrary drag position survives clamping unchanged",
+          nudged == {"x": 0.137, "y": 217.5, "w": 0.413, "h": 333.25},
+          str(nudged))
 
 
-def _pos(x: int, y: int):
-    """A mouse event stand-in exposing only what the canvas reads."""
-    class _P:
-        @staticmethod
-        def toPoint():
-            return QPoint(x, y)
-    class _E:
-        @staticmethod
-        def globalPosition():
-            return _P()
-    return _E()
+def test_tile_geometry_clamp_and_overlap() -> None:
+    print("[21] Canvas geometry: proposals are clamped, overlap is allowed")
+    from desktop.widgets import tile_geometry as tg
+
+    # Out-of-range proposals from a stale document or older session JSON.
+    junk = tg.clamp({"x": -5, "y": -20, "w": 9, "h": 0})
+    check("out-of-range proposal is clamped, never negative",
+          junk["x"] == 0 and junk["y"] == 0, str(junk))
+    check("a card cannot be dragged off the right edge",
+          junk["x"] + junk["w"] <= 1.0, str(junk))
+    check("a zero-height card is lifted to a usable size",
+          junk["h"] >= tg.MIN_H, str(junk))
+    check("a card cannot be shrunk to nothing",
+          tg.clamp({"x": 0, "y": 0, "w": 0.001, "h": 10})["w"] >= tg.MIN_W)
+
+    # NaN is the dangerous one: it compares false against everything, so it
+    # slips through a naive min/max clamp and reaches CSS as left:NaN%, which
+    # the browser discards -- the card silently vanishes.
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        c = tg.clamp({"x": bad, "y": bad, "w": bad, "h": bad})
+        check(f"non-finite geometry ({bad}) is replaced, not propagated",
+              all(isinstance(v, float) and v == v and abs(v) != float("inf")
+                  for v in c.values()), str(c))
+    check("a non-numeric payload falls back to the defaults",
+          tg.clamp({"x": "abc", "y": None, "w": [], "h": {}})["w"] > 0)
+
+    # OVERLAP IS LEGAL. This is the whole point of the change: a card may be
+    # dropped on top of another, as a window may cover another. The old build
+    # pushed the offender down, which is why every drag looked ignored.
+    stacked = tg.clamp_all({"a": {"x": 0.1, "y": 100, "w": 0.5, "h": 300},
+                            "b": {"x": 0.1, "y": 100, "w": 0.5, "h": 300}})
+    check("two cards may occupy the same rectangle",
+          tg.overlaps(stacked) == [("a", "b")], str(tg.overlaps(stacked)))
+    check("the overlap detector finds nothing in a clean board",
+          not tg.overlaps(tg.tidy(stacked)))
+
+    check("visual order is top-to-bottom, left-to-right",
+          tg.visual_order({"c": {"x": 0.5, "y": 10, "w": 0.5, "h": 100},
+                           "a": {"x": 0, "y": 0, "w": 0.5, "h": 100},
+                           "b": {"x": 0.5, "y": 0, "w": 0.5, "h": 100}})
+          == ["a", "b", "c"])
 
 
-def _no_overlaps(c) -> bool:
-    cells = set()
-    for g in c.geometry_map().values():
-        for yy in range(g["y"], g["y"] + g["h"]):
-            for xx in range(g["x"], g["x"] + g["w"]):
-                if (xx, yy) in cells:
-                    return False
-                cells.add((xx, yy))
-    return True
+def test_tile_geometry_tidy_reflows() -> None:
+    print("[22] Canvas geometry: tidy re-flows without resizing the cards")
+    from desktop.widgets import tile_geometry as tg
+    messy = tg.clamp_all({"u0": {"x": 0.6, "y": 500, "w": 0.4, "h": 250},
+                          "u1": {"x": 0.1, "y": 40, "w": 0.4, "h": 250},
+                          "u2": {"x": 0.2, "y": 20, "w": 0.3, "h": 180}})
+    t = tg.tidy(messy, gap_px=24)
+    check("tidy keeps the visual order the user can see",
+          tg.visual_order(t) == ["u2", "u1", "u0"], str(t))
+    check("tidy leaves no card overlapping another", not tg.overlaps(t),
+          str(tg.overlaps(t)))
+    check("tidy keeps each card the size the user gave it",
+          all(t[u]["w"] == messy[u]["w"] and t[u]["h"] == messy[u]["h"]
+              for u in messy), str(t))
+    check("tidy packs from the top-left",
+          min(g["y"] for g in t.values()) == 0.0
+          and min(g["x"] for g in t.values()) == 0.0, str(t))
+    check("tidy stays inside the canvas",
+          all(g["x"] + g["w"] <= 1.0 + 1e-9 for g in t.values()), str(t))
+    # Idempotent: tidying an already-tidy board must not keep shuffling it.
+    check("tidy is idempotent", tg.tidy(t, gap_px=24) == t)
 
 
-def test_tiling_canvas_packs_and_preserves_spans() -> None:
-    print("[20] Tiling canvas: row-wise packing, spans and column changes")
-    c = _canvas(cols=2, n=4)
-    g = c.geometry_map()
-    check("tiles fill row-wise, not down one column",
-          g["u0"]["x"] == 0 and g["u1"]["x"] == 1
-          and g["u2"]["x"] == 0 and g["u2"]["y"] == 1, str(g))
-    check("no overlaps on a fresh board", _no_overlaps(c))
+def test_saved_geometry_migrates_from_the_grid() -> None:
+    print("[23b] Saved sessions: grid cells convert to free units once")
+    from desktop.widgets import tile_geometry as tg
 
-    c.set_geometry_map({"u0": {"x": 0, "y": 0, "w": 2, "h": 2}})
-    check("span survives a column-count change",
-          c.card_geometry("u0")["w"] == 2, str(c.card_geometry("u0")))
-    c.set_columns(3)
-    check("2-wide tile is still 2 wide at 3 columns",
-          c.card_geometry("u0")["w"] == 2, str(c.card_geometry("u0")))
-    c.set_columns(1)
-    check("span is clamped to the available columns",
-          c.card_geometry("u0")["w"] == 1, str(c.card_geometry("u0")))
-
-
-def test_tiling_canvas_drag_and_resize() -> None:
-    print("[21] Tiling canvas: drag and resize produce grid geometry")
-    c = _canvas(cols=2, n=2)
-    before = c.card_geometry("u0")
-    c.begin_drag("u0", QPoint(0, 0))
-    c.mouseMoveEvent(_pos(450, 700))   # one column right, ~2 rows down
-    c.mouseReleaseEvent(_pos(450, 700))
-    moved = c.card_geometry("u0")
-    check("drag moved the tile to another cell",
-          (moved["x"], moved["y"]) != (before["x"], before["y"]),
-          f"{before} -> {moved}")
-    check("drag result is still overlap-free", _no_overlaps(c))
-
-    # Resize is measured as a cursor DELTA from the grab point, so the target
-    # must be past the tile's current bottom-right corner (which is already
-    # near the canvas edge) -- a drag to a smaller coordinate correctly shrinks.
-    # Resize from the left column: a tile already sitting in the rightmost
-    # column CANNOT grow horizontally (width is clamped to the grid), so
-    # starting from x=1 would only ever prove the height axis.
-    c.set_geometry_map({"u0": {"x": 0, "y": 0, "w": 1, "h": 1}})
-    c.begin_resize("u0", QPoint(0, 0))
-    c.mouseMoveEvent(_pos(2000, 2000))
-    c.mouseReleaseEvent(_pos(2000, 2000))
-    rz = c.card_geometry("u0")
-    check("resize grew the tile's span", rz["w"] > moved["w"] and rz["h"] > moved["h"],
-          f"{moved} -> {rz}")
-
-    # Whatever cards remain after the reflow must all sit inside the grid --
-    # a card pushed to the far edge has to be clamped, not left overflowing.
-    check("no tile overflows the grid",
-          all(g["x"] + g["w"] <= c.columns() for g in c.geometry_map().values()),
-          str(c.geometry_map()))
-    shrunk = dict(rz)
-    c.begin_resize("u0", QPoint(0, 0))
-    c.mouseMoveEvent(_pos(1, 1))
-    c.mouseReleaseEvent(_pos(1, 1))
-    check("resize cannot shrink below one cell",
-          c.card_geometry("u0")["w"] >= 1 and c.card_geometry("u0")["h"] >= 1,
-          f"{shrunk} -> {c.card_geometry('u0')}")
-    check("resize result is still overlap-free", _no_overlaps(c))
-    check("order follows visual position, not insertion",
-          c.card_order() and c.card_order()[0] == "u0" or True)
-
-
-def test_tiling_canvas_overlap_and_stale_geometry() -> None:
-    print("[22] Tiling canvas: overlap reflow and stale geometry pruning")
-    c = _canvas(cols=3, n=3)
-    c.set_geometry_map({"u0": {"x": 0, "y": 0, "w": 2, "h": 1},
-                        "u1": {"x": 1, "y": 0, "w": 2, "h": 1},
-                        "u2": {"x": 0, "y": 0, "w": 1, "h": 1}})
-    check("overlapping tiles are separated", _no_overlaps(c))
-    check("first card keeps its position",
-          c.card_geometry("u0") == {"x": 0, "y": 0, "w": 2, "h": 1},
-          str(c.card_geometry("u0")))
-
-    c.set_geometry_map({"ghost": {"x": 0, "y": 0, "w": 1, "h": 1}})
-    check("geometry for a non-existent card is dropped",
-          "ghost" not in c.geometry_map(), str(c.geometry_map()))
-    c.remove_card("u0")
-    check("removing a card drops its geometry",
-          "u0" not in c.geometry_map(), str(c.geometry_map()))
+    grid = {"a": {"x": 0, "y": 0, "w": 1, "h": 2},
+            "b": {"x": 1, "y": 0, "w": 1, "h": 1}}
+    check("a grid blob is recognised as grid-shaped",
+          tg.is_grid_shaped(grid, 2), str(grid))
+    free = tg.from_grid(grid, cols=2, row_h=400, gap_px=24)
+    check("converted geometry is in free units (fractions, not cells)",
+          free["a"]["w"] == 0.5 and free["a"]["x"] == 0.0, str(free))
+    check("converted height uses the card height and gap, in pixels",
+          free["a"]["h"] == 2 * 424 - 24, str(free))
+    check("the right-hand column lands on the right half",
+          free["b"]["x"] == 0.5, str(free))
+    check("a converted blob is no longer grid-shaped (migration is one-way)",
+          not tg.is_grid_shaped(free, 2), str(free))
+    check("nothing converted lands outside the canvas",
+          all(g["x"] >= 0 and g["x"] + g["w"] <= 1.0 + 1e-9
+              for g in free.values()), str(free))
+    # Free units must not be mistaken for grid cells, or a saved free board
+    # would be converted a second time on every open and drift downwards.
+    check("fractional widths are never read as grid columns",
+          not tg.is_grid_shaped(tg.auto_place(["a", "b", "c"]), 2))
+    check("an empty blob is not grid-shaped", not tg.is_grid_shaped({}, 2))
 
 
 def test_saved_tile_geometry_round_trip() -> None:
     print("[23] Saved tiling geometry: migration and restore")
     import json
-    from desktop.pages.dashboard_page import _load_saved_tiles
+    from desktop.pages.dashboard_page import _load_saved_tiles, _is_kpi_key
     sm = {"grid_cols_n": 2, "grid_fullwidth_json": json.dumps(
-        {"a": {"x": 1, "y": 2, "w": 1, "h": 3}, "gone": {"x": 0, "y": 0, "w": 1, "h": 1}})}
+        {"a": {"x": 1, "y": 2, "w": 1, "h": 3}, "0": {"x": 0, "y": 0, "w": 1, "h": 1},
+         "gone": {"x": 0, "y": 0, "w": 1, "h": 1}})}
     tiles = _load_saved_tiles(sm)
     check("tiled geometry round-trips exactly",
           tiles["a"] == {"x": 1, "y": 2, "w": 1, "h": 3}, str(tiles))
+    check("KPI tiles survive the round trip and are distinguishable",
+          _is_kpi_key("0") and not _is_kpi_key("a") and tiles["0"]["x"] == 0,
+          str(tiles))
     # _load_saved_tiles is deliberately card-agnostic: it only sees session
-    # meta, not which charts currently exist. Dropping unknown uids is the
-    # canvas's job (see section 22) -- asserting it here would be asserting
-    # against a function that cannot know the answer.
+    # meta, not which blocks currently exist. Dropping unknown ids is the
+    # geometry helper's job, so asserting it here would be asserting against a
+    # function that cannot know the answer.
 
     legacy = {"grid_cols_n": 3, "grid_fullwidth_json": json.dumps(
-        {"a": True, "b": False, "c": True})}
+        {"p": True, "q": False})}
     lt = _load_saved_tiles(legacy)
-    check("legacy full-width chart spans the whole row",
-          lt.get("a") == {"x": 0, "y": 0, "w": 3, "h": 1}, str(lt))
-    check("legacy full-width charts get distinct rows",
-          lt["a"]["y"] != lt["c"]["y"], str(lt))
-    check("legacy non-full-width chart is dropped", "b" not in lt, str(lt))
-    check("missing/invalid json yields no geometry",
-          _load_saved_tiles({}) == {}
-          and _load_saved_tiles({"grid_fullwidth_json": "nope"}) == {})
+    check("legacy full-width boolean becomes a full-row span",
+          lt["p"] == {"x": 0, "y": 0, "w": 3, "h": 1}
+          and "q" not in lt, str(lt))
 
 
-def test_tiling_canvas_shows_reparented_cards() -> None:
-    print("[25] Tiling canvas: reparented cards stay visible")
-    # Regression: add_card() reparents a card out of its previous parent, and
-    # Qt HIDES a widget when it is re-parented. Without an explicit show(), every
-    # chart tile silently vanished the moment it was re-added -- the layout was
-    # still correct, the cards were just not on screen.
-    from PySide6.QtWidgets import QFrame, QScrollArea
-    c = _canvas(cols=2, n=3)
-    sa = QScrollArea()
-    sa.setWidgetResizable(True)
-    sa.setWidget(c)
-    sa.resize(800, 400)
-    sa.show()
-    app().processEvents()
-    check("cards are visible after being reparented into the canvas",
-          all(c.card_widget(u).isVisible() for u in ("u0", "u1", "u2")),
-          str([c.card_widget(u).isVisible() for u in ("u0", "u1", "u2")]))
-    check("visible cards have real geometry, not a default 640x480",
-          all(c.card_widget(u).width() != 640 or c.width() == 640
-              for u in ("u0", "u1", "u2")),
-          str([c.card_widget(u).geometry().getRect() for u in ("u0", "u1", "u2")]))
-
-
-def test_kpi_drag_reorder_helpers() -> None:
-    print("[26] KPI row: slot hit-testing is layout-independent")
-    # Regression: _kpi_index_at used to hit-test each card's widget geometry.
-    # Qt only assigns real geometries once the layout actually runs, so before
-    # that every card reports the SAME origin and its default 640x480 size --
-    # which made the hit test always answer slot 0 and the reorder never
-    # advanced past its first step. The helper now divides the row rectangle
-    # into n slots instead, so it must give the same answer before and after
-    # the layout has run.
-    class _Row:
-        """Minimal stand-in exposing exactly what _kpi_index_at reads."""
-        def __init__(self, n):
-            self._n = n
-        def mapToGlobal(self, _pt):
-            return QPoint(100, 0)
-        def rect(self):
-            from PySide6.QtCore import QRect
-            return QRect(0, 0, 900, 71)
-        def width(self):
-            return 900
-    from desktop.pages.dashboard_page import DashboardPage
-    fake = _Row(3)
-    fake.kpi_row_container = fake          # _kpi_index_at reads it off self
-    fake._current_kpi_visual_order = lambda: [0, 1, 2]
-    idx_at = lambda x: DashboardPage._kpi_index_at(fake, x)
-    check("hit test splits the row into even slots",
-          [idx_at(x) for x in (100, 400, 700, 999)] == [0, 1, 2, 2],
-          str([idx_at(x) for x in (100, 400, 700, 999)]))
-    check("cursor left of the row resolves to no slot",
-          idx_at(50) is None and idx_at(1200) is None,
-          f"{idx_at(50)} {idx_at(1200)}")
-    # A degenerate (not yet laid out) container must not raise or divide by zero.
-    fake.width = lambda: 0
-    check("zero-width row degrades safely", idx_at(100) is None, str(idx_at(100)))
-
-
-def test_export_follows_tile_geometry() -> None:
-    print("[24] HTML export: visual order and free-form tile placement")
+def test_report_canvas_structure() -> None:
+    print("[27] Report canvas: the board IS the report")
     import re
     import plotly.express as px
     from modules.export import generate_html_report
     from services.export_service import build_export_theme
     df = px.data.iris()
-    charts = [("b", "Second", px.bar(df, x="species", y="sepal_length"), "", {}, {}),
-              ("a", "First", px.scatter(df, x="petal_length", y="petal_width"), "", {}, {}),
-              ("c", "Third", px.box(df, x="species", y="sepal_width"), "", {}, {})]
+    charts = [("a", "First", px.bar(df, x="species", y="sepal_length"), "n", "", {}),
+              ("b", "Second", px.scatter(df, x="petal_length", y="petal_width"),
+               "", "", {})]
     th = build_export_theme({})
-    geom = {"a": {"x": 0, "y": 0, "w": 1, "h": 2},
-            "b": {"x": 1, "y": 0, "w": 1, "h": 1},
-            "c": {"x": 1, "y": 1, "w": 1, "h": 1}}
+    geom = {"a": {"x": 0.0, "y": 0.0, "w": 0.5, "h": 500.0},
+            "b": {"x": 0.5, "y": 0.0, "w": 0.5, "h": 400.0}}
+
+    he = generate_html_report(charts, "S", grid_cols_n=2, theme=th,
+                              tile_geometry=geom, editor=True)
+    check("every card carries a stable uid for the canvas to target",
+          len(re.findall(r'data-uid="[ab]"', he)) == 2, he[:0])
+    check("editor mode adds the editing class to <body>",
+          '<body class="ly-editing">' in he)
+    check("editor mode ships the drag overlay css and js",
+          ".ly-grip" in he and "lySetEditing" in he)
+    check("no unsubstituted placeholder leaks into the document",
+          "__ACCENT__" not in he and "__COLS__" not in he
+          and "__GAP__" not in he and "__MODE__" not in he)
+
+    hs = generate_html_report(charts, "S", grid_cols_n=2, theme=th,
+                              tile_geometry=geom)
+    check("the SAVED file carries no editing chrome at all",
+          "<body>" in hs and "ly-grip" not in hs and "lySetEditing" not in hs)
+
+    # A card the user made 500px tall must be 500px tall with a plot that FITS
+    # inside it -- not a 500px box with the default 400px plot spilling out of
+    # the bottom. "a" carries a note here, so the plot is the card height less
+    # the heading/padding allowance and the notes strip.
+    heights = sorted({int(h) for h in re.findall(r'"height":(\d+)', hs)})
+    check("a tall card gets a plot that fits inside it, not the default height",
+          heights and max(heights) < 500 and 400 not in heights, str(heights))
+    tall_no_notes = generate_html_report(
+        [("a", "First", px.bar(df, x="species", y="sepal_length"), "", "", {})],
+        "S", theme=th, tile_geometry={"a": {"x": 0.0, "y": 0.0, "w": 0.5,
+                                             "h": 500.0}})
+    nh = sorted({int(h) for h in re.findall(r'"height":(\d+)', tall_no_notes)})
+    check("a taller card gets a proportionally taller plot",
+          nh and max(nh) > 400, str(nh))
+    cs = re.findall(r'<div class="chart-card"[^>]*style="([^"]*)"', hs)
+    check("the card itself is exactly the height the user set",
+          cs and cs[0].endswith("height:500.00px;"), str(cs))
+
+    hp = generate_html_report(charts, "S", grid_cols_n=2, theme=th,
+                              tile_geometry=geom, inline_plotly=False)
+    check("external-plotly mode emits a src reference, not 4.5MB of inline js",
+          'src="lytrize_plotly.js"' in hp
+          and not re.findall(r"plotly\.js v", hp))
+    check("the saved file still embeds the bundle",
+          re.findall(r"plotly\.js v", hs))
+
+    hc = generate_html_report(charts, "S", grid_cols_n=2, theme=th,
+                              extra_css="@font-face{x:1}")
+    check("caller css reaches the document before </style>",
+          "@font-face{x:1}" in hc)
+
+
+def test_canvas_handles_are_wired() -> None:
+    print("[27b] Canvas editing: the handles really move and resize")
+    import re
+    from modules.report_editor import editor_js, editor_css
+
+    free = editor_js(2, 24, mode="free")
+    grid = editor_js(2, 24, mode="grid")
+    check("the overlay is told which layout it is editing",
+          "var FREE = MODE !== 'grid';" in free and "var MODE = 'free';" in free,
+          "")
+    check("legacy mode is still selectable",
+          "var MODE = 'grid';" in grid)
+
+    # The drag must not round to a cell pitch. This is the regression behind
+    # "all those resize handler icons are just for show": every move() was
+    # divided by the column width and rounded, so a card could only ever land on
+    # a whole cell, and Python then re-packed it straight back.
+    # Not merely unused: dead snapping code left in the free path is exactly how
+    # the grid behaviour came back. The free bundle must not contain it at all.
+    check("the free bundle contains no grid snapping code",
+          "pitchX" not in free and "pitchY" not in free
+          and "snapCol" not in free and "snapRow" not in free
+          and "gridTemplateColumns" not in free, "")
+    check("the legacy bundle still has the cell-snapping path",
+          "pitchX" in grid and "snapCol" in grid, "")
+    check("free dragging adds the pointer delta directly",
+          "g.x = drag.start.x + dx / c.w;" in free, "")
+    check("free resizing is by pixels, not by cell spans",
+          "g.w = drag.start.w + dx / c.w;" in free
+          and "g.h = drag.start.h + dy;" in free, "")
+    check("the card itself follows the pointer, not just an outline",
+          "writeGeom(el, g);" in free and "refit(el);" in free)
+    check("the proposal is clamped before it is sent to Python",
+          "clampGeom(g);" in free)
+    # Fractions in, fractions out -- int() here would quantise every card's
+    # left edge and width back to whole columns.
+    check("fractional geometry is never int()-ed in the overlay",
+          "Math.round(g.x * 100)" not in free)
+    check("the canvas is grown live so a card can be dropped below it",
+          "host.style.height" in free)
+    check("the temporary canvas growth is handed back on release",
+          "host.style.height = ''" in free)
+    check("Plotly is refit in BOTH axes after a resize",
+          "Plotly.relayout(plot" in free and "height: h > 0 ? h : undefined" in free)
+    check("a click that never moved is not treated as a layout change",
+          "Math.abs(g.x - b.x) < 0.0005" in free)
+    # Whole-card dragging must not steal Plotly's own pan/zoom.
+    # Whitespace- and quote-normalised: the guard is a concatenation of string
+    # literals, so an exact substring test fails the moment a token is added to
+    # the list or the line is rewrapped -- which is exactly what adding
+    # .slicer-body did, without changing what is excluded.
+    _flat = " ".join(
+        free.replace("' +", "'").replace("'", " ").split())
+    check("dragging the card does not hijack the plot or the notes",
+          all(t in _flat for t in
+              (".js-plotly-plot", ".modebar", ".notes", ".slicer-body")),
+          _flat[-300:])
+    check("the whole card is a drag handle on the free canvas",
+          ".ly-editing.ly-free .chart-card" in editor_css())
+
+    css = editor_css("#6163df")
+    # position:relative on a free CARD would silently drop its left/top and
+    # collapse the whole board into the top-left corner. Every rule that sets it
+    # on a card must therefore be qualified with .ly-grid-editing. The CONTAINER
+    # legitimately needs it (the drag ghost is positioned inside it).
+    _bare = css.replace("/*__NOTHING__*/", "")
+    _card_rules = re.findall(
+        r"([^{}]*(?:chart-card|kpi-card)[^{}]*)\{([^}]*)\}", _bare)
+    _relative_cards = [sel.strip() for sel, body in _card_rules
+                       if "position: relative" in body]
+    check("position:relative on a card is qualified to grid mode",
+          _relative_cards
+          and all("ly-grid-editing" in sel for sel in _relative_cards),
+          str(_relative_cards))
+    check("no unscoped position:relative rule can catch a free card",
+          ".ly-editing .chart-card, .ly-editing .kpi-card { position: relative; }"
+          not in css, "")
+
+    check("the handles have a grab target bigger than they look",
+          ".ly-h-right::after" in css and "inset: -8px" in css, "")
+    check("the accent placeholder is substituted",
+          "__ACCENT__" not in css)
+
+
+def test_kpi_tiles_share_the_chart_canvas() -> None:
+    print("[28] KPI tiles: placed like charts, on the same canvas")
+    import re
+    import plotly.express as px
+    from modules.export import generate_html_report
+    from services.export_service import build_export_theme
+    df = px.data.iris()
+    charts = [("a", "First", px.bar(df, x="species", y="sepal_length"), "", "", {}),
+              ("b", "Second", px.bar(df, x="species", y="sepal_width"), "", "", {})]
+    kpis = [{"label": "Total", "value": "1", "icon": "X"},
+            {"label": "Count", "value": "2", "icon": "Y"}]
+    th = build_export_theme({})
+
+    both = generate_html_report(
+        charts, "S", theme=th, kpis=kpis, inline_plotly=False,
+        tile_geometry={"a": {"x": 0, "y": 0, "w": 0.5, "h": 400},
+                       "b": {"x": 0.5, "y": 0, "w": 0.5, "h": 400}},
+        kpi_geometry={"0": {"x": 0, "y": 420, "w": 1.0, "h": 120}})
+    check("KPIs and charts share ONE canvas on the free layout",
+          both.count('<div class="ly-canvas"') == 1
+          and '<div class="kpi-row">' not in both, both[:0])
+    # A KPI placed below a chart must not push that chart's saved row index --
+    # there are no row indices any more, because placement is absolute.
+    ks = re.findall(r'<div class="kpi-card"[^>]*style="([^"]*)"', both)
+    cs = re.findall(r'<div class="chart-card"[^>]*style="([^"]*)"', both)
+    # A board whose geometry has no title yet gets one inserted at the top, which
+    # shifts every card down by one band. The KPIs here carry no saved geometry
+    # of their own, so they are auto-placed below that band; the charts were
+    # saved by hand and moved with it.
+    from modules.canvas_geometry import title_band_height
+    band = title_band_height(th["title_size"], True)
+    check("a KPI is placed exactly like a chart",
+          ks and any(k.startswith(f"left:0.0000%;top:{420 + band + 24:.2f}px;"
+                                  "width:100.0000%")
+                     for k in ks), str(ks))
+    check("placing a KPI leaves the chart coordinates untouched",
+          cs and cs[0].startswith(f"left:0.0000%;top:{band + 24:.2f}px;"),
+          str(cs))
+    check("a KPI with no saved geometry is still positioned",
+          len(ks) == 2 and all(k.strip() for k in ks), str(ks))
+
+    hn = generate_html_report(charts, "S", theme=th, kpis=kpis,
+                              inline_plotly=False)
+    hn_geom = re.findall(r'<div class="kpi-card"[^>]*style="([^"]*)"', hn)
+    check("auto-placed KPIs are sized like KPIs, not like charts",
+          all("height:120.00px" in k for k in hn_geom), str(hn_geom))
+    check("no empty style leaves a KPI unpositioned",
+          all(k.strip() for k in hn_geom), str(hn_geom))
+
+    bad = generate_html_report(charts, "S", theme=th, kpis=kpis,
+                               inline_plotly=False,
+                               kpi_geometry={"0": {"x": -5, "y": 0, "w": 9, "h": 0}})
+    bs = re.findall(r'data-kpi="0" style="([^"]*)"', bad)
+    check("out-of-range KPI geometry is clamped, never invalid CSS",
+          bs and "NaN" not in bs[0] and "left:0.0000%" in bs[0], str(bs))
+
+
+def test_export_follows_tile_geometry() -> None:
+    print("[24] HTML export: free placement, visual order, no editor chrome")
+    import re
+    import plotly.express as px
+    from modules.export import generate_html_report
+    from services.export_service import build_export_theme
+    df = px.data.iris()
+    charts = [("b", "Second", px.bar(df, x="species", y="sepal_length"), "", "", {}),
+              ("a", "First", px.scatter(df, x="petal_length", y="petal_width"), "", "", {}),
+              ("c", "Third", px.box(df, x="species", y="sepal_width"), "", "", {})]
+    th = build_export_theme({})
+    geom = {"a": {"x": 0.0, "y": 0.0, "w": 0.5, "h": 420.0},
+            "b": {"x": 0.5, "y": 0.0, "w": 0.5, "h": 300.0},
+            "c": {"x": 0.1, "y": 440.0, "w": 0.4, "h": 200.0}}
     html = generate_html_report(charts, "S", grid_cols_n=2, theme=th,
                                 tile_geometry=geom)
-    order = re.findall(r">(First|Second|Third)<", html)
+    order = re.findall(r'">(First|Second|Third)<', html)
     check("export walks the visual tile order, not bridge order",
           order == ["First", "Second", "Third"], str(order))
-    styles = re.findall(r'<div class="chart-card" style="([^"]*)"', html)
-    check("export emits explicit column AND row placement",
-          styles[0] == "grid-column: 1 / span 1;grid-row: 1 / span 2;"
-          and styles[1] == "grid-column: 2 / span 1;grid-row: 1 / span 1;"
-          and styles[2] == "grid-column: 2 / span 1;grid-row: 2 / span 1;",
+
+    check("cards are absolutely placed on one canvas",
+          '<div class="ly-canvas"' in html and 'class="grid"' not in html)
+    styles = re.findall(r'<div class="chart-card"[^>]*style="([^"]*)"', html)
+    # The heading is a card on this canvas now, and a board whose geometry has
+    # no title yet gets one inserted at the top -- which moves everything else
+    # down by exactly one band. Both facts are pinned here rather than worked
+    # around, because "the title covers the first row" is what the shift exists
+    # to prevent.
+    from modules.canvas_geometry import TITLE_UID, title_band_height
+    band = title_band_height(th["title_size"], True)
+    check("placement is left/top in percent+px, width percent, height px",
+          styles[0] == f"left:0.0000%;top:{band + 24:.2f}px;width:50.0000%;"
+                        "height:420.00px;"
+          and styles[2] == "left:10.0000%;top:584.00px;width:40.0000%;"
+                            "height:200.00px;",
           str(styles))
-    check("print CSS does not full-bleed explicitly placed tiles",
-          '.chart-card[style*="grid-column: 1 / -1"]' in html)
+    # The container needs an explicit height: absolutely positioned children are
+    # out of flow, so without it the canvas collapses and the lower cards become
+    # unreachable.
+    m = re.search(r'<div class="ly-canvas" style="height:([\d.]+)px;"', html)
+    check("the canvas is told how tall it must be",
+          m and float(m.group(1)) == 640.0 + band + 24,
+          m.group(1) if m else "no height")
+
+    # Arbitrary positions must survive the round trip to CSS -- this is the
+    # regression behind "the resize handles are just for show". The title is
+    # given a placement here, so nothing shifts and the coordinates must come
+    # out exactly as they went in.
+    nudged = generate_html_report(charts, "S", theme=th, tile_geometry={
+        TITLE_UID: {"x": 0.0, "y": 0.0, "w": 1.0, "h": band},
+        "a": {"x": 0.137, "y": 217.5, "w": 0.413, "h": 333.25},
+        "b": {"x": 0.0, "y": 0.0, "w": 0.5, "h": 400.0},
+        "c": {"x": 0.0, "y": 0.0, "w": 0.5, "h": 400.0}})
+    ns = re.findall(r'data-uid="a" style="([^"]*)"', nudged)
+    check("an arbitrary dragged position is emitted verbatim",
+          ns and ns[0] == "left:13.7000%;top:217.50px;width:41.3000%;height:333.25px;",
+          str(ns))
 
     html0 = generate_html_report(charts, "S", grid_cols_n=2, theme=th)
-    check("no geometry -> no forced placement (backwards compatible)",
-          not re.findall(r'<div class="chart-card" style="[^"]*grid-column: \d', html0),
-          "unexpected explicit placement")
-    check("no geometry -> every chart still exported",
-          len(re.findall(r'class="chart-card"', html0)) == 3)
+    check("no geometry -> cards are auto-placed, not stacked",
+          '<div class="ly-canvas"' in html0
+          and len(re.findall(r'class="chart-card"', html0)) == 3)
+    a0 = re.findall(r'<div class="chart-card"[^>]*style="([^"]*)"', html0)
+    check("an auto-placed board fills two across",
+          len(a0) == 3 and "width:50.0000%" in a0[0] and "width:50.0000%" in a0[1],
+          str(a0))
 
-    bad = generate_html_report(charts, "S", grid_cols_n=2, theme=th,
-                               tile_geometry={"a": {"x": -5, "y": 2, "w": 9, "h": 0}})
-    bs = re.findall(r'<div class="chart-card" style="([^"]*)"', bad)
+    # A malformed stored value must not reach the document: the browser
+    # discards invalid CSS and the card silently disappears.
+    bad = generate_html_report(charts, "S", theme=th, tile_geometry={
+        "a": {"x": -5, "y": "nan", "w": 9, "h": 0},
+        "b": {"x": 0.9, "y": 0, "w": 0.5, "h": 100},
+        "c": {"x": 0, "y": 0, "w": 0.5, "h": 400}})
+    bs = re.findall(r'<div class="chart-card"[^>]*style="([^"]*)"', bad)
     check("out-of-range geometry is clamped, never invalid CSS",
-          not any(re.search(r"grid-column: (-|\d+ /)", s) and "-4" in s for s in bs)
-          and all(not re.search(r"grid-column:\s*-", s) for s in bs), str(bs))
+          bs and all(("NaN" not in s and "nan" not in s and "-" not in s.split(":")[1][:1])
+                     for s in bs), str(bs))
+    check("a card dragged past the right edge is pulled back inside",
+          all(float(re.search(r"left:([\d.]+)%", x).group(1))
+              + float(re.search(r"width:([\d.]+)%", x).group(1)) <= 100.0 + 1e-6
+              for x in bs), str(bs))
+
+    # A session saved before the free canvas must still open on the board it was
+    # saved with, so the old cell layout stays available as an explicit mode.
+    grid = generate_html_report(charts, "S", theme=th, kpis=None,
+                                tile_geometry={"a": {"x": 0, "y": 0, "w": 1, "h": 2},
+                                               "b": {"x": 1, "y": 0, "w": 1, "h": 1},
+                                               "c": {"x": 1, "y": 1, "w": 1, "h": 1}},
+                                geometry_mode="grid")
+    gs = re.findall(r'<div class="chart-card"[^>]*style="([^"]*)"', grid)
+    check("legacy grid mode still emits explicit cell placement",
+          gs[0] == "grid-column: 1 / span 1;grid-row: 1 / span 2;"
+          and gs[1] == "grid-column: 2 / span 1;grid-row: 1 / span 1;", str(gs))
+    check("legacy grid mode does not use the free canvas",
+          '<div class="ly-canvas" style=' not in grid)
+
+
+def test_export_free_canvas_is_printable() -> None:
+    print("[24b] HTML export: the free canvas survives print and preview CSS")
+    import re
+    import plotly.express as px
+    from modules.export import generate_html_report
+    from services.export_service import build_export_theme
+    df = px.data.iris()
+    charts = [("a", "First", px.bar(df, x="species", y="sepal_length"), "", "", {})]
+    th = build_export_theme({})
+    html = generate_html_report(charts, "S", theme=th,
+                                tile_geometry={"a": {"x": 0, "y": 0, "w": 0.5,
+                                                     "h": 400}})
+    # Absolute pixels are meaningless across paginated paper, and two cards
+    # overlapping on screen would print on top of each other -- so print falls
+    # back to document flow in the same visual order.
+    _print_block = html.split("@media print")[-1]
+    check("print CSS drops the absolute positioning",
+          ".ly-canvas > .chart-card" in _print_block
+          and "position: static !important" in _print_block
+          and ".ly-canvas {" in _print_block, "")
+    check("print CSS clears the pixel height so nothing keeps a stale size",
+          "height: auto !important;" in html)
+    check("print CSS does not full-bleed explicitly placed tiles",
+          '.chart-card[style*="grid-column: 1 / -1"]' in html)
+    # Cards are flex columns so a shortened card shows a shorter CHART, not the
+    # original plot spilling past the bottom edge.
+    check("the plot area flexes to fill the card",
+          ".ly-canvas .chart-wrap" in html and "flex: 1 1 auto" in html)
+    check("cards are box-sizing:border-box so padding does not inflate height",
+          "box-sizing: border-box;" in html)
+    check("the plot is refit to the measured height, not just the width",
+          "height: height > 0 ? height : undefined" in html)
+
+
+def test_dashboard_palette_is_theme_independent() -> None:
+    print("[29] Dashboard palette: identical under light and dark app themes")
+    from desktop.pages import dashboard_page as dp
+    from desktop import theme as theme_mod
+    from services.export_service import build_export_theme, apply_preset
+
+    # The board and the file now read ONE dict, so there is no light/dark split
+    # left to regress -- but the preset path is exactly where it used to leak,
+    # so assert the contract directly.
+    state = dict(dp.EXPORT_DEFAULTS)
+    merged = apply_preset(state, "Midnight Pulse")
+    before = build_export_theme(merged)
+    original = theme_mod.current_mode()
+    try:
+        for mode in ("light", "dark"):
+            theme_mod.current_mode = lambda m=mode: m
+            after = build_export_theme(merged)
+            check(f"preset palette is unchanged under {mode} app theme",
+                  after == before, f"{before} != {after}")
+    finally:
+        theme_mod.current_mode = lambda: original
+    check("the page no longer keeps a second, theme-following palette",
+          not hasattr(dp, "_resolve_live_style"))
+    check("page defaults ARE the service defaults (one source of truth)",
+          dp._STYLE_DEFAULTS == dict(dp.EXPORT_DEFAULTS))
+
+
+def test_kpi_ids_reconcile_across_the_bridge() -> None:
+    print("[30] KPI ids: canvas spelling and persisted spelling are one tile")
+    from desktop.pages import dashboard_page as dp
+    from modules.report_editor import editor_js
+
+    # The overlay tags a KPI with data-kpi="0" and reports it as "kpi:0" so it
+    # cannot be confused with a chart uid. The persisted blob and the report
+    # writer both key KPIs by the bare index. Both spellings must resolve to
+    # the same tile or a KPI drag is silently dropped.
+    check("canvas KPI uid maps to the persisted KPI key",
+          dp._kpi_key("kpi:0") == "0" and dp._kpi_key("kpi:12") == "12",
+          f"got {dp._kpi_key('kpi:0')!r}")
+    check("persisted KPI key is already normalised",
+          dp._kpi_key("0") == "0")
+    check("a chart uid is never mistaken for a KPI",
+          dp._kpi_key("abc123") is None and dp._kpi_key("") is None
+          and dp._kpi_key(None) is None)
+    check("both spellings are recognised as KPI keys",
+          dp._is_kpi_key("kpi:0") and dp._is_kpi_key("0")
+          and not dp._is_kpi_key("abc123"))
+    check("the overlay really does emit the prefixed spelling",
+          "'kpi:' + el.dataset.kpi" in editor_js(2, 24))
+
+    # A KPI action must reach the KPI handlers, never a chart handler that
+    # would run against a KPI index.
+    import inspect
+    src = inspect.getsource(dp.DashboardPage._on_canvas_action)
+    check("KPI actions are dispatched by index",
+          all(a in src for a in ("kpi-delete", "kpi-up", "kpi-down",
+                                 "kpi-edit")))
+    # The KPI bar has its OWN operations (kpi-edit/kpi-up/kpi-down/kpi-delete)
+    # and the chart bar is now pencil + delete only (open-analysis/delete).
+    # Either branch offering the other's actions routes a click to a handler
+    # that runs against the wrong card kind.
+    _js = editor_js(2, 24)
+    _kpi_branch = _js.split("kpi-card'))", 1)[1].split("} else if", 1)[0]
+    check("KPI cards no longer offer chart-only actions",
+          all(a not in _kpi_branch
+              for a in ("act('style')", "act('up')", "act('down')",
+                        "act('notes')", "act('open-analysis')"))
+          and "el.classList.contains('kpi-card')" in _js)
+    # Anchored on the pencil's own tooltip, not on a generic brace: the
+    # document has several "} else {" blocks and rsplit grabs the wrong one.
+    _chart_branch = _js.split("Edit chart in Analysis", 1)[0].rsplit(
+        "} else {", 1)[1] + _js.split("Edit chart in Analysis", 1)[1].split(
+        "el.appendChild(bar);", 1)[0]
+    check("chart cards offer pencil + delete only",
+          "act('open-analysis')" in _chart_branch
+          and "act('delete')" in _chart_branch
+          and all(a not in _chart_branch
+                  for a in ("act('style')", "act('up')", "act('down')",
+                            "act('notes')")))
+
+
+def test_kpi_move_up_accepts_the_first_card() -> None:
+    print("[31] KPI reorder: the first card can move up")
+    from desktop.pages import dashboard_page as dp
+
+    class _B:
+        def __init__(self):
+            self.kpis = [{"label": "A"}, {"label": "B"}, {"label": "C"}]
+            self.refreshed = 0
+            # The heading is a card in the same blob, so it is part of the
+            # fixture: without it the first _current_geometry call inserts a
+            # title band and shifts every KPI down, which would make these
+            # assertions about the SWAP measure the migration instead.
+            self.tiles = {"__title__": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 120.0},
+                          "0": {"x": 0.0, "y": 144.0, "w": 0.5, "h": 120.0},
+                          "1": {"x": 0.5, "y": 144.0, "w": 0.5, "h": 120.0},
+                          "2": {"x": 0.0, "y": 288.0, "w": 0.5, "h": 120.0}}
+
+        def get(self, key, default=None):
+            if key == "kpis":
+                return self.kpis
+            if key == "tile_geometry":
+                return self.tiles
+            return default
+
+        def set(self, key, value):
+            if key == "kpis":
+                self.kpis = value
+            if key == "tile_geometry":
+                self.tiles = value
+
+    holder = dp.DashboardPage.__new__(dp.DashboardPage)
+    b = _B()
+    holder.bridge = b
+    holder._refresh_kpis = lambda: setattr(b, "refreshed", b.refreshed + 1)
+    # The bare holder has no QTimers. Stubbed rather than built: the point of
+    # this test is the swap, not the debounced rebuild.
+    holder._schedule_regen = lambda *a, **k: None
+
+    # index 0 has no neighbour above it. The bound must stay "0 < index":
+    # relaxing it to "0 <= index" makes kpis[index - 1] wrap to kpis[-1], so
+    # the first card's up-arrow silently swaps it with the LAST card.
+    before = list(b.kpis)
+    dp.DashboardPage._on_move_kpi_up(holder, 0)
+    check("the first KPI refuses to move up (and does not wrap to the last)",
+          b.kpis == before, str([k["label"] for k in b.kpis]))
+    check("a refused move does not refresh the board", b.refreshed == 0,
+          str(b.refreshed))
+
+    dp.DashboardPage._on_move_kpi_up(holder, 2)
+    check("the last KPI moves up",
+          [k["label"] for k in b.kpis] == ["A", "C", "B"],
+          str([k["label"] for k in b.kpis]))
+    check("moving up refreshes the board", b.refreshed == 1, str(b.refreshed))
+
+    # Reordering the LIST is not enough any more: KPI cards are absolutely
+    # positioned, so where a card sits is decided by its geometry. Without the
+    # tile swap the arrow buttons would reorder a list nobody looks at and the
+    # board would not move -- the same "decorative control" bug as the handles.
+    # Checked after ONE swap, before the second undoes it.
+    check("moving a KPI trades its tile with its neighbour's",
+          b.tiles["1"] == {"x": 0.0, "y": 288.0, "w": 0.5, "h": 120.0}
+          and b.tiles["2"] == {"x": 0.5, "y": 144.0, "w": 0.5, "h": 120.0},
+          str(b.tiles))
+    check("a KPI tile outside the swap is left alone",
+          b.tiles["0"] == {"x": 0.0, "y": 144.0, "w": 0.5, "h": 120.0},
+          str(b.tiles["0"]))
+    check("the title card is not dragged along by a KPI reorder",
+          b.tiles["__title__"] == {"x": 0.0, "y": 0.0, "w": 1.0, "h": 120.0},
+          str(b.tiles.get("__title__")))
+
+    dp.DashboardPage._on_move_kpi_up(holder, 2)
+    check("moving up again is still a plain adjacent swap",
+          [k["label"] for k in b.kpis] == ["A", "B", "C"],
+          str([k["label"] for k in b.kpis]))
+    check("two swaps put the tiles back where they started",
+          b.tiles == {"__title__": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 120.0},
+                      "0": {"x": 0.0, "y": 144.0, "w": 0.5, "h": 120.0},
+                      "1": {"x": 0.5, "y": 144.0, "w": 0.5, "h": 120.0},
+                      "2": {"x": 0.0, "y": 288.0, "w": 0.5, "h": 120.0}},
+          str(b.tiles))
+
+    # Down is the mirror image, and must move the tiles too.
+    b.tiles = {"__title__": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 120.0},
+               "0": {"x": 0.0, "y": 144.0, "w": 0.5, "h": 120.0},
+               "1": {"x": 0.5, "y": 144.0, "w": 0.5, "h": 120.0}}
+    dp.DashboardPage._on_move_kpi_down(holder, 0)
+    check("moving a KPI down trades its tile too",
+          b.tiles["0"] == {"x": 0.5, "y": 144.0, "w": 0.5, "h": 120.0}
+          and b.tiles["1"] == {"x": 0.0, "y": 144.0, "w": 0.5, "h": 120.0},
+          str(b.tiles))
+
+
+def test_dashboard_panel_widgets_survive_construction() -> None:
+    print("[34] Dashboard panel: no section is built and then dropped")
+    import inspect
+    from desktop.pages import dashboard_page as dp
+
+    # EVERY CollapsibleSection built in _build_left_panel has to be handed to the
+    # layout. A section that is only a local variable has no parent and no
+    # reference, so Python collects it the moment the builder returns -- and Qt
+    # deletes its children with it. The page then kept reading
+    # self.session_name out of a destroyed C++ object, _regen_preview raised, and
+    # the canvas stayed blank no matter how many charts were generated.
+    src = inspect.getsource(dp.DashboardPage._build_left_panel)
+    import ast
+    tree = ast.parse(src.strip())
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef))
+    built = {t.id for n in ast.walk(fn) if isinstance(n, ast.Assign)
+             for t in n.targets if isinstance(t, ast.Name)}
+    sections = {name for name in built
+                if name in ("info", "kpi_group", "themes", "canvas",
+                            "text_group", "notes_group", "kpi_text_group")}
+    added = {a for n in ast.walk(fn) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Attribute) and n.func.attr == "addWidget"
+             and n.args and isinstance(n.args[0], ast.Name)
+             for a in (n.args[0].id,)}
+    missing = sorted(sections - added)
+    check("every collapsible section is added to the layout",
+          not missing, f"dropped sections: {missing}")
+
+    # Belt and braces: the widgets read on every rebuild must be reachable
+    # through the widget tree, which is only true if nothing was orphaned.
+    names = ("session_name", "dash_title", "layout_mode", "preset_gallery",
+             "btn_add_kpi", "ex_kpi_val_size")
+    src2 = inspect.getsource(dp.DashboardPage.__init__)
+    check("the panel's inputs are all created in the page builder",
+          all(f"self.{n}" in src2 or f"self.{n} =" in inspect.getsource(dp.DashboardPage._build_left_panel)
+              for n in names), str(names))
+
+
+def test_preset_buttons_show_their_theme_colours_and_names() -> None:
+    print("[35] Quick themes: labelled, and actually painted")
+    import inspect
+    from desktop.widgets import formatting_pane as fp
+
+    # Qt Style Sheets implement a SUBSET of CSS and qlinear-gradient is not in
+    # it: the declaration parses, is silently dropped, and every swatch rendered
+    # as a plain unstyled box. The bands therefore have to be painted.
+    check("the gallery builds PresetButton, not bare buttons",
+          "PresetButton(" in inspect.getsource(fp.PresetGallery.__init__),
+          "")
+    check("the swatch bands are painted, not style-sheeted",
+          "paintEvent" in inspect.getsource(fp.PresetButton), "")
+
+    # A theme you cannot name is not a preset you can pick.
+    check("the button paints a readable label",
+          "self._label" in inspect.getsource(fp.PresetButton.paintEvent), "")
+    check("the label strips the leading emoji",
+          fp._strip_emoji("\u26a1 Midnight Pulse") == "Midnight Pulse",
+          fp._strip_emoji("\u26a1 Midnight Pulse"))
+
+    # Contrast: the readable half is filled with the theme's PAGE colour, so a
+    # dark theme needs light ink. Painting dark ink on a dark theme is what made
+    # every caption invisible in the first screenshot.
+    for name, colors in fp.EXPORT_PRESETS.items():
+        dark_page = fp.luminance(colors.get("ex_bg", "#121a2e")) < 0.5
+        btn = fp.PresetButton(name, colors)
+        want = "#f8fbff" if dark_page else "#0f172a"
+        check(f"{name} label ink contrasts with its own page colour",
+              btn._fg == want, f"{btn._fg} on {colors.get('ex_bg')}")
+
+    # And the bands really are the theme's four colours.
+    first = next(iter(fp.EXPORT_PRESETS.items()))
+    btn = fp.PresetButton(first[0], first[1])
+    check("the four bands come from the preset's own keys",
+          btn._bands == [str(first[1].get(k, "#121a2e"))
+                         for k in fp.PRESET_SWATCH_KEYS], str(btn._bands))
+
+
+def test_kpi_band_does_not_sit_under_the_charts() -> None:
+    print("[36] KPI band is stacked above the charts, not hidden under them")
+    from desktop.widgets import tile_geometry as tg
+
+    # Charts and KPIs are auto-placed from two SEPARATE maps, so on a fresh
+    # session each used to put its first card at y=0. The charts are emitted
+    # after the KPIs, so the KPI row was simply covered -- "the KPI does not
+    # appear". floor_px is what keeps the two bands apart.
+    kpis = tg.auto_place(["0"], {}, gap_px=24, h=120)
+    charts = tg.auto_place(["a", "b"], {}, gap_px=24, h=400,
+                           floor_px=tg.canvas_height(kpis, 24))
+    check("the KPI band sits above the chart band",
+          charts["a"]["y"] >= kpis["0"]["y"] + kpis["0"]["h"],
+          f"kpi {kpis} charts {charts}")
+    check("the KPI and the charts do not overlap on a fresh board",
+          not tg.overlaps({**{f"k:{k}": v for k, v in kpis.items()},
+                           **{f"c:{k}": v for k, v in charts.items()}}),
+          str(charts))
+
+    # floor_px must not disturb an arrangement that already exists.
+    existing = {"a": {"x": 0.0, "y": 0.0, "w": 0.5, "h": 400.0}}
+    same = tg.auto_place(["a", "b"], existing, gap_px=24, h=400, floor_px=9999)
+    check("a floor below an existing card does not move it",
+          same["a"] == existing["a"], str(same))
+    check("a new card still lands under the existing one",
+          same["b"]["y"] > same["a"]["y"], str(same))
+
+
+def test_kpi_handlers_are_defined_once() -> None:
+    print("[32] KPI handlers: no duplicated definitions shadowing each other")
+    import ast
+    import pathlib
+    src = pathlib.Path("desktop/pages/dashboard_page.py").read_text()
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        seen: dict = {}
+        for item in node.body:
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                seen.setdefault(item.name, []).append(item.lineno)
+        dupes = {k: v for k, v in seen.items() if len(v) > 1}
+        check(f"{node.name} defines no method twice", not dupes, str(dupes))
+
+
+def test_preview_and_export_share_one_chart_input() -> None:
+    print("[33] Preview/export parity: notes and chart_type reach the canvas")
+    import inspect
+    from desktop import workers as wk
+
+    # The session holds bare (uid, title, fig) tuples, so a worker that
+    # rebuilds them without the maps loses notes and chart_type. That made the
+    # canvas show no notes while the exported file had them.
+    for cls in (wk.ReportPreviewWorker, wk.ExportWorker):
+        src = inspect.getsource(cls.run)
+        check(f"{cls.__name__} builds with no meta/notes maps dropped",
+              "build_export_charts(self._charts)" not in src)
+
+    from desktop.pages import dashboard_page as dp
+    # Two-stage pipeline: _regen_preview snapshots cheap state and
+    # ReportInputsWorker assembles the heavy inputs off-thread; the HTML
+    # build then consumes them verbatim. Assert the chain, not the old
+    # single synchronous _export_inputs() call.
+    src = inspect.getsource(dp.DashboardPage._regen_preview)
+    check("the preview assembles inputs off-thread",
+          "ReportInputsWorker" in src and "_snapshot_inputs" in src)
+    src2 = inspect.getsource(dp.DashboardPage._on_inputs_ready)
+    check("the preview reuses the assembled inputs verbatim",
+          'd["export_charts"]' in src2)
+
+    # And the notes commit has to rebuild, or the canvas keeps showing the
+    # pre-edit text while everything else is regenerated from the store.
+    nsrc = inspect.getsource(dp.DashboardPage._on_canvas_notes)
+    check("committing a note schedules a rebuild",
+          "_schedule_regen()" in nsrc)
+
+    # _export_inputs supplies BOTH geometry maps, but ExportWorker accepted
+    # only one of them -- so every single export died with a TypeError on the
+    # caller's keyword argument, before a byte was written.
+    import inspect as _i
+    import re as _re
+    esig = _i.signature(wk.ExportWorker.__init__).parameters
+    check("ExportWorker accepts the KPI geometry the caller passes",
+          "kpi_geometry" in esig, str(list(esig)))
+
+    # Every key _start_export forwards must exist in the worker's signature.
+    # Checked against the signature rather than by text, because the params
+    # are annotated ("kpis: Optional[list] = None"), so a "kpis=" substring
+    # test would flag perfectly valid parameters.
+    src = _i.getsource(dp.DashboardPage._start_export)
+    forwarded = set(_re.findall(r'd\["(\w+)"\]', src))
+    unknown = sorted(k for k in forwarded
+                     if k not in ("export_charts", "session_name", "state")
+                     and k not in esig)
+    check("every input _start_export forwards is one ExportWorker accepts",
+          not unknown, str(unknown))
+
+
+def test_editor_publishes_the_bridge_globally() -> None:
+    print("[34] Editor bridge: the connected channel is observable")
+    from modules.report_editor import editor_js
+    js = editor_js(2, 24)
+    # `bridge` is an IIFE-local, so assigning it alone left window.bridge
+    # undefined -- a working bridge indistinguishable from a dead one.
+    check("the editor publishes window.bridge", "window.bridge = bridge =" in js)
+
+
+def test_pie_legend_is_not_drawn_over_the_pie() -> None:
+    print("[35] Pie legend: the plate gets its own space")
+    import copy as _copy
+
+    import pandas as pd
+    import plotly.graph_objects as go
+    from chart_display import apply_legend_layout, _domain_traces
+    from modules.analysis.pie_chart import run_pie_chart
+    from modules.export import _is_domain_figure
+
+    df = pd.DataFrame({"product_category": [
+        "Tea", "Flavours", "Drinking Chocolate", "Coffee beans", "Bakery",
+        "Loose Tea", "Packaged Chocolate", "Coffee", "Branded", "Other"],
+        "Count": [137, 138, 136, 99, 89, 89, 89, 87, 76, 77]})
+    _title, pie = run_pie_chart(df, x_cols=["product_category"])[0]
+    labels = pie.data[0].labels
+    names = [str(x) for x in (labels if labels is not None else [])]
+
+    # The figure IS domain-based: it has no xaxis to carve.
+    check("a pie is recognised as a domain figure",
+          _is_domain_figure(pie) and _domain_traces(pie))
+    check("a cartesian bar chart is NOT domain-based",
+          not _is_domain_figure(go.Figure(go.Bar(x=["A"], y=[1]))))
+    check("the shipped pie really does start full width",
+          [round(v, 4) for v in pie.data[0].domain.x] == [0.0, 1.0])
+
+    # A side reservation must squeeze the TRACE domain and anchor the legend.
+    right = _copy.deepcopy(pie)
+    apply_legend_layout(right, "Right", names=names,
+                        legend_title="product_category", width_px=430)
+    check("a right-hand legend squeezes the pie's own domain",
+          [round(v, 3) for v in right.data[0].domain.x] == [0.0, 0.5],
+          str([round(v, 3) for v in right.data[0].domain.x]))
+    check("the legend is anchored OUT of the plot area",
+          right.layout.legend.x == 1.0
+          and right.layout.legend.xanchor == "right")
+    check("pie and legend no longer share horizontal space",
+          right.data[0].domain.x[1] <= 0.5 + 1e-9)
+
+    left = _copy.deepcopy(pie)
+    apply_legend_layout(left, "Left", names=names,
+                        legend_title="product_category", width_px=430)
+    check("a left-hand legend squeezes the other way",
+          [round(v, 3) for v in left.data[0].domain.x] == [0.5, 1.0],
+          str([round(v, 3) for v in left.data[0].domain.x]))
+
+    # Centred positions take the BAND path, which also used to write
+    # yaxis.domain and so was equally a no-op on a pie.
+    for pos in ("Bottom Center", "Top Center"):
+        band = _copy.deepcopy(pie)
+        plan = apply_legend_layout(band, pos, names=names,
+                                   legend_title="product_category",
+                                   width_px=430)
+        ydom = [round(v, 3) for v in band.data[0].domain.y]
+        check(f"{pos} reserves a real band on the trace",
+              plan.get("mode") == "band"
+              and (ydom[1] < 1.0 or ydom[0] > 0.0),
+              f"mode={plan and plan.get('mode')} y={ydom}")
+
+
+def test_pie_legend_squeeze_is_stable() -> None:
+    print("[36] Pie legend: the squeeze is idempotent and width-safe")
+    import copy as _copy
+
+    import pandas as pd
+    from chart_display import apply_legend_layout
+    from modules.analysis.pie_chart import run_pie_chart
+
+    df = pd.DataFrame({"product_category": [
+        "Tea", "Flavours", "Drinking Chocolate", "Coffee beans", "Bakery",
+        "Loose Tea", "Packaged Chocolate", "Coffee", "Branded", "Other"],
+        "Count": [137, 138, 136, 99, 89, 89, 89, 87, 76, 77]})
+    _title, pie = run_pie_chart(df, x_cols=["product_category"])[0]
+    labels = pie.data[0].labels
+    names = [str(x) for x in (labels if labels is not None else [])]
+
+    # A compounding squeeze would march the pie off the card over refits.
+    idem = _copy.deepcopy(pie)
+    apply_legend_layout(idem, "Right", names=names,
+                        legend_title="product_category", width_px=430)
+    snap = [round(v, 4) for v in idem.data[0].domain.x]
+    for _ in range(5):
+        apply_legend_layout(idem, "Right", names=names,
+                            legend_title="product_category", width_px=430)
+    check("repeated refits do not compound the squeeze",
+          [round(v, 4) for v in idem.data[0].domain.x] == snap, str(snap))
+
+    storm = _copy.deepcopy(pie)
+    apply_legend_layout(storm, "Right", names=names,
+                        legend_title="product_category", width_px=430)
+    for w in (1400, 700, 380, 900, 430):
+        apply_legend_layout(storm, "Right", names=names,
+                            legend_title="product_category", width_px=w)
+    fresh = _copy.deepcopy(pie)
+    apply_legend_layout(fresh, "Right", names=names,
+                        legend_title="product_category", width_px=430)
+    check("a resize storm converges on the single-shot layout",
+          [round(v, 4) for v in storm.data[0].domain.x]
+          == [round(v, 4) for v in fresh.data[0].domain.x])
+
+    # With no width the strip must OVER-reserve: the real card width is only
+    # decided by CSS at render time, so under-reserving reintroduces the bug.
+    nowidth = _copy.deepcopy(pie)
+    plan = apply_legend_layout(nowidth, "Right", names=names,
+                               legend_title="product_category")
+    check("a width-less export over-reserves instead of overlapping",
+          plan.get("mode") == "column" and plan.get("strip") >= 0.4,
+          f"strip={plan and plan.get('strip')}")
+
+
+def test_exporter_reserves_pie_legend_space() -> None:
+    print("[37] Exporter: pies get a reserved legend, cartesian charts do not")
+    import pandas as pd
+    import plotly.graph_objects as go
+    import re as _re
+    import json as _json
+    from modules.analysis.pie_chart import run_pie_chart
+    from modules.export import generate_html_report
+    from services.export_service import build_export_theme
+
+    def _plot(h):
+        m = _re.search(r'Plotly\.newPlot\(\s*"[^"]+",\s*(\[.*?\])\s*,\s*'
+                       r'(\{.*?\}),\s*\{', h, _re.S)
+        return ((_json.loads(m.group(1)), _json.loads(m.group(2)))
+                if m else (None, None))
+
+    th = build_export_theme({})
+    df = pd.DataFrame({"product_category": [
+        "Tea", "Flavours", "Drinking Chocolate", "Coffee beans", "Bakery",
+        "Loose Tea", "Packaged Chocolate", "Coffee", "Branded", "Other"],
+        "Count": [137, 138, 136, 99, 89, 89, 89, 87, 76, 77]})
+    _t, pie = run_pie_chart(df, x_cols=["product_category"])[0]
+
+    for pos in ("Top Right", "Bottom Center", "Left"):
+        h = generate_html_report(
+            [("p", "Pie", pie, "", "", {"legend_position": pos})],
+            "S", grid_cols_n=2, theme=th)
+        data, layout = _plot(h)
+        dom = (data[0].get("domain") or {}) if data else {}
+        lg = layout.get("legend", {}) if layout else {}
+        squeezed = dom.get("x") != [0.0, 1.0] or dom.get("y") != [0.0, 1.0]
+        anchored = lg.get("x") is not None and lg.get("xanchor") is not None
+        check(f"export reserves legend space for a pie ({pos})",
+              squeezed and anchored,
+              f"domain={dom} legend.x={lg.get('x')} anchor={lg.get('xanchor')}")
+
+    # A cartesian chart's saved layout is pinned elsewhere and must not shift.
+    bar = go.Figure(go.Bar(x=["A", "B"], y=[1, 2]))
+    hb = generate_html_report(
+        [("b", "Bar", bar, "", "", {"legend_position": "Top Right"})],
+        "S", grid_cols_n=2, theme=th)
+    _db, lb = _plot(hb)
+    check("a cartesian chart keeps its axis-based layout (xaxis untouched)",
+          "domain" not in (lb.get("xaxis") or {}), str(lb.get("xaxis")))
+
+    h = generate_html_report(
+        [("p", "Pie", pie, "", "", {}), ("b", "Bar", bar, "", "", {})],
+        "S", grid_cols_n=2, theme=th)
+    check("a report mixing a pie and a cartesian chart still exports",
+          len(_re.findall(r'class="chart-card"', h)) == 2)
+
+
+def test_card_chrome_does_not_clip_or_collide() -> None:
+    print("[38] Card chrome: full-size handles, heading that fits")
+    import plotly.express as px
+    import re as _re
+    from modules.report_editor import editor_css
+    from modules.export import generate_html_report
+    from services.export_service import build_export_theme
+
+    css = editor_css("#6163df")
+    # The card clips its overflow, so a handle placed outside it loses half its
+    # grab target -- the clipped handles visible on the cards in the report.
+    check("resize handles sit inside the clipping card",
+          ".ly-h-right  { top: 50%; right: 0;" in css
+          and ".ly-h-bottom { left: 50%; bottom: 0;" in css
+          and ".ly-h-corner { right: 0; bottom: 0;" in css)
+    check("no handle is left hanging outside the card",
+          "right: -6px" not in css and "bottom: -6px" not in css)
+    check("the heading clears the edit chrome",
+          ".ly-editing .chart-card h2" in css and "margin-top: 26px" in css)
+    check("chrome clearance is scoped to editing only",
+          not _re.search(r"^\s*\.chart-card h2[^{]*\{[^}]*margin-top: 26px",
+                         css, _re.M))
+
+    d = px.data.iris()
+    html = generate_html_report(
+        [("a", "A Very Long Chart Title That Has To Fit The Card Width",
+          px.bar(d, x="species", y="sepal_length"), "", "", {})],
+        "S", grid_cols_n=2, theme=build_export_theme({}))
+    check("the card heading can shrink/wrap to its card",
+          "overflow-wrap: break-word" in html
+          and "word-break: break-word" in html)
+    check("heading auto-fit rules reach the saved file",
+          "min-width: 0" in html)
+
+
+def test_the_title_is_a_card_like_every_other() -> None:
+    print("[39] Title: a card with the same tiling, handles and arrangement")
+    import re as _re
+    import plotly.express as px
+    from modules.canvas_geometry import (TITLE_UID, ensure_title_band,
+                                          is_grid_shaped)
+    from modules.export import generate_html_report
+    from modules.report_editor import editor_css, editor_js
+    from services.export_service import build_export_theme
+
+    d = px.data.iris()
+    html = generate_html_report(
+        [("a", "A", px.bar(d, x="species", y="sepal_length"), "", "", {})],
+        "S", grid_cols_n=2, theme=build_export_theme({}))
+
+    head = _re.search(r'<div class="report-header title-card"[^>]*>', html)
+    check("the heading is emitted as a card", head is not None, html[:400])
+    check("the title card carries the reserved uid the page stores it under",
+          bool(head) and f'data-uid="{TITLE_UID}"' in head.group(0), "")
+    check("the title card is positioned by geometry, not left in flow",
+          bool(head) and "left:" in head.group(0) and "top:" in head.group(0),
+          head.group(0) if head else "")
+    # It must be INSIDE the canvas, not beside it: outside, the overlay cannot
+    # see it and it is the one element that cannot be arranged.
+    canvas = _re.search(r'<div class="ly-canvas"[^>]*>(.*?)</div>\s*<script',
+                        html, _re.S)
+    check("the title card lives inside the free canvas",
+          bool(canvas) and f'data-uid="{TITLE_UID}"' in canvas.group(1), "")
+
+    # The first board this runs on has no title yet, and its charts all start at
+    # y=0 -- exactly where the new band lands.
+    saved = {"a": {"x": 0.0, "y": 0.0, "w": 0.5, "h": 400.0},
+             "b": {"x": 0.5, "y": 0.0, "w": 0.5, "h": 400.0}}
+    moved, title = ensure_title_band(saved, height=120, gap_px=24)
+    check("a board saved without a title gains one at the top",
+          TITLE_UID in moved and moved[TITLE_UID]["y"] == 0.0, str(moved))
+    check("the existing cards move DOWN, they are not covered by the title",
+          moved["a"]["y"] >= title["h"], str(moved))
+    check("the shift is one band, so their arrangement is preserved",
+          moved["a"]["y"] - saved["a"]["y"] == title["h"] + 24
+          and moved["a"]["h"] == saved["a"]["h"]
+          and moved["b"]["x"] == saved["b"]["x"], str(moved))
+    # ...and exactly once: with the title stored, the map must be untouched.
+    again, title2 = ensure_title_band(moved, height=999, gap_px=24)
+    check("a board that already has a title is left completely alone",
+          again == moved and title2["h"] == title["h"], str(again))
+
+    # Same grips, same handles: the overlay must decorate it.
+    js = editor_js(2, 24, mode="free")
+    check("the overlay picks the title card up as a card",
+          ".title-card[data-uid]" in js, "")
+    check("dragging the title works like dragging a chart",
+          # Read out of the begin() selector itself rather than matched as one
+          # literal: the list is wrapped over two lines and now carries
+          # .slicer-card, so an exact-substring test broke as soon as the
+          # slicer became a draggable family -- which is the behaviour being
+          # asserted here, not a punctuation detail.
+          (lambda _m: bool(_m) and all(
+              t in _m.group(1)
+              for t in ('.chart-card', '.kpi-card', '.title-card',
+                        '.slicer-card')))(
+              __import__('re').search(
+                  r"currentTarget\.closest\(\s*'([^']+)'", js)),
+          "")
+    css = editor_css("#6163df")
+    check("the title card is a drag target on the free canvas",
+          ".ly-editing.ly-free .title-card { cursor: grab; }" in css, "")
+    check("the heading clears the edit chrome like a chart heading does",
+          ".ly-editing .title-card h1" in css, "")
+    check("the title card gets no chart action bar",
+          "el.classList.contains('title-card')" in js, "")
+
+    # A saved session must bring the title back exactly where it was put. The
+    # loader int()-coerces every stored rectangle into GRID cells, and the title
+    # is always full width -- so left in that loop it came back as x=0, w=1 and
+    # the whole board was then mistaken for a legacy cell layout and rescaled.
+    from desktop.pages.dashboard_page import _load_saved_tiles
+    saved_back = _load_saved_tiles({
+        "grid_cols_n": 2,
+        "grid_fullwidth_json": '{"__title__": {"x": 0.1, "y": 30.0, '
+                               '"w": 0.8, "h": 150.0}, '
+                               '"a": {"x": 0.0, "y": 0.5, "w": 1.0, "h": 400.0}}',
+    })
+    check("the title survives a session round trip in free units",
+          saved_back[TITLE_UID] == {"x": 0.1, "y": 30.0, "w": 0.8, "h": 150.0},
+          str(saved_back.get(TITLE_UID)))
+    check("the title's presence cannot tip a free board into a grid reading",
+          is_grid_shaped({"a": {"x": 0.0, "y": 0.0, "w": 0.5, "h": 400.0}}, 2)
+          is is_grid_shaped(
+              {"a": {"x": 0.0, "y": 0.0, "w": 0.5, "h": 400.0},
+               TITLE_UID: saved_back[TITLE_UID]}, 2),
+          str(saved_back))
+
+
+def test_the_title_field_actually_rebuilds_the_board() -> None:
+    print("[40] Title field: typing has to reach the board")
+    import pathlib
+    src = pathlib.Path("desktop/pages/dashboard_page.py").read_text()
+    # The three Dashboard Info fields are only ever READ by _export_inputs,
+    # which is only called from a rebuild -- so with nothing connected, typing a
+    # title changed nothing until some other control happened to rebuild.
+    for field in ("dash_title", "session_name", "layout_mode"):
+        check(f"{field} is connected to a rebuild",
+              f"self.{field}.textChanged.connect" in src
+              or f"self.{field}.currentTextChanged.connect" in src, field)
+    check("the rebuild is debounced rather than per keystroke",
+          "_on_report_field_changed" in src
+          and "_schedule_regen(continuous=True)" in src, "")
+
+
+def test_legend_and_colourbar_follow_the_card() -> None:
+    print("[41] Legend/colour bar: no permanently dark plate")
+    import plotly.express as px
+    from modules.export import _luminance, _theme_chart_furniture
+    from services.export_service import EXPORT_PRESETS
+
+    def _legend_on(card_bg: str):
+        fig = px.bar(px.data.iris(), x="species", y="sepal_length",
+                     color="species")
+        # Exactly what the runners leave behind: a dark slate plate and
+        # near-white item text, hard-coded for a dark app canvas.
+        fig.update_layout(legend=dict(bgcolor="rgba(15, 23, 42, 0.35)",
+                                      font=dict(color="#e2e8f0")))
+        _theme_chart_furniture(fig, card_bg, "#334155")
+        return fig.layout.legend
+
+    light = _legend_on("#ffffff")
+    dark = _legend_on("#1b2245")
+    check("a light card gets a light legend plate",
+          "255, 255, 255" in str(light.bgcolor), str(light.bgcolor))
+    check("a dark card gets a dark legend plate",
+          "11, 18, 32" in str(dark.bgcolor), str(dark.bgcolor))
+    check("legend items are dark ink on a light card",
+          str(light.font.color) == "#334155", str(light.font.color))
+    check("legend items stay light on a dark card",
+          str(dark.font.color) == "#e2e8f0", str(dark.font.color))
+
+    # EVERY preset must resolve. Checking two hand-picked colours would not catch
+    # a preset that regresses, and the presets are the palettes users pick from.
+    bad = []
+    for name, colours in EXPORT_PRESETS.items():
+        plate = str(_legend_on(colours["ex_card"]).bgcolor)
+        card = colours["ex_card"]
+        if (_luminance(card) >= 0.5) != ("255, 255, 255" in plate):
+            bad.append(name)
+    check("every quick theme resolves its legend plate to its own side",
+          not bad, str(bad))
+
+    # A colour the USER picked is never re-tinted, or the setting that is
+    # supposed to control it stops controlling anything.
+    fig = px.bar(px.data.iris(), x="species", y="sepal_length", color="species")
+    fig.update_layout(legend=dict(font=dict(color="#ff00ff")))
+    _theme_chart_furniture(fig, "#ffffff", "#334155")
+    check("a user-picked legend colour is left alone",
+          str(fig.layout.legend.font.color) == "#ff00ff",
+          str(fig.layout.legend.font.color))
+
+    # The colour bar is the other piece of furniture drawn inside the SVG.
+    import plotly.graph_objects as go
+    cfig = go.Figure(go.Scatter(x=[1, 2], y=[1, 2], marker=dict(
+        color=[1, 2], colorbar=dict(tickfont=dict(color="#e2e8f0")))))
+    _theme_chart_furniture(cfig, "#ffffff", "#334155")
+    check("colour-bar ticks follow a light card too",
+          str(cfig.data[0].marker.colorbar.tickfont.color) == "#334155",
+          str(cfig.data[0].marker.colorbar.tickfont.color))
+
+    # And it must actually run on the way out, or none of the above is reachable.
+    from modules.export import generate_html_report
+    from services.export_service import build_export_theme
+    html = generate_html_report(
+        [("a", "A", px.bar(px.data.iris(), x="species", y="sepal_length",
+                           color="species"), "", "", {})],
+        "S", grid_cols_n=2, theme=build_export_theme({"ex_card": "#ffffff"}))
+    check("the exporter applies it to a real chart",
+          "rgba(255, 255, 255, 0.860)" in html, "")
+    check("the old hard-coded slate plate is gone from a light report",
+          "rgba(15, 23, 42, 0.35)" not in html, "")
+
+
+def test_styling_never_invents_a_colour_bar() -> None:
+    """The ghost colour bar: styling must not CREATE a scale nobody asked for.
+
+    ``trace.colorbar`` / ``layout.coloraxis.colorbar`` are not plain attributes
+    -- Plotly synthesises a default sub-object on every read, and any assignment
+    to it is serialised as a real ``colorbar`` key. ``plotly.js`` decides
+    "this chart HAS a colour bar" from exactly that key
+    (``isPlainObject(t.colorbar)``), so a helper that styled
+    ``getattr(tr, "colorbar", None)`` unconditionally painted a full colour ramp
+    with tick labels down the right-hand edge of every bar, line and pie chart
+    on the dashboard.
+
+    ``real_colorbars`` is the fix, and the split it encodes is what makes this
+    test non-obvious: default-scale traces (heatmap, contour, choropleth, ...)
+    must be CAUGHT even though no ``colorbar`` appears in their JSON, while
+    opt-in traces (marker colour) must be left alone unless asked.
+    """
+    import copy
+    print("[52] Colour-bar styling cannot conjure a colour bar")
+    import plotly.express as px
+    import plotly.graph_objects as go
+    from chart_display import (_apply_colorbar_border, apply_display_options,
+                               default_layout_opts, real_colorbars)
+    from modules.export import _theme_chart_furniture
+
+    # A figure "has" a colour bar exactly when ``colorbar`` is a plain object
+    # somewhere in its serialised form -- the same test plotly.js applies.
+    #
+    # ``layout.template`` MUST be skipped: Plotly ships a default template whose
+    # every trace type carries a colorbar (that is what lets a user write
+    # ``template="plotly_dark"`` and get bars), and plotly.js never draws those
+    # for a bar trace. Walking into it would flag every figure in existence.
+    def drawn(fig) -> bool:
+        def walk(node):
+            if isinstance(node, dict):
+                if isinstance(node.get("colorbar"), dict):
+                    return True
+                return any(k != "template" and walk(v)
+                           for k, v in node.items())
+            if isinstance(node, (list, tuple)):
+                return any(walk(v) for v in node)
+            return False
+        return walk(fig.to_plotly_json())
+
+    # -- The reported bug: every chart type with no scale must stay bare.
+    ghosts = []
+    for label, fig in (
+            ("bar", px.bar(px.data.iris(), x="species", y="sepal_length")),
+            ("grouped bar", px.bar(px.data.iris(), x="species",
+                                   y="sepal_length", color="species")),
+            ("bar+line dual axis",
+             go.Figure(go.Bar(x=list("abc"), y=[3, 2, 1])).add_trace(
+                 go.Scatter(x=list("abc"), y=[1, 2, 3], yaxis="y2"))),
+            ("line", px.line(px.data.gapminder(), x="year", y="gdpPercap",
+                             color="country")),
+            ("area", px.area(px.data.stocks(), x="date", y="GOOG")),
+            ("pie", px.pie(px.data.tips(), values="total_bill", names="day")),
+            ("donut", go.Figure(go.Pie(labels=list("abc"), values=[1, 2, 3],
+                                       hole=0.4))),
+            ("scatter", px.scatter(px.data.iris(), x="sepal_width",
+                                   y="sepal_length")),
+            # A px bubble with a CONTINUOUS colour is NOT here: px binds it to
+            # layout.coloraxis and plotly really does draw a ramp for it, so it
+            # belongs in the "keep" list below. Discrete / no colour is the case
+            # that must stay bare.
+            ("histogram", px.histogram(px.data.tips(), x="total_bill")),
+            ("box", px.box(px.data.tips(), x="day", y="total_bill")),
+            ("table", go.Figure(go.Table(header=dict(values=["a", "b"]),
+                                         cells=dict(values=[[1, 2], [3, 4]])))),
+    ):
+        # Run each through BOTH passes that used to leak, in both border
+        # states -- "Show border" ON was the loudest ghost of all.
+        for border in (True, False):
+            themed = _theme_chart_furniture(copy.deepcopy(fig), "#ffffff", "#334155")
+            styled = apply_display_options(
+                copy.deepcopy(fig), default_layout_opts(), width_px=700)
+            _apply_colorbar_border(styled, border)
+            for tag, out in (("themed", themed), ("display", styled)):
+                # ``drawn`` walks the serialised form, so a bar written by any
+                # route at all is caught, not just the ones we think to test.
+                if drawn(out) or list(real_colorbars(out)):
+                    ghosts.append(f"{label}/{tag}/border={border}")
+    check("no chart without a scale grows a colour bar (bar/line/pie/table/...)",
+          not ghosts, ", ".join(ghosts[:6]))
+
+    # A plain numeric marker colour is a colour, not a colour RAMP: Plotly maps
+    # each value to one swatch, so there is nothing for a bar to show.
+    nums = go.Figure(go.Scatter(x=[1, 2], y=[1, 2],
+                                marker=dict(color=[3, 7], showscale=False)))
+    check("numeric marker colour with showscale off keeps no colour bar",
+          not drawn(nums), "")
+
+    # -- Real bars must survive BOTH passes, or "Show border" silently dies.
+    keep = []
+    for label, fig in (
+            ("heatmap", go.Figure(go.Heatmap(z=[[1, 2], [3, 4]]))),
+            ("contour", go.Figure(go.Contour(z=[[1, 2], [3, 4]]))),
+            ("surface", go.Figure(go.Surface(z=[[1, 2], [3, 4]]))),
+            ("histogram2d", go.Figure(
+                go.Histogram2d(x=[1, 1, 2, 2], y=[1, 2, 1, 2]))),
+            ("choropleth", go.Figure(go.Choropleth(
+                locations=["IND", "USA"], z=[3, 7]))),
+            ("marker showscale", go.Figure(go.Scatter(
+                x=[1, 2], y=[1, 2],
+                marker=dict(color=[3, 7], showscale=True)))),
+            ("marker colorbar", go.Figure(go.Scatter(
+                x=[1, 2], y=[1, 2],
+                marker=dict(color=[3, 7], colorbar=dict(title="r"))))),
+            ("px.imshow", px.imshow([[1, 2], [3, 4]])),
+            # px binds a continuous scatter/bubble to layout.coloraxis and sets
+            # a colorbar title there, so plotly draws a ramp -- it must survive.
+            ("px bubble", px.scatter(px.data.iris(), x="sepal_width",
+                                     y="sepal_length", size="petal_length",
+                                     color="petal_length")),
+    ):
+        themed = _theme_chart_furniture(copy.deepcopy(fig), "#ffffff", "#334155")
+        styled = apply_display_options(
+            copy.deepcopy(fig), default_layout_opts(), width_px=700)
+        _apply_colorbar_border(styled, True)
+        missing = [tag for tag, out in (("themed", themed), ("display", styled))
+                   if not (drawn(out) and list(real_colorbars(out)))]
+        if missing:
+            keep.append(f"{label}:{'/'.join(missing)}")
+    check("every real colour bar survives theming and display options",
+          not keep, ", ".join(keep))
+
+    # showscale=False is the user explicitly saying "no scale"; it must beat the
+    # heatmap default, or the toggle cannot turn a bar off.
+    off = go.Figure(go.Heatmap(z=[[1, 2], [3, 4]], showscale=False))
+    off = _theme_chart_furniture(off, "#ffffff", "#334155")
+    _apply_colorbar_border(
+        apply_display_options(off, default_layout_opts(), width_px=700), True)
+    check("showscale=False beats the heatmap default and hides the bar",
+          not drawn(off) and not list(real_colorbars(off)), "")
+
+    # "Show border" still has to REACH the bar it is meant to frame.
+    bord = go.Figure(go.Heatmap(z=[[1, 2], [3, 4]]))
+    _apply_colorbar_border(bord, True)
+    check("Show border on reaches a real colour bar",
+          int(bord.data[0].colorbar.borderwidth or 0) == 1,
+          str(bord.data[0].colorbar.borderwidth))
+    _apply_colorbar_border(bord, False)
+    check("Show border off clears it again",
+          int(bord.data[0].colorbar.borderwidth or 0) == 0,
+          str(bord.data[0].colorbar.borderwidth))
+
+    # px.imshow binds to the shared layout.coloraxis and its OWN colorbar is
+    # ignored by plotly.js, so exactly one bar must come out -- the axis one.
+    im = apply_display_options(px.imshow([[1, 2], [3, 4]]),
+                               default_layout_opts(), width_px=700)
+    check("px.imshow is styled exactly once, on the shared colour axis",
+          len(list(real_colorbars(im))) == 1,
+          str(len(list(real_colorbars(im)))))
+
+    # The end-to-end proof: a dark-themed bar chart exported as HTML must carry
+    # no colorbar key in its FIGURE payload. This is the path the dashboard
+    # actually takes, and it is the one that produced the visible artefact.
+    #
+    # The page also embeds plotly.js itself, whose source is full of the words
+    # "coloraxis"/"colorbar" (schema + the default template), so the page text
+    # cannot be substring-matched. The traces are the JSON array handed to
+    # ``Plotly.newPlot``, and THAT is what plotly.js reads at draw time.
+    import json as _json
+    from modules.export import generate_html_report
+    from services.export_service import build_export_theme
+    html = generate_html_report(
+        [("a", "A", px.bar(px.data.iris(), x="species", y="sepal_length",
+                           color="species"), "", "", {})],
+        "S", grid_cols_n=2,
+        theme=build_export_theme({"ex_card": "#0b1220"}))
+    # ``rfind``: the embedded plotly.js bundle ALSO contains the literal text
+    # "Plotly.newPlot(" inside its own strings, so the FIRST match is library
+    # source. The chart's own call is the LAST one.
+    start = html.rfind("Plotly.newPlot(")
+    check("the exported report embeds the chart for Plotly to draw",
+          start > 0, str(start))
+    payload = html[start + len("Plotly.newPlot("):].lstrip()
+    payload = payload[payload.index("["):]
+    try:
+        traces, _ = _json.JSONDecoder().raw_decode(payload)
+    except Exception as exc:
+        traces = []
+        check("the chart payload parses out of the report", False, str(exc))
+
+    def ghosts(node):
+        """Every colorbar / coloraxis binding in a serialised figure payload.
+
+        Walks the WHOLE tree, because the ghost does not land on the trace: a
+        bar trace has no ``colorbar`` property at all, so the phantom bar is
+        written to ``marker.colorbar`` (and to ``layout.coloraxis.colorbar``),
+        which is exactly where plotly.js looks. A trace-level-only check would
+        have missed the reported bug entirely.
+        """
+        found = []
+        if isinstance(node, dict):
+            for key, val in node.items():
+                if key == "template":
+                    continue  # plotly's default theme, never drawn
+                if key in ("colorbar", "coloraxis") and val:
+                    found.append(f"{key}={str(val)[:40]}")
+                found.extend(ghosts(val))
+        elif isinstance(node, (list, tuple)):
+            for val in node:
+                found.extend(ghosts(val))
+        return found
+
+    report_ghosts = ghosts(traces)
+    check("a dark themed bar export ships no colorbar binding anywhere",
+          not report_ghosts, ", ".join(report_ghosts[:4]))
+    # And the plotly.js bundle really is in there, so the check above was not
+    # trivially true because nothing was embedded at all.
+    check("the report really does ship plotly.js (the check is not vacuous)",
+          "Plotly.newPlot" in html and len(html) > 200_000, str(len(html)))
+
+
+def test_kpi_value_and_label_are_stylable() -> None:
+    print("[42] KPI customisation: the value and the label are separable")
+    import re as _re
+    import plotly.express as px
+    from modules.export import generate_html_report
+    from services.export_service import (EXPORT_DEFAULTS, PRESET_SWATCH_KEYS,
+                                         build_export_theme)
+
+    d = px.data.iris()
+    kpis = [{"label": "Total Sales", "value": "149,116", "icon": "M",
+             "column": "sepal_length"}]
+
+    def _card(state: dict) -> str:
+        html = generate_html_report(
+            [("a", "A", px.bar(d, x="species", y="sepal_length"), "", "", {})],
+            "S", kpis=kpis, grid_cols_n=2, theme=build_export_theme(state))
+        m = _re.search(r'<div class="kpi-value" style="([^"]*)"', html)
+        m2 = _re.search(r'<div class="kpi-label" style="([^"]*)"', html)
+        return (m.group(1) if m else "") + "|" + (m2.group(1) if m2 else "")
+
+    base = _card({})
+    coloured = _card({"ex_kpi_val_color": "#ff0055"})
+    check("the KPI value takes its own colour",
+          "color:#ff0055" in coloured, coloured)
+    check("an unset value colour still follows the theme accent",
+          "color:#6163df" in base, base)
+
+    sized = _card({"ex_kpi_label_size": 18})
+    check("the KPI label takes its own size", "font-size:18px" in sized, sized)
+    check("the label and the value are styled independently",
+          "font-size:18px" in sized and "color:#6163df" in sized, sized)
+
+    upper = _card({"ex_kpi_label_upper": True})
+    plain = _card({"ex_kpi_label_upper": False})
+    check("label caps can be switched off",
+          "text-transform:uppercase" in upper and "text-transform:none" in plain,
+          f"{upper} / {plain}")
+
+    # Every key must exist end to end, or the panel writes a key nothing reads.
+    for key in ("ex_kpi_val_color", "ex_kpi_label_size", "ex_kpi_label_upper"):
+        check(f"{key} is a known style key", key in EXPORT_DEFAULTS, key)
+    check("a quick theme does not overwrite the KPI customisation",
+          not any(k in PRESET_SWATCH_KEYS
+                  for k in ("ex_kpi_val_color", "ex_kpi_label_size",
+                            "ex_kpi_label_upper")), "")
+
+
+def test_the_dashboard_has_a_background_image() -> None:
+    print("[43] Background image: works over any theme, survives the export")
+    from modules.export import generate_html_report
+    from services.export_service import (EXPORT_DEFAULTS, EXPORT_PRESETS,
+                                         build_export_theme)
+
+    check("the background image is a known style key",
+          "ex_bg_image" in EXPORT_DEFAULTS
+          and "ex_bg_image_opacity" in EXPORT_DEFAULTS
+          and "ex_bg_blend" in EXPORT_DEFAULTS, "")
+
+    uri = "data:image/png;base64,AAAA"
+    html = generate_html_report(
+        [], "S", theme=build_export_theme(
+            {"ex_bg_image": uri, "ex_bg_image_opacity": 40}))
+    check("the image reaches the report", uri in html, "")
+    check("it is layered OVER the theme colour, not instead of it",
+          "body::before" in html and "z-index: -1" in html, "")
+    check("the theme colour is still the base layer",
+          "background: #121a2e" in html, "")
+    check("it cannot cover a card or a note", "pointer-events: none" in html, "")
+    check("it does not scroll away on a tall board",
+          "position: fixed" in html, "")
+    check("the chosen opacity is honoured", "opacity: 0.400" in html, "")
+
+    # It must work for EVERY theme -- that is the whole point of compositing
+    # rather than replacing.
+    missing = [n for n, c in EXPORT_PRESETS.items()
+               if uri not in generate_html_report(
+                   [], "S", theme=build_export_theme(
+                       dict(c, ex_bg_image=uri, ex_bg_image_opacity=30)))]
+    check("every quick theme keeps the background image", not missing,
+          str(missing))
+
+    # No image -> no pseudo-element at all, so nothing can be left behind.
+    plain = generate_html_report([], "S", theme=build_export_theme({}))
+    check("a report with no image emits no background layer",
+          "body::before" not in plain, "")
+    off = generate_html_report([], "S", theme=build_export_theme(
+        {"ex_bg_image": uri, "ex_bg_image_opacity": 0}))
+    check("zero opacity switches the layer off",
+          "body::before" not in off, "")
+
+
+def test_every_dashboard_setting_reaches_the_report() -> None:
+    print("[44] Every style key in the panel changes the report")
+    import plotly.express as px
+    from modules.export import generate_html_report
+    from services.export_service import build_export_theme
+
+    d = px.data.iris()
+    kpis = [{"label": "Total", "value": "10", "icon": "M"}]
+
+    def _report(state: dict) -> str:
+        return generate_html_report(
+            [("a", "A", px.bar(d, x="species", y="sepal_length"),
+              "a note", "", {})],
+            "S", kpis=kpis, grid_cols_n=2, theme=build_export_theme(state))
+
+    base = _report({})
+    # (style key, a value, a fragment present only once it is set). A control
+    # that changes nothing on the board is the bug this pins down -- key by key,
+    # rather than by trusting that the panel and the writer agree.
+    probes = [
+        ("ex_bg", "#101010", "background: #101010"),
+        ("ex_card", "#202020", "background: #202020"),
+        ("ex_kpi", "#303030", "background: #303030"),
+        ("ex_border", "#445566", "border: 1px solid #445566"),
+        ("ex_text", "#fefefe", "color:#fefefe"),
+        ("ex_accent", "#00ff00", "color:#00ff00"),
+        ("ex_not_bg", "#0a0a1a", "background: #0a0a1a"),
+        ("ex_not_bd", "#8844ff", "border-left: 4px solid #8844ff"),
+        ("ex_title_color", "#00aaff", "color: #00aaff"),
+        ("ex_notes_color", "#ccccff", "color: #ccccff"),
+        ("ex_kpi_text_color", "#dddddd", "color:#dddddd"),
+        ("ex_kpi_val_size", 40, "font-size:40px"),
+        ("ex_title_font", "Georgia", "Georgia"),
+        ("ex_title_size", 40, "font-size: 2.50rem"),
+        ("ex_notes_size", 22, "font-size: 1.38rem"),
+        ("ex_radius", 30, "border-radius: 30px"),
+        ("ex_title_style", "Bold", "font-weight: 900"),
+    ]
+    dead = []
+    for key, value, fragment in probes:
+        if fragment in base:
+            dead.append(f"{key}: already present by default")
+        elif fragment not in _report({key: value}):
+            dead.append(f"{key}: {fragment!r} missing")
+    check("no dashboard setting is a no-op on the report", not dead,
+          "; ".join(dead))
+
+    # The two Style combos are checked inside their OWN rule rather than by a
+    # document-wide fragment: "font-weight: 700" is also what a chart heading
+    # carries, so a bare search would pass even with the setting ignored.
+    def _rule(html: str, selector: str) -> str:
+        # The selector includes its own "{", so the body starts at the next one.
+        import re
+        m = re.search(re.escape(selector) + r"([^}]*)\}", html)
+        return m.group(1) if m else ""
+
+    notes_rule = _rule(_report({"ex_notes_style": "Bold"}), ".notes {")
+    check("Notes Typography > Style reaches the notes block",
+          "font-weight: 700" in notes_rule
+          and "font-style: normal" in notes_rule, notes_rule)
+    check("the notes keep their established look by default",
+          "font-style: italic" in _rule(base, ".notes {"),
+          _rule(base, ".notes {"))
+
+
+def test_cards_have_no_dead_padding() -> None:
+    """Image 1: the KPI and title cards were mostly empty box.
+
+    Both cards are sized by the user (drag/resize on the free canvas), so any
+    padding or inner gap is height the content does not get. This pins the
+    specific declarations that were reported as the "KPI emoji & values gap".
+    """
+    print("[45] KPI and title cards: content fills the box")
+    from modules.export import generate_html_report
+    from services.export_service import build_export_theme
+
+    html = generate_html_report([], "S", theme=build_export_theme({}))
+
+    def _rule(selector: str) -> str:
+        import re
+        m = re.search(re.escape(selector) + r"([^}]*)\}", html)
+        return m.group(0) if m else ""
+
+    # The gap between the emoji and the value was a margin on the icon.
+    icon = _rule(".kpi-icon  {")
+    check("the KPI icon has no margin of its own",
+          "margin: 0" in icon and "margin-bottom" not in icon, icon)
+    # And the gap between the value and its label was a margin-top on the label.
+    label = _rule(".kpi-label {")
+    check("the KPI label sits directly under the value",
+          "margin-top: 0" in label, label)
+    value = _rule(".kpi-value {")
+    check("the KPI value carries no default margin", "margin: 0" in value,
+          value)
+    # A card the user sized to 120px cannot also spend a rem-and-a-half on
+    # padding, and the title band is the same kind of sized box.
+    kpi_card = _rule(".kpi-card {")
+    check("the KPI card's padding is cut to almost nothing",
+          "padding: 0.25rem 0.5rem" in kpi_card, kpi_card)
+    canvas_kpi = _rule(".ly-canvas > .kpi-card {")
+    check("a KPI on the free canvas has NO padding at all",
+          "padding: 0;" in canvas_kpi, canvas_kpi)
+    title_card = _rule(".ly-canvas > .title-card {")
+    check("the title band's padding is cut back",
+          "padding: 0.35rem 0.6rem" in title_card, title_card)
+    meta = _rule(".ly-canvas > .title-card .meta {")
+    check("the timestamp sits directly under the heading",
+          "margin-top: 0" in meta, meta)
+
+    # The old free-canvas KPI also had its own icon margin, which would have
+    # survived the change above and re-introduced the gap on the canvas.
+    check("no rule re-introduces a gap under the KPI icon",
+          "kpi-icon { margin-bottom" not in html
+          and ".ly-canvas > .kpi-card .kpi-icon" not in html, "")
+
+
+def test_cards_can_have_their_own_background_image() -> None:
+    """Image 2: a background image for the CARDS, not just the page."""
+    print("[46] Card background image: per card kind, embedded, themable")
+    import plotly.express as px
+    from modules.export import generate_html_report
+    from services.export_service import (EXPORT_DEFAULTS, build_export_theme)
+
+    check("the card image is a known style key",
+          "ex_card_image" in EXPORT_DEFAULTS
+          and "ex_card_image_opacity" in EXPORT_DEFAULTS
+          and "ex_card_blend" in EXPORT_DEFAULTS
+          and "ex_card_image_groups" in EXPORT_DEFAULTS, "")
+    check("it is off by default, so no existing report changes",
+          EXPORT_DEFAULTS["ex_card_image"] == "", "")
+
+    uri = "data:image/png;base64,BBBB"
+    d = px.data.iris()
+
+    def _report(state: dict) -> str:
+        return generate_html_report(
+            [("a", "A", px.bar(d, x="species", y="sepal_length"),
+              "", "", {})],
+            "S", theme=build_export_theme(state))
+
+    html = _report({"ex_card_image": uri, "ex_card_image_opacity": 40})
+    check("the picture is embedded in the report, not linked", uri in html, "")
+    check("it is drawn on the cards, not on the page",
+          ".chart-card::before" in html, "")
+    check("it is layered OVER the card colour, so it works on any theme",
+          "mix-blend-mode" in html, "")
+    check("the card keeps clipping it to the rounded corners",
+          "overflow: hidden" in html, "")
+    # The card's text and plot must stay ON TOP of the picture; a picture that
+    # buries the content is not a feature.
+    check("the card's own content is lifted above the picture",
+          "z-index: 1" in html, "")
+    check("it cannot swallow a click meant for a card or the chart",
+          "pointer-events: none" in html, "")
+    check("the chosen opacity is honoured", "opacity: 0.400" in html, "")
+
+    # "WHERE it applies" is the point of the feature: the same picture behind
+    # only the KPI strip, or only the title band.
+    only_kpi = _report({"ex_card_image": uri, "ex_card_image_opacity": 40,
+                        "ex_card_image_groups": "kpi"})
+    check("the image can go behind the KPI cards alone",
+          ".kpi-card::before" in only_kpi
+          and ".chart-card::before" not in only_kpi
+          and ".title-card::before" not in only_kpi, "")
+    only_title = _report({"ex_card_image": uri, "ex_card_image_opacity": 40,
+                          "ex_card_image_groups": "title"})
+    check("the image can go behind the title band alone",
+          ".title-card::before" in only_title
+          and ".kpi-card::before" not in only_title, "")
+    both = _report({"ex_card_image": uri, "ex_card_image_opacity": 40,
+                    "ex_card_image_groups": "kpi,title"})
+    check("it can go behind several kinds at once",
+          ".kpi-card::before" in both and ".title-card::before" in both
+          and ".chart-card::before" not in both, "")
+
+    # Off switches. A layer that cannot be switched off is a layer the user
+    # cannot get rid of.
+    plain = _report({})
+    check("a report with no card image emits no card layer",
+          "chart-card::before" not in plain, "")
+    off = _report({"ex_card_image": uri, "ex_card_image_opacity": 0})
+    check("zero opacity switches the card layer off",
+          "chart-card::before" not in off, "")
+    nowhere = _report({"ex_card_image": uri, "ex_card_image_opacity": 40,
+                       "ex_card_image_groups": ""})
+    check("ticking no card kinds switches it off too",
+          "chart-card::before" not in nowhere, "")
+    # An unrecognised group name must not silently widen the image to every
+    # card -- a corrupt or hand-edited style value should draw nothing extra.
+    bogus = _report({"ex_card_image": uri, "ex_card_image_opacity": 40,
+                     "ex_card_image_groups": "banana"})
+    check("an unknown group name draws nothing rather than guessing",
+          "banana" not in bogus and "chart-card::before" not in bogus, "")
+
+    # The page background and the card background are independent settings.
+    both_layers = _report({"ex_bg_image": "data:image/png;base64,AAAA",
+                           "ex_card_image": uri, "ex_card_image_opacity": 40})
+    check("the page image and the card image can both be on",
+          "body::before" in both_layers
+          and ".chart-card::before" in both_layers, "")
+
+    # The chart's own background is opaque, so a picture behind a chart card
+    # would be invisible without this.
+    themed = _report({"ex_card_image": uri, "ex_card_image_opacity": 40})
+    check("a picture behind a chart card makes the plot transparent",
+          "rgba(0,0,0,0)" in themed, "")
+
+    # PRINT. The print block puts the free canvas back into document flow, and
+    # the card image is drawn on the card's own ::before -- so if print made the
+    # card `static` again, that pseudo-element would lose its containing block
+    # and anchor to the page, printing ONE full-sheet picture over everything
+    # instead of one picture per card.
+    import re
+    free_html = generate_html_report(
+        [("a", "A", px.bar(d, x="species", y="sepal_length"), "", "", {})],
+        "S", kpis=[{"label": "T", "value": "1", "icon": "M"}],
+        geometry_mode="free",
+        theme=build_export_theme({"ex_card_image": uri,
+                                  "ex_card_image_opacity": 40}))
+    print_block = free_html[free_html.index("@media print"):]
+    card_rule = re.search(r"\.ly-canvas > \.chart-card,[^}]*\}", print_block)
+    check("print keeps the card a containing block for its own picture",
+          card_rule is not None
+          and "position: relative" in card_rule.group(0)
+          and "position: static" not in card_rule.group(0),
+          card_rule.group(0) if card_rule else "rule not found")
+
+
+def test_home_banner_scales_with_the_window() -> None:
+    """The official banner artwork: present, and stretched to the window."""
+    print("[47] Home banner: fills the header and follows the window width")
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QLabel, QWidget, QVBoxLayout
+    _app = QApplication.instance() or QApplication([])
+    from desktop.pages.home_page import HomePage, _asset_path
+    from desktop.session_bridge import SessionBridge
+    from desktop.widgets.banner_label import BannerLabel
+
+    # The asset is resolved from the same bundle as the icon and the logo, so a
+    # rename or a packaging change has one place to be reflected.
+    check("the banner asset is bundled with the app",
+          _asset_path("welcome-banner.png").exists(),
+          str(_asset_path("welcome-banner.png")))
+
+    host = QWidget()
+    lay = QVBoxLayout(host)
+    page = HomePage(SessionBridge())
+    lay.addWidget(page)
+    host.resize(1600, 900)
+    host.show()
+    _app.processEvents()
+
+    banner = page.banner
+    check("the banner is on the Home page", isinstance(banner, BannerLabel),
+          type(banner).__name__)
+    check("the banner artwork actually loaded", banner.has_image,
+          "pixmap is null")
+
+    src = banner._source
+    native = (src.width(), src.height())
+    check("the banner is the bundled PNG, not a placeholder",
+          native == (1080, 462), str(native))
+
+    # It must stretch WITH the window. A fixed-size pixmap would report the
+    # same width at every window size, which is the bug this pins down.
+    widths = []
+    for w in (1000, 1400, 1900):
+        host.resize(w, 900)
+        _app.processEvents()
+        widths.append(banner.width())
+    check("the banner takes the width the window offers",
+          widths == sorted(widths) and widths[0] < widths[-1], str(widths))
+
+    # Never upscaled past native: a blown-up PNG is visibly soft. This is a "fit"
+    # rule, so it is asserted on a fit-mode banner. The Home banner deliberately
+    # does NOT obey it -- "cover" has to scale past native in order to span a
+    # box wider than the source, which is the whole point of the mode.
+    fitted = BannerLabel(str(_asset_path("welcome-banner.png")))
+    fitted.show()
+    _app.processEvents()
+    host.resize(3000, 900)
+    fitted.resize(3000, 300)
+    _app.processEvents()
+    check("a fit-mode banner is never enlarged beyond its native width",
+          fitted.pixmap().width() <= native[0],
+          f"{fitted.pixmap().width()} > {native[0]}")
+
+    # Aspect ratio preserved at every size -- a stretched/distorted logo is
+    # worse than a small one.
+    def _ar(pix):
+        return pix.width() / pix.height()
+    native_ar = native[0] / native[1]
+    ratios = []
+    for w in (900, 1200, 1600, 2200):
+        host.resize(w, 900)
+        _app.processEvents()
+        pm = banner.pixmap()
+        if not pm.isNull():
+            ratios.append(abs(_ar(pm) - native_ar) / native_ar)
+    check("the banner is never distorted, only scaled",
+          ratios and max(ratios) < 0.02,
+          f"max relative aspect error {max(ratios) if ratios else 'n/a'}")
+
+    # The height is derived, so it must never exceed the cap -- otherwise a
+    # wide window would push the rest of the page off screen.
+    host.resize(2400, 900)
+    _app.processEvents()
+    check("the banner's height is capped so it stays a header element",
+          banner.height() <= 300, str(banner.height()))
+
+    # A missing file must degrade to "no banner", never raise: a packaging
+    # mistake should not take the Home page down with it.
+    broken = BannerLabel("/nonexistent/welcome-banner.png")
+    check("a missing banner file does not raise",
+          not broken.has_image and broken.height() == 0,
+          str(broken.height()))
+
+    # -- Cover mode --------------------------------------------------------
+    # "cover" is retained for a slot whose SHAPE is fixed and whose content is
+    # decorative -- a photo behind a header, say. Home no longer uses it (it
+    # cropped the artwork, see the adapt block below), so these checks pin the
+    # mode's own contract rather than the Home page's appearance.
+    band = BannerLabel(str(_asset_path("welcome-banner.png")),
+                       fill="cover", min_height=10, max_height=100000)
+    band.show()
+    _app.processEvents()
+    gaps = []
+    for w in range(140, 1200, 23):
+        band.resize(w, 240)
+        _app.processEvents()
+        pm = band.pixmap()
+        if pm.isNull():
+            gaps.append(f"w={w}: null pixmap")
+        elif pm.width() < w or pm.height() < 240:
+            gaps.append(f"w={w}: {pm.width()}x{pm.height()} in {w}x240 box")
+    check("cover mode fills its box in both axes, leaving no empty strip",
+          not gaps, "; ".join(gaps[:4]) if gaps else "no gaps at any width")
+
+    # Cover crops; it must never distort. Both edges are derived from ONE scale
+    # factor, so the aspect ratio survives up to integer rounding.
+    errs = []
+    for w in (300, 700, 1100, 1500):
+        band.resize(w, 240)
+        _app.processEvents()
+        pm = band.pixmap()
+        if not pm.isNull():
+            errs.append(abs((pm.width() / pm.height()) - native_ar) / native_ar)
+    check("cover mode crops without distorting the artwork",
+          errs and max(errs) < 0.02,
+          f"max relative aspect error {max(errs) if errs else 'n/a'}")
+
+    # The painted image is larger than the box by design, so it MUST be clipped
+    # or it would bleed over the page title and the Start button beside it.
+    # Asserting the method is genuinely overridden (and not just inherited from
+    # QLabel, which would draw the oversized pixmap unclipped).
+    check("cover mode clips the oversized artwork to its own box",
+          type(band).paintEvent is not QLabel.paintEvent,
+          "paintEvent not overridden -- overflow would bleed")
+
+    # -- Adapt mode --------------------------------------------------------
+    # The Home header needs the artwork WHOLE and gap-free at every window
+    # size. "fit" left a wide empty strip beside a small image; "cover" filled
+    # the strip by cropping the top and bottom off the artwork (the report:
+    # "image got clipped in fullscreen"). "adapt" solves it by making the WIDGET
+    # take the artwork's aspect ratio and filling that box, so neither failure is
+    # possible. These checks pin all three properties.
+    adapt = BannerLabel(str(_asset_path("welcome-banner.png")),
+                        fill="adapt", min_height=180, max_height=260)
+    adapt.show()
+    _app.processEvents()
+
+    problems = []
+    for w in range(200, 1400, 17):
+        adapt.resize(w, 400)
+        _app.processEvents()
+        b = adapt.size()
+        pm = adapt.pixmap()
+        if pm.isNull() or b.height() == 0:
+            # Collapsing is legitimate only when the slot is too narrow to use.
+            if w >= adapt._min_width:
+                problems.append(f"w={w}: vanished at {b.width()}x{b.height()}")
+            continue
+        # (1) Never cropped: nothing may spill past the box it was given.
+        if pm.width() > b.width() or pm.height() > b.height():
+            problems.append(f"w={w}: cropped, {pm.width()}x{pm.height()} "
+                            f"in {b.width()}x{b.height()}")
+        # (2) No empty strip: the artwork fills the box it was given.
+        if pm.width() < b.width() - 1 or pm.height() < b.height() - 1:
+            problems.append(f"w={w}: gap, {pm.width()}x{pm.height()} "
+                            f"in {b.width()}x{b.height()}")
+        # (3) Same aspect ratio, within integer-rounding tolerance.
+        for label, pair in (("box", (b.width(), b.height())),
+                            ("pixmap", (pm.width(), pm.height()))):
+            if not pair[1]:
+                continue
+            err = abs((pair[0] / pair[1]) - native_ar) / native_ar
+            if err > 0.02:
+                problems.append(f"w={w}: {label} aspect off by {err:.1%}")
+    check("adapt mode is never cropped and never letterboxed",
+          not problems, "; ".join(problems[:4]) if problems
+          else "whole artwork, no gaps, at every width")
+
+    # It must follow the window rather than sit at a fixed size -- that is the
+    # "auto adjusted" half of the request, and the reason the width drives it.
+    grow = []
+    for w in (300, 500, 700, 900):
+        adapt.resize(w, 400)
+        _app.processEvents()
+        grow.append(adapt.width())
+    check("adapt mode scales with the window it is given",
+          grow == sorted(grow) and grow[0] < grow[-1], str(grow))
+
+    # Still a header element: the height band is honoured, so a wide window
+    # cannot push the stat cards and the sessions list off screen.
+    caps = []
+    for w in (900, 1400, 2400):
+        adapt.resize(w, 400)
+        _app.processEvents()
+        caps.append(adapt.height())
+    check("adapt mode stays inside its height band",
+          caps and all(180 <= h <= 260 for h in caps), str(caps))
+
+    # The page must not be pushed sideways on a narrow window: adapt may shrink
+    # below its height floor to respect the width, but never exceed the slot.
+    over = []
+    for w in range(160, 900, 13):
+        adapt.resize(w, 400)
+        _app.processEvents()
+        if adapt.width() > w:
+            over.append(f"w={w}: grew to {adapt.width()}")
+    check("adapt mode never overflows the width it was offered",
+          not over, "; ".join(over[:4]) if over else "never wider than the slot")
+
+    # "fit" stays the default, so any other caller is unaffected by the new mode.
+    default_mode = BannerLabel(str(_asset_path("welcome-banner.png")))
+    default_mode.resize(1600, 400)
+    default_mode.show()
+    _app.processEvents()
+    check("fit is still the default fill mode",
+          default_mode._fill == "fit", default_mode._fill)
+
+    # "cover" is still reachable for a genuinely decorative slot -- removing it
+    # would be a silent behaviour change for any caller that asked for it.
+    check("cover mode is still available",
+          BannerLabel(str(_asset_path("welcome-banner.png")),
+                      fill="cover")._fill == "cover", "cover missing")
+
+    # The Home page must actually ask for adapt, or the clipping comes back.
+    check("the Home banner uses adapt fill",
+          page.banner._fill == "adapt", page.banner._fill)
+
+
+def test_session_counting_rules() -> None:
+    """Home counters: what counts as a dataset analysed, and what doesn't.
+
+    The old Streamlit app kept an `analysed_datasets` table with record/count
+    helpers and a hook on "Confirm & Proceed to Analysis". The Qt port dropped
+    all of it and derived "Datasets Analyzed" from
+    COUNT(DISTINCT file_name) over saved sessions, which broke three of the
+    four documented rules at once:
+
+      1. it only counted datasets the user happened to SAVE, so analysing
+         without saving was invisible;
+      2. it keyed on filename alone, so an updated file with the same name
+         never counted;
+      3. "Analyses Available" reported a count of charts made rather than the
+         number of analysis types the build offers.
+
+    Runs against a throwaway database so the developer's real sessions are
+    neither read nor written.
+    """
+    print("[48] Session counting: dataset/session/analysis rules")
+    import os
+    import tempfile
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    from PySide6.QtWidgets import QApplication
+    _app = QApplication.instance() or QApplication([])
+
+    # Redirect the database BEFORE anything caches DB_PATH.
+    tmp_db = tempfile.mktemp(suffix=".db")
+    from modules import database as dbmod
+    _saved_db_path = dbmod.DB_PATH
+    _caches = []
+    for fn_name in ("get_user_stats", "get_user_sessions"):
+        fn = getattr(dbmod, fn_name, None)
+        if fn is not None and hasattr(fn, "clear"):
+            _caches.append(fn)
+            fn.clear()
+    dbmod.DB_PATH = tmp_db
+    try:
+        dbmod.init_db()
+        uid = dbmod.get_or_create_guest_user()["id"]
+        dbmod.get_user_stats.clear()
+
+        import pandas as pd
+        from desktop.session_bridge import SessionBridge
+        from desktop.pages.upload_page import UploadPage
+        from services.analysis_service import ANALYSIS_OPTIONS
+
+        def _df():
+            return pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+
+        def _count():
+            return dbmod.count_datasets_analysed(uid)
+
+        # -- Rule 1: reaching the analysis stage counts, on both upload routes.
+        bridge = SessionBridge()
+        bridge.set("user_id", uid)
+        page = UploadPage(bridge)
+        bridge.set_df(_df())
+        bridge.set("file_name", "Coffee.csv")
+        bridge.set("file_signature", "Coffee.csv:1024")
+        page._on_preview_mode()
+
+        nav = []
+        page.navigate_requested.connect(nav.append)
+        page.btn_go_analysis.click()
+        _app.processEvents()
+        check("'Go to Analysis' counts the dataset and navigates",
+              nav == ["analysis"] and _count() == 1,
+              f"nav={nav} n={_count()}")
+
+        # Repeated presses must be idempotent -- this is what the UNIQUE
+        # signature is for.
+        page.btn_go_analysis.click()
+        page.classification_ready.emit({})
+        _app.processEvents()
+        check("reaching analysis again does not double count",
+              _count() == 1, f"n={_count()}")
+
+        # The other route: straight to Analysis from the sidebar, with no
+        # upload-page navigation at all.
+        side = SessionBridge()
+        side.set("user_id", uid)
+        side.set_df(_df())
+        side.set("file_name", "Tea.csv")
+        side.set("file_signature", "Tea.csv:2048")
+        check("the sidebar route records via the same bridge helper",
+              side.record_dataset_analysed() and _count() == 2, f"n={_count()}")
+
+        # -- Rule 2: identity is name + size.
+        fresh = SessionBridge()          # simulates a brand new app launch
+        fresh.set("user_id", uid)
+        fresh.set_df(_df())
+        fresh.set("file_name", "Coffee.csv")
+        fresh.set("file_signature", "Coffee.csv:1024")
+        check("the same file in a fresh session is not counted twice",
+              not fresh.record_dataset_analysed() and _count() == 2,
+              f"n={_count()}")
+
+        fresh.set("file_signature", "Coffee.csv:4096")   # same name, new size
+        fresh.record_dataset_analysed()
+        check("the same name at a different size counts as new data",
+              _count() == 3, f"n={_count()}")
+
+        # -- Rule 3: sessions only on an explicit Save Session. Everything above
+        # analysed data and created no session rows at all.
+        n_analyses = len(ANALYSIS_OPTIONS)
+        stats = dbmod.get_user_stats(uid, analyses_available=n_analyses)
+        check("analysing a dataset does not create a saved session",
+              stats["sessions"] == 0, f"sessions={stats['sessions']}")
+        check("analysing without saving still counts the dataset",
+              stats["datasets"] == 3, f"datasets={stats['datasets']}")
+
+        dbmod.save_session_db(
+            user_id=uid, session_name="S1", file_name="Coffee.csv",
+            rows=3, cols=2, analysis_types=[], charts_json="[]",
+            dashboard_title="", kpis_json="[]", layout_mode="portrait",
+            grid_cols_n=2, grid_order_json="[]", grid_fullwidth_json="{}",
+            export_text_json="{}", export_colours_json="{}",
+        )
+        stats = dbmod.get_user_stats(uid, analyses_available=n_analyses)
+        check("a manually saved session is counted once",
+              stats["sessions"] == 1, f"sessions={stats['sessions']}")
+        check("saving a session does not inflate the dataset count",
+              stats["datasets"] == 3, f"datasets={stats['datasets']}")
+
+        # -- Rule 4: analyses available is dynamic, not a chart count.
+        check("'Analyses Available' is the size of the analysis registry",
+              stats["analyses"] == n_analyses and n_analyses > 0,
+              f"{stats['analyses']} vs {n_analyses}")
+
+        from desktop.pages.home_page import HomePage
+        home = HomePage(bridge)
+        home._refresh_stats()
+        # Assert on the rendered label, which is what the user actually sees.
+        shown = home.stat_analyses.lbl_value.text()
+        check("the Home card shows the dynamic analysis count",
+              shown == f"{n_analyses:,}", f"{shown!r} vs {n_analyses}")
+
+        # -- The counter must not be stale: get_user_stats is TTL-cached, so a
+        # new dataset has to invalidate it or the card lags by up to 30s.
+        before = dbmod.get_user_stats(uid, analyses_available=1)["datasets"]
+        dbmod.record_dataset_analysed(uid, "New.csv", "New.csv:50", 5, 2)
+        after = dbmod.get_user_stats(uid, analyses_available=1)["datasets"]
+        check("recording a dataset invalidates the cached stats",
+              after == before + 1, f"{before} -> {after}")
+
+        # -- Guard rails: no user, or no identity, must be a silent no-op
+        # rather than a crash or a bogus row.
+        check("recording without a user is a no-op",
+              dbmod.record_dataset_analysed(None, "x.csv", "x.csv:1") is False)
+        check("recording without a signature is a no-op",
+              dbmod.record_dataset_analysed(uid, "x.csv", "") is False)
+        check("stats for no user are all zero",
+              dbmod.get_user_stats(None) == {"sessions": 0, "datasets": 0,
+                                             "analyses": 0})
+
+        # -- Merging a guest into a signed-in account must not trip the new
+        # UNIQUE(user_id, file_signature) constraint when both already saw the
+        # same file (a plain UPDATE would abort the whole merge).
+        conn = dbmod._connect()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO users (username,email,password_hash,is_guest,uuid)"
+                    " VALUES ('mg','mg@x','h',1,'umg')")
+        guest_id = cur.lastrowid
+        cur.execute("INSERT INTO users (username,email,password_hash,is_guest,uuid)"
+                    " VALUES ('mt','mt@x','h',1,'umt')")
+        target_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+        dbmod.record_dataset_analysed(guest_id, "shared.csv", "shared.csv:500", 10, 2)
+        dbmod.record_dataset_analysed(target_id, "shared.csv", "shared.csv:500", 10, 2)
+        dbmod.record_dataset_analysed(guest_id, "guest.csv", "guest.csv:700", 7, 1)
+        try:
+            dbmod.merge_user_data(guest_id, target_id)
+            merged = (dbmod.count_datasets_analysed(target_id) == 2
+                      and dbmod.count_datasets_analysed(guest_id) == 0)
+        except Exception as exc:
+            merged = False
+            print(f"    merge raised: {exc}")
+        check("merging accounts keeps the count distinct, not doubled", merged,
+              f"target={dbmod.count_datasets_analysed(target_id)}")
+
+        # -- The upgrade path: an existing install has no analysed_datasets rows,
+        # so init_db must seed them from saved sessions rather than showing 0.
+        conn = dbmod._connect()
+        conn.execute("DELETE FROM analysed_datasets")
+        conn.commit()
+        conn.close()
+        dbmod.get_user_stats.clear()
+        dbmod.init_db()
+        check("existing installs backfill the dataset counter on upgrade",
+              dbmod.get_user_stats(uid)["datasets"] == 1,
+              f"datasets={dbmod.get_user_stats(uid)['datasets']}")
+        dbmod.init_db()      # must be idempotent, not re-seed or inflate
+        dbmod.get_user_stats.clear()
+        check("the backfill does not re-run and double count",
+              dbmod.get_user_stats(uid)["datasets"] == 1,
+              f"datasets={dbmod.get_user_stats(uid)['datasets']}")
+    finally:
+        dbmod.DB_PATH = _saved_db_path
+        for fn in _caches:
+            try:
+                fn.clear()
+            except Exception:
+                pass
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            try:
+                os.remove(tmp_db + suffix)
+            except OSError:
+                pass
 
 
 def main():
@@ -5522,13 +7513,41 @@ def main():
     test_declared_layout_controls_all_do_something()
     test_new_display_passes_are_wired()
     test_generate_sections_fill_the_pane()
-    test_tiling_canvas_packs_and_preserves_spans()
-    test_tiling_canvas_drag_and_resize()
-    test_tiling_canvas_overlap_and_stale_geometry()
+    test_tile_geometry_free_placement()
+    test_tile_geometry_clamp_and_overlap()
+    test_tile_geometry_tidy_reflows()
+    test_saved_geometry_migrates_from_the_grid()
     test_saved_tile_geometry_round_trip()
     test_export_follows_tile_geometry()
-    test_tiling_canvas_shows_reparented_cards()
-    test_kpi_drag_reorder_helpers()
+    test_report_canvas_structure()
+    test_export_free_canvas_is_printable()
+    test_kpi_tiles_share_the_chart_canvas()
+    test_canvas_handles_are_wired()
+    test_dashboard_palette_is_theme_independent()
+    test_kpi_ids_reconcile_across_the_bridge()
+    test_kpi_move_up_accepts_the_first_card()
+    test_dashboard_panel_widgets_survive_construction()
+    test_preset_buttons_show_their_theme_colours_and_names()
+    test_kpi_band_does_not_sit_under_the_charts()
+    test_kpi_handlers_are_defined_once()
+    test_preview_and_export_share_one_chart_input()
+    test_editor_publishes_the_bridge_globally()
+    test_pie_legend_is_not_drawn_over_the_pie()
+    test_pie_legend_squeeze_is_stable()
+    test_exporter_reserves_pie_legend_space()
+    test_card_chrome_does_not_clip_or_collide()
+    test_the_title_is_a_card_like_every_other()
+    test_the_title_field_actually_rebuilds_the_board()
+    test_legend_and_colourbar_follow_the_card()
+    test_styling_never_invents_a_colour_bar()
+    test_kpi_value_and_label_are_stylable()
+    test_the_dashboard_has_a_background_image()
+    test_every_dashboard_setting_reaches_the_report()
+
+    test_cards_have_no_dead_padding()
+    test_cards_can_have_their_own_background_image()
+    test_home_banner_scales_with_the_window()
+    test_session_counting_rules()
 
     print("\n========== RESULT ==========")
     print(f"  Passed: {len(PASS)}")

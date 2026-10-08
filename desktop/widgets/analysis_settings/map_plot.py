@@ -36,7 +36,8 @@ generated from a mode plus geo columns, which the correlation page (a numeric
 column list) cannot express.
 """
 from __future__ import annotations
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QComboBox, QCheckBox
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QComboBox,
+                             QCheckBox)
 from .base import (hint_label, cap_widget, color_swatch, slider_with_readout,
                    page_root, section_box, grid_row, FlowGrid, GEN_W, HINT_GAP)
 from .correlation import CorrelationSettings
@@ -44,11 +45,73 @@ from .statistical import NONE_SENTINEL
 from .categorical import AGGS
 
 # Generate-row options. The two map modes are the exact strings the service
-# branch compares against, and the styles are the basemaps the old panel
-# offered (screenshot map1.png).
+# branch compares against.
 MAP_MODES = ["Scatter (Lat/Lon)", "Choropleth (Location Names)"]
-MAP_STYLES = ["carto-positron", "carto-darkmatter", "open-street-map",
-              "carto-voyager", "white-bg", "stamen-terrain"]
+
+# Which Generate sections each mode's runner call actually receives.
+#
+# This split is read off ``services.analysis_service``'s map branch, which is
+# what really decides -- the runner never sees a field the service did not
+# pass to it:
+#
+# * the choropleth branch passes geo/value/color/agg/projection/scope/borders
+#   and NOT lat/lon/style/opacity/render, so those five are scatter-only;
+# * the scatter branch passes lat/lon/location/value/color/agg/style/opacity/
+#   render/borders and NOT projection/scope, so those two are choropleth-only.
+#
+# Location, Colour, Value, Aggregation and the six hover fields are passed by
+# BOTH branches (a scatter groups by location when a Location + Value are
+# chosen; the choropleth's Borders is the same checkbox), so they stay visible
+# in both modes. Hiding them would remove a capability the runner honours,
+# which is a different bug from the one being fixed: the report was that the
+# page shows fields the SELECTED mode ignores.
+SCATTER_ONLY_SECTIONS = ("Latitude", "Longitude", "Style", "Opacity", "Render")
+CHOROPLETH_ONLY_SECTIONS = ("Projection", "Scope")
+
+# Basemaps: the two "OpenStreetMap" entries are CARTO's key-free VECTOR
+# styles from the runner's own map (modules.analysis.map_plot._MAP_STYLE_SPECS
+# -> carto-positron / carto-darkmatter) -- vector tiles are sharp at any zoom
+# and on any HiDPI screen, which is what fixed the "blurry map" report.
+# Satellite has no free key-less vector imagery, so it stays the one raster
+# basemap (Esri World Imagery) and is the softer of the three.
+# ``stamen-terrain`` and friends are dead registry names that blanked the
+# canvas; the runner normalises any legacy value onto these three.
+# Kept as a literal (not imported) so the settings panel does not drag the
+# whole backend runner into the Qt import path.
+MAP_STYLES = ["OpenStreetMap (Light)", "OpenStreetMap (Dark)", "Satellite (Earth)"]
+
+# Density is the default: a map that silently drops points misstates the
+# spatial analysis, so sampling is only ever an explicit choice.
+RENDER_MODES = ["Density (all points)", "Sample 5,000"]
+
+# Choropleth-only projection / scope, from the runner
+# (modules.analysis.map_plot._PROJECTIONS / _SCOPES).  Both were in the old
+# panel's row and both are honoured by ``px.choropleth``, so they belong here;
+# a chart that is a scatter simply ignores them.  Kept as literals for the same
+# reason as MAP_STYLES: the panel must not import the backend runner.
+PROJECTIONS = ["natural earth", "mercator", "equirectangular",
+               "orthographic", "kavrayskiy7", "robinson"]
+
+SCOPES = ["world", "usa", "europe", "asia", "africa",
+          "north america", "south america"]
+
+
+def _normalize_style_name(value) -> str:
+    """Snap any legacy/Plotly style name onto one of the three basemaps.
+
+    Mirrors ``_normalize_map_style`` in the runner so the combo, the form and
+    the figure never disagree about which basemap is selected.
+
+    Only names that really mean aerial imagery reach the Satellite basemap: it
+    is the one raster (and so the one soft) basemap of the three, and a dead
+    landscape style such as ``stamen-terrain`` must not select it.
+    """
+    s = str(value or "").lower()
+    if any(k in s for k in ("dark", "matter", "night", "moon")):
+        return "OpenStreetMap (Dark)"
+    if any(k in s for k in ("satellite", "earth", "imagery", "esri", "aerial")):
+        return "Satellite (Earth)"
+    return "OpenStreetMap (Light)"
 
 
 class MapPlotSettings(CorrelationSettings):
@@ -63,12 +126,20 @@ class MapPlotSettings(CorrelationSettings):
             'location_col': None, 'color_col': None, 'value_col': None,
             'agg_func': AGGS[0], 'map_style': MAP_STYLES[0],
             'marker_opacity': 0.82, 'invert_colorscale': False,
-            'show_borders': True,
+            'show_borders': True, 'render_mode': RENDER_MODES[0],
+            'choropleth_projection': PROJECTIONS[0],
+            'choropleth_scope': SCOPES[0],
+            'hover_dim1': None, 'hover_dim2': None,
+            'hover_val1': None, 'hover_val1_agg': AGGS[0],
+            'hover_val2': None, 'hover_val2_agg': AGGS[0],
         }
         for attr in ('_combo_mode', '_combo_lat', '_combo_lon', '_combo_loc',
                      '_combo_color', '_combo_value', '_combo_agg',
-                     '_combo_style', '_gen_opacity', '_ck_cbar', '_ck_sizeby',
-                     '_ms_spin', '_mo_spin'):
+                     '_combo_style', '_combo_render', '_gen_opacity',
+                     '_combo_projection', '_combo_scope',
+                     '_combo_hdim1', '_combo_hdim2', '_combo_hval1',
+                     '_combo_hagg1', '_combo_hval2', '_combo_hagg2',
+                     '_ck_cbar', '_ck_sizeby', '_ms_spin', '_mo_spin'):
             if not hasattr(self, attr):
                 setattr(self, attr, None)
 
@@ -111,11 +182,21 @@ class MapPlotSettings(CorrelationSettings):
         rl.addWidget(hint_label(
             'Adjust options below. All selections are live — no submit needed until Generate.'))
         flow = FlowGrid()
+        # Title -> section box, so _sync_mode_sections can show/hide by name.
+        # Kept in ADD order so hiding and re-showing restores the original
+        # arrangement rather than a shuffled one.
+        self._gen_flow = flow
+        self._gen_sections = {}
+
+        def add(title, box):
+            self._gen_sections[title] = box
+            flow.add_section(box)
+            return box
 
         box, self._combo_mode = self._combo_section(
             'Mode', 'Scatter plots points; Choropleth fills whole countries.',
             MAP_MODES, MAP_MODES[0], self._on_mode)
-        flow.add_section(box)
+        add('Mode', box)
 
         allc = [str(c) for c in (self._all_cols or [])]
         for title, attr, handler, hint in (
@@ -127,17 +208,60 @@ class MapPlotSettings(CorrelationSettings):
             box, cb = self._combo_section(title, hint, [NONE_SENTINEL] + allc,
                                           NONE_SENTINEL, handler)
             setattr(self, attr, cb)
-            flow.add_section(box)
+            add(title, box)
 
         box, self._combo_agg = self._combo_section(
             'Aggregation', 'How to combine values per location',
             AGGS, AGGS[0], self._on_agg)
-        flow.add_section(box)
+        add('Aggregation', box)
 
         box, self._combo_style = self._combo_section(
-            'Style', 'Base map style (scatter mode)',
+            'Style', 'Base map tiles (scatter mode)',
             MAP_STYLES, MAP_STYLES[0], self._on_style)
-        flow.add_section(box)
+        add('Style', box)
+
+        box, self._combo_render = self._combo_section(
+            'Render', 'Density shows every point (default)',
+            RENDER_MODES, RENDER_MODES[0], self._on_render)
+        add('Render', box)
+
+        # Projection / Scope are choropleth-only in the service; they are built
+        # unconditionally (a mode switch must never re-create controls, which
+        # would lose whatever was already chosen) and then shown/hidden by
+        # _sync_mode_sections according to the selected mode.
+        box, self._combo_projection = self._combo_section(
+            'Projection', 'How the globe is flattened (choropleth)',
+            PROJECTIONS, PROJECTIONS[0], self._on_projection)
+        add('Projection', box)
+
+        box, self._combo_scope = self._combo_section(
+            'Scope', 'Which region the choropleth frames',
+            SCOPES, SCOPES[0], self._on_scope)
+        add('Scope', box)
+
+        # The six extra tooltip fields, in the old panel's order:
+        # Hover Dim 1 | Hover Dim 2 | Hover Value 1 | Agg 1 |
+        # Hover Value 2 | Agg 2.
+        for title, attr, handler, hint in (
+                ('Hover Dim 1', '_combo_hdim1', self._on_hdim1,
+                 'Extra column shown in each tooltip'),
+                ('Hover Dim 2', '_combo_hdim2', self._on_hdim2,
+                 'Second extra tooltip column'),
+                ('Hover Value 1', '_combo_hval1', self._on_hval1,
+                 'Measure added to each tooltip'),
+                ('Agg 1', '_combo_hagg1', self._on_hagg1,
+                 'How Hover Value 1 is combined'),
+                ('Hover Value 2', '_combo_hval2', self._on_hval2,
+                 'Second measure added to each tooltip'),
+                ('Agg 2', '_combo_hagg2', self._on_hagg2,
+                 'How Hover Value 2 is combined')):
+            items = AGGS if attr in ('_combo_hagg1', '_combo_hagg2') \
+                else [NONE_SENTINEL] + allc
+            dflt = AGGS[0] if attr in ('_combo_hagg1', '_combo_hagg2') \
+                else NONE_SENTINEL
+            box, cb = self._combo_section(title, hint, items, dflt, handler)
+            setattr(self, attr, cb)
+            add(title, box)
 
         opac = slider_with_readout(0.1, 1.0,
                                    float(self._pending.get('marker_opacity', 0.82)),
@@ -148,45 +272,72 @@ class MapPlotSettings(CorrelationSettings):
                 lambda v: self._set_pending(marker_opacity=float(v)))
         except Exception:
             pass
-        flow.add_section(section_box('Opacity', opac, 'Marker transparency'))
+        add('Opacity', section_box('Opacity', opac, 'Marker transparency'))
 
         # Invert / Borders are the two boolean tail controls in the old row.
+        # They share ONE section box side by side instead of taking a full
+        # GEN_W grid column each, which is what left the oversized gap between
+        # each label and its checkbox.
         self._chk_invert, self._chk_borders = None, None
+        toggles = QWidget()
+        tl = QHBoxLayout(toggles)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(12)
         for title, key, dflt in (('Invert', 'invert_colorscale', False),
                                  ('Borders', 'show_borders', True)):
-            cb = QCheckBox('')
+            cell = QWidget()
+            cl = QVBoxLayout(cell)
+            cl.setContentsMargins(0, 0, 0, 0)
+            cl.setSpacing(2)
+            cb = QCheckBox(title)
             cb.setChecked(bool(self._pending.get(key, dflt)))
             cb.toggled.connect(lambda v, k=key: self._set_pending(**{k: bool(v)}))
             if key == 'show_borders':
                 self._chk_borders = cb
             else:
                 self._chk_invert = cb
-            holder = QWidget()
-            bl = QVBoxLayout(holder)
-            bl.setContentsMargins(0, 0, 0, 0)
-            bl.setSpacing(HINT_GAP)
-            bl.addWidget(cb)
-            bl.addStretch()
-            flow.add_section(section_box(title, holder, ''))
+            cl.addWidget(cb)
+            cl.addStretch()
+            tl.addWidget(cell)
+        add('Options', section_box(
+            'Options', toggles,
+            'Invert flips the colour scale; Borders adds a boundaries overlay'))
 
         rl.addWidget(flow)
         rl.addStretch()
-        # Borders only exists on the choropleth trace. A scattermap marker has
-        # no outline and layout.map exposes no country toggle, so leaving the
-        # box live in scatter mode would promise an effect that cannot happen.
-        self._sync_borders_enabled()
+        # Show only the sections the current mode reads. Runs here as well as
+        # on every mode change so a restored/prefilled config lands in the
+        # right shape instead of showing the other mode's fields first.
+        self._sync_mode_sections()
         return root
 
-    def _sync_borders_enabled(self):
-        """Enable Borders only where the chart can honour it."""
-        cb = getattr(self, '_chk_borders', None)
-        if cb is None:
+    # -- Mode-gated visibility ----------------------------------------------
+    def _sync_mode_sections(self) -> None:
+        """Show only the Generate sections the selected mode actually reads.
+
+        ``build_generate`` builds the union of both forms on purpose (a mode
+        switch must never re-create controls, which would discard whatever was
+        already chosen); this is the second half of that decision: the fields
+        the SERVICE ignores in the current mode are hidden, and the FlowGrid
+        re-flows so the remaining ones keep their even spacing.
+
+        Values are never cleared on a switch -- hide only. Switching back
+        restores the user's earlier Lat/Lon or Projection/Scope exactly as
+        they left them.
+        """
+        flow = getattr(self, '_gen_flow', None)
+        sections = getattr(self, '_gen_sections', None)
+        if flow is None or not sections:
             return
-        is_geo = 'choropleth' in str(
-            self._pending.get('map_mode', MAP_MODES[0])).lower()
-        cb.setEnabled(is_geo)
-        cb.setToolTip('' if is_geo else
-                       'Country borders apply to Choropleth (Location Names) only.')
+        mode = str(self._pending.get('map_mode') or MAP_MODES[0])
+        choropleth = mode == MAP_MODES[1]
+        scatter_only = SCATTER_ONLY_SECTIONS
+        choro_only = CHOROPLETH_ONLY_SECTIONS
+        for title, box in sections.items():
+            if title in scatter_only:
+                flow.set_section_hidden(box, choropleth)
+            elif title in choro_only:
+                flow.set_section_hidden(box, not choropleth)
 
     def _set_pending(self, **kw):
         """Record a Generate value and mark the form dirty."""
@@ -196,7 +347,7 @@ class MapPlotSettings(CorrelationSettings):
     # -- Generate handlers -------------------------------------------------
     def _on_mode(self, text):
         self._set_pending(map_mode=str(text))
-        self._sync_borders_enabled()
+        self._sync_mode_sections()
 
     def _on_lat(self, text):
         self._set_pending(lat_col=self._clean(text))
@@ -219,6 +370,33 @@ class MapPlotSettings(CorrelationSettings):
     def _on_style(self, text):
         self._set_pending(map_style=str(text))
 
+    def _on_render(self, text):
+        self._set_pending(render_mode=str(text))
+
+    def _on_projection(self, text):
+        self._set_pending(choropleth_projection=str(text))
+
+    def _on_scope(self, text):
+        self._set_pending(choropleth_scope=str(text))
+
+    def _on_hdim1(self, text):
+        self._set_pending(hover_dim1=self._clean(text))
+
+    def _on_hdim2(self, text):
+        self._set_pending(hover_dim2=self._clean(text))
+
+    def _on_hval1(self, text):
+        self._set_pending(hover_val1=self._clean(text))
+
+    def _on_hagg1(self, text):
+        self._set_pending(hover_val1_agg=str(text))
+
+    def _on_hval2(self, text):
+        self._set_pending(hover_val2=self._clean(text))
+
+    def _on_hagg2(self, text):
+        self._set_pending(hover_val2_agg=str(text))
+
     def collect_values(self):
         """The map Generate values, keyed as the map service branch reads them.
 
@@ -232,15 +410,31 @@ class MapPlotSettings(CorrelationSettings):
         return {k: p.get(k) for k in (
             'map_mode', 'lat_col', 'lon_col', 'location_col', 'color_col',
             'value_col', 'agg_func', 'map_style', 'marker_opacity',
-            'invert_colorscale', 'show_borders')}
+            'invert_colorscale', 'show_borders', 'render_mode',
+            'choropleth_projection', 'choropleth_scope',
+            'hover_dim1', 'hover_dim2',
+            'hover_val1', 'hover_val1_agg', 'hover_val2', 'hover_val2_agg')}
 
     def prefill(self, values):
-        """Restore a saved map config, snapping names to options that exist."""
-        v = values or {}
+        """Restore a saved map config, snapping names to options that exist.
+
+        A saved style from an older build may name a Plotly style the runner no
+        longer offers (``stamen-terrain``, ``carto-positron``, ...).  Those are
+        normalised onto one of the three current basemaps here as well as in
+        the runner, so the panel shows what the chart will actually draw
+        instead of leaving a stale value in the form that no combo displays.
+        """
+        v = dict(values or {})
+        if 'map_style' in v:
+            v['map_style'] = _normalize_style_name(v['map_style'])
         p = self._pending
         for key in ('map_mode', 'lat_col', 'lon_col', 'location_col', 'color_col',
                     'value_col', 'agg_func', 'map_style', 'marker_opacity',
-                    'invert_colorscale', 'show_borders'):
+                    'invert_colorscale', 'show_borders', 'render_mode',
+                    'choropleth_projection', 'choropleth_scope',
+                    'hover_dim1', 'hover_dim2',
+                    'hover_val1', 'hover_val1_agg',
+                    'hover_val2', 'hover_val2_agg'):
             if key in v:
                 p[key] = v[key]
         for attr, key, dflt in (('_combo_mode', 'map_mode', MAP_MODES[0]),
@@ -250,7 +444,17 @@ class MapPlotSettings(CorrelationSettings):
                                 ('_combo_color', 'color_col', ''),
                                 ('_combo_value', 'value_col', ''),
                                 ('_combo_agg', 'agg_func', AGGS[0]),
-                                ('_combo_style', 'map_style', MAP_STYLES[0])):
+                                ('_combo_style', 'map_style', MAP_STYLES[0]),
+                                ('_combo_render', 'render_mode', RENDER_MODES[0]),
+                                ('_combo_projection', 'choropleth_projection',
+                                 PROJECTIONS[0]),
+                                ('_combo_scope', 'choropleth_scope', SCOPES[0]),
+                                ('_combo_hdim1', 'hover_dim1', ''),
+                                ('_combo_hdim2', 'hover_dim2', ''),
+                                ('_combo_hval1', 'hover_val1', ''),
+                                ('_combo_hagg1', 'hover_val1_agg', AGGS[0]),
+                                ('_combo_hval2', 'hover_val2', ''),
+                                ('_combo_hagg2', 'hover_val2_agg', AGGS[0])):
             w = getattr(self, attr, None)
             if w is None:
                 continue
@@ -270,6 +474,10 @@ class MapPlotSettings(CorrelationSettings):
                 w.blockSignals(False)
             except Exception:
                 pass
+        # The mode combo above is set with signals blocked, so _on_mode never
+        # fires here -- re-gate the sections explicitly or a restored
+        # choropleth would come back showing the scatter-only fields.
+        self._sync_mode_sections()
 
 
 

@@ -46,3 +46,4 @@ backend/.streamlit
 # ── Temporary / scratch files ─────────────────────────────────────────────
 extra/
 Old codebase(Do not delete)/
+tests/

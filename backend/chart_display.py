@@ -436,10 +436,17 @@ def plan_legend_layout(fig, legend_position, names=None, legend_title="",
 
     w = float(width_px or 0)
     if w <= 0 or area <= 0:
+        # No width to measure against. For a cartesian chart the historic fixed
+        # fraction is fine. For a pie/treemap it is not: the card width in the
+        # report is decided by CSS at RENDER time and is unknowable here, so any
+        # fraction can come out too small and put the legend back over the marks.
+        # Over-reserving only wastes some width; under-reserving is the reported
+        # bug, so these figures take the safe floor.
+        strip = (LEGEND_STRIP_MAX if _domain_traces(fig)
+                 else _legend_strip(names, legend_title, side, None,
+                                    axis_px=axis_px))
         return {"mode": "column", "side": side, "need_px": need,
-                "axis_px": axis_px,
-                "strip": _legend_strip(names, legend_title, side, None,
-                                       axis_px=axis_px)}
+                "axis_px": axis_px, "strip": strip}
 
     if need / area <= LEGEND_COLUMN_MAX_SHARE:
         return {"mode": "column", "side": side, "need_px": need,
@@ -511,6 +518,18 @@ def reserve_legend_band(fig, legend_position, band_px):
             fig.update_layout(yaxis2=dict(domain=domain))
     except Exception:
         return False
+    # Same gap as the column reservation: a pie/donut/treemap has no yaxis, so
+    # ``yaxis.domain`` moves nothing and the horizontal band is reserved in
+    # name only. This is the centred-position case ("Top Center" / "Bottom
+    # Center"), which is where a dashboard pie actually lands -- the row is
+    # drawn across the middle-bottom of the card and sits on the pie. Squeeze
+    # the trace's own y domain so the band is genuinely free.
+    for tr in _domain_traces(fig):
+        try:
+            tr.domain.y = list(domain)
+        except Exception:
+            log.debug("could not lift a trace domain for the legend band",
+                      exc_info=True)
     try:
         fig.update_layout(legend=dict(
             orientation="h",
@@ -551,6 +570,30 @@ def _plot_area_width(margin, width_px):
         return max(1.0, w - l - r)
     except Exception:
         return width_px
+
+
+def _domain_traces(fig) -> list:
+    """Traces positioned by their OWN ``domain`` rather than by xaxis/yaxis.
+
+    Pie/donut, treemap, sunburst, funnel and icicle all size themselves from a
+    per-trace ``domain`` box and have no cartesian axes at all. For those,
+    shrinking ``xaxis.domain`` moves nothing -- which is why the legend
+    reservation silently did nothing for them and the legend plate ended up
+    painted straight over the marks.
+    """
+    out = []
+    for tr in (getattr(fig, "data", None) or []):
+        dom = getattr(tr, "domain", None)
+        if dom is None:
+            continue
+        # A pie's domain is a real range pair; cartesian traces have no
+        # per-trace domain at all, so anything that has one is what we want.
+        try:
+            if getattr(dom, "x", None) is not None:
+                out.append(tr)
+        except Exception:
+            continue
+    return out
 
 
 def reserve_legend_column(fig, legend_position, strip=None,
@@ -611,10 +654,39 @@ def reserve_legend_column(fig, legend_position, strip=None,
         domain = [float(strip), 1.0]
     else:
         domain = [0.0, 1.0 - float(strip)]
+
+    # Pie / treemap / sunburst / funnel size themselves from a per-TRACE domain
+    # and have no xaxis, so writing ``xaxis.domain`` there moves nothing at all
+    # -- the reservation used to return "left"/"right" as if it had worked while
+    # the legend plate stayed exactly where it was, on top of the marks. Squeeze
+    # the trace domain instead, and keep writing the xaxis for the cartesian
+    # case so existing charts are unaffected.
+    squeezed = 0
+    for tr in _domain_traces(fig):
+        try:
+            dom = tr.domain
+            dom.x = list(domain)
+            squeezed += 1
+        except Exception:
+            log.debug("could not squeeze a trace domain for the legend",
+                      exc_info=True)
     try:
         fig.update_layout(margin=m, xaxis=dict(domain=domain))
     except Exception:
         return None
+    if squeezed:
+        # The legend is only guaranteed to sit in the freed strip if it is
+        # anchored there. A pie drawn with no explicit anchor gets Plotly's
+        # default (inside the plot), so the domain squeeze alone would leave the
+        # plate on the pie -- which is the reported overlap.
+        try:
+            x, xanchor = (0.0, "left") if side == "left" else (1.0, "right")
+            y, yanchor = place["y"], place["yanchor"]
+            fig.update_layout(legend=dict(x=x, xanchor=xanchor,
+                                          y=y, yanchor=yanchor))
+        except Exception:
+            log.debug("could not anchor the legend for a domain-squeezed figure",
+                      exc_info=True)
     return side
 
 
@@ -718,6 +790,16 @@ def _restore_legend_reservation(fig):
             fig.update_layout(yaxis2=dict(domain=[0.0, 1.0]))
     except Exception:
         log.debug("could not reset the legend reservation", exc_info=True)
+    # Undo any per-trace squeeze from reserve_legend_column as well. Leaving the
+    # pie's domain where the last pass put it means the next pass measures
+    # against an already-reserved trace and shrinks it again, so a resize storm
+    # would march the pie off the card.
+    for tr in _domain_traces(fig):
+        try:
+            tr.domain.x = [0.0, 1.0]
+            tr.domain.y = [0.0, 1.0]
+        except Exception:
+            log.debug("could not reset a trace domain", exc_info=True)
     try:
         if legend_layout_mode(fig) == "band":
             fig.update_layout(legend=dict(orientation="v"))
@@ -806,6 +888,205 @@ def refit_legend_width(fig, width_px):
 LEGEND_BORDER_COLOR = "rgba(148, 163, 184, 0.35)"
 
 
+# Trace types whose colour bar is drawn BY DEFAULT, i.e. plotly renders one
+# even when the figure's JSON never mentions "colorbar". Verified by rendering:
+# heatmap, contour, surface, mesh3d, histogram2d and choropleth all show a
+# colour ramp out of the box. Everything else (bar, scatter, line, pie, table)
+# shows one only when asked to.
+_COLORBAR_TRACE_TYPES = {
+    "heatmap", "heatmapgl", "contour", "surface", "mesh3d",
+    "histogram2d", "histogram2dcontour", "choropleth",
+}
+
+
+def _shows_scale(container_json: dict) -> bool | None:
+    """``showscale`` as the figure states it, or None when unstated."""
+    value = container_json.get("showscale")
+    return None if value is None else bool(value)
+
+
+def real_colorbars(fig):
+    """The colour bars *fig* genuinely draws -- and nothing else.
+
+    Why this exists
+    ---------------
+    Plotly builds a fresh default sub-object for ANY container you read with
+    ``getattr``: ``trace.marker.colorbar`` and ``layout.coloraxis.colorbar``
+    both hand back a live ``ColorBar`` even when the figure never declared one.
+    Reading is harmless, but the moment anything is ASSIGNED to that object it
+    is written into the figure's JSON -- and ``colorbar`` is one of the keys
+    ``plotly.js`` treats as "this chart HAS a colour bar" (its ``hasColorbar``
+    is literally ``isPlainObject(t.colorbar)``).
+
+    So a styling helper that does the natural-looking
+    ``cb = getattr(holder, "colorbar", None); cb.tickfont = ...`` silently
+    ADDS a colour bar to every chart it touches. A plain bar chart then grew a
+    full colour ramp with a bogus title and tick labels down its right-hand
+    side -- the "ghost colour bar" reported on the dashboard.
+
+    A colour bar counts as real when plotly would actually draw one:
+
+    * trace-level (heatmap / contour / surface / mesh3d / histogram2d /
+      choropleth) -- these default to showing a scale, so they count unless
+      ``showscale`` was explicitly turned off;
+    * marker-level (scatter / geo) -- the default is OFF, so these count only
+      when ``showscale`` is explicitly on or a ``colorbar`` was declared;
+    * the shared ``layout.coloraxis`` -- only when a trace actually binds
+      itself to it, which is what ``px.imshow`` and ``px.scatter`` with a
+      continuous colour both do (the latter via ``marker.coloraxis``).
+
+    Yields the real ``ColorBar`` objects so callers can style them exactly as
+    before; an empty iterator simply means "this figure draws no colour bar",
+    which is the normal case for bar, line, pie and table charts.
+    """
+    bound_to_coloraxis = False
+
+    for tr in (getattr(fig, "data", None) or []):
+        try:
+            tr_json = tr.to_plotly_json() or {}
+        except Exception:
+            continue
+        ttype = str(tr_json.get("type") or "").lower()
+
+        marker = getattr(tr, "marker", None)
+        try:
+            m_json = marker.to_plotly_json() or {} if marker is not None else {}
+        except Exception:
+            m_json = {}
+
+        # A trace can bind itself to the shared colour axis EITHER at trace
+        # level (``coloraxis="coloraxis"``) or, for scatter/bubble, on its
+        # MARKER (``marker.coloraxis``) -- which is what ``px.scatter`` with a
+        # continuous colour emits. Missing the marker case made px bubbles lose
+        # their colour bar, so both are checked here.
+        bound = bool(tr_json.get("coloraxis")) or bool(m_json.get("coloraxis"))
+        if bound:
+            bound_to_coloraxis = True
+
+        declared = isinstance(tr_json.get("colorbar"), dict)
+        showscale = _shows_scale(tr_json)
+        # A trace bound to the shared colour axis (what px does) draws its scale
+        # from THAT axis only -- its own colorbar is ignored -- so it must not be
+        # yielded here or the bar would be styled twice.
+        trace_level = not bound and (
+            declared
+            or (showscale is not False and ttype in _COLORBAR_TRACE_TYPES))
+        if trace_level:
+            try:
+                yield tr.colorbar
+            except Exception:
+                pass
+
+        if marker is not None:
+            # Marker-level default is OFF, so only an explicit ask counts --
+            # and a marker bound to the shared axis is that axis's business.
+            if (not bound
+                    and (isinstance(m_json.get("colorbar"), dict)
+                         or _shows_scale(m_json) is True)):
+                try:
+                    yield marker.colorbar
+                except Exception:
+                    pass
+
+    # The shared colour axis, but only while something is bound to it --
+    # ``layout.coloraxis`` otherwise always "exists" and styling it would
+    # conjure a colour bar onto charts that never had one.
+    if bound_to_coloraxis:
+        try:
+            ca = fig.layout.coloraxis
+            if (ca.to_plotly_json() or {}).get("showscale") is not False:
+                yield ca.colorbar
+        except Exception:
+            pass
+
+
+def colorbar_json(fig) -> list:
+    """``real_colorbars`` as plain dicts -- for tests and diagnostics."""
+    out = []
+    for cb in real_colorbars(fig):
+        try:
+            out.append(cb.to_plotly_json() or {})
+        except Exception:
+            out.append({})
+    return out
+
+
+def _remap_discrete_map_colours(fig, cs) -> None:
+    """Repaint a DISCRETE map's markers from the chosen colour scale.
+
+    Bug: "Colorscale not working" on a map.
+
+    A ``scattermap`` paints a continuous measure through the shared
+    ``layout.coloraxis``, and ``update_coloraxes(colorscale=...)`` below reaches
+    that.  But when the map's Colour column is binary or categorical, the runner
+    deliberately emits FLAT palette colours instead (``color_discrete_map`` /
+    ``color_discrete_sequence``) and binds nothing to the colour axis -- and
+    ``px`` then splits the map into ONE TRACE PER CATEGORY, each carrying a single
+    flat colour.  There is therefore no colour axis to write to and no per-trace
+    colour array to remap, so the Colorscale dropdown silently did nothing at all:
+    exactly the reported symptom, and the reason the control looked connected while
+    repainting the same colours.
+
+    The fix keeps the discrete ENCODING (one flat colour per category, so the
+    legend stays a legend) but derives those flat colours FROM the selected scale
+    instead of from the app palette.  Categories are matched to scale stops in
+    first-appearance order, which is stable and idempotent, so picking a scale
+    visibly repaints the map and switching back switches back.
+
+    No-ops on continuous traces (their colour is bound to the shared axis, which
+    the block below owns) and on any chart without a discrete map trace, so it can
+    never damage a figure it does not understand.
+    """
+    if not cs:
+        return
+    try:
+        from plotly.colors import sample_colorscale
+
+        map_traces = [tr for tr in (getattr(fig, "data", None) or [])
+                      if str(getattr(tr, "type", "")).lower()
+                      in ("scattermap", "scattermapbox")]
+        if not map_traces:
+            return
+
+        # Distinct flat colours across the whole map, in first-appearance order.
+        # Every discrete map trace px emits is a candidate; a continuous one is
+        # skipped and left entirely to ``layout.coloraxis``.
+        distinct: list = []
+        for tr in map_traces:
+            marker = getattr(tr, "marker", None)
+            if marker is None or getattr(marker, "coloraxis", None):
+                continue  # continuous -> owned by the shared colour axis
+            colors = marker.to_plotly_json().get("color")
+            if isinstance(colors, str):
+                colors = [colors]
+            if not isinstance(colors, (list, tuple)):
+                continue
+            for c in colors:
+                # Only real colours are candidates; a numeric array is not
+                # something a discrete scale can be sampled onto.
+                if isinstance(c, str) and c and c not in distinct:
+                    distinct.append(c)
+        if len(distinct) < 2:
+            # Nothing discrete to restyle (a single category cannot show a scale).
+            return
+
+        mapping = dict(zip(distinct,
+                           sample_colorscale(str(cs), len(distinct))))
+        for tr in map_traces:
+            marker = getattr(tr, "marker", None)
+            if marker is None or getattr(marker, "coloraxis", None):
+                continue
+            colors = marker.to_plotly_json().get("color")
+            if isinstance(colors, str):
+                marker.color = mapping.get(colors, colors)
+            elif isinstance(colors, (list, tuple)):
+                marker.color = [mapping.get(c, c) if isinstance(c, str) else c
+                                for c in colors]
+    except Exception:
+        # A colour remap is cosmetic; never let it take a chart down.
+        pass
+
+
 def _apply_heatmap_options(fig, lo, typo, width_px=None):
     """Apply the heatmap / colour-bar Layout options to *fig* in place.
 
@@ -820,14 +1101,32 @@ def _apply_heatmap_options(fig, lo, typo, width_px=None):
     from a heatmap; a trace left with a stale ``texttemplate`` keeps drawing
     them.
     """
-    scales = ["heatmap", "choropleth"]
+    scales = ["heatmap", "choropleth", "scattermap", "scattermapbox"]
     traces = [tr for tr in getattr(fig, "data", []) or []
               if str(getattr(tr, "type", "")).lower() in scales]
     if not traces:
         return
 
+    # A map scatter (scattermap / scatter_mapbox) is colour-driven through the
+    # SHARED colour axis, not through a trace-level ``colorscale`` -- px binds
+    # it via ``marker.coloraxis``.  So the per-trace block below must skip map
+    # traces: ``tr.coloraxis = None`` would detach the colour bar entirely and
+    # ``tr.colorscale = ...`` is rejected outright by Plotly for these traces
+    # (verified: ValueError).  They are routed through ``update_coloraxes``
+    # below instead, which is what actually repaints them.
+    map_traces = {"scattermap", "scattermapbox"}
+
     # -- Per-trace: colour scale + in-cell annotations ---------------------
     cs = lo.get("heatmap_colorscale")
+
+    # A DISCRETE map (binary / categorical colour column) is px-split into one
+    # trace per category with a flat colour and no colour axis, so neither the
+    # per-trace writes below nor ``update_coloraxes`` can reach it -- which is
+    # why the Colorscale control did nothing there.  Repaint its flat colours
+    # from the chosen scale first, figure-wide (the categories are spread over
+    # several traces, so this cannot be done one trace at a time).
+    _remap_discrete_map_colours(fig, cs)
+
     show_text = lo.get("heatmap_show_text", True)
     try:
         prec = max(0, int(round(float(
@@ -838,6 +1137,11 @@ def _apply_heatmap_options(fig, lo, typo, width_px=None):
     ann_color = lo.get("heatmap_annotation_color", "#ffffff")
 
     for tr in traces:
+        if str(getattr(tr, "type", "")).lower() in map_traces:
+            # See the note above: a map scatter carries no per-trace colour
+            # scale.  Skip the unbind/annotate writes entirely and let the
+            # shared-axis block below style it.
+            continue
         if cs:
             try:
                 # Detach the trace from the shared colour axis FIRST. A
@@ -1504,21 +1808,15 @@ def _apply_colorbar_border(fig, show_border):
     never go through the legend block, so "Show border" has to reach them
     separately or the toggle would look like it only half worked.  Both a
     per-trace ``colorbar`` and a shared ``layout.coloraxis.colorbar`` are
-    covered; anything a trace doesn't have is skipped.
+    covered.
+
+    Only colour bars the figure ALREADY declared are touched -- see
+    ``real_colorbars``. Assigning to a ``colorbar`` reached by ``getattr``
+    would *create* one, so this used to give every bar, line and pie chart a
+    ghost colour bar with a frame and no data behind it.
     """
     width = 1 if show_border else 0
-    targets = []
-    for tr in getattr(fig, "data", []) or []:
-        cb = getattr(tr, "colorbar", None)
-        if cb is not None:
-            targets.append(cb)
-    try:
-        ca = getattr(fig.layout, "coloraxis", None)
-        if ca is not None and getattr(ca, "colorbar", None) is not None:
-            targets.append(ca.colorbar)
-    except Exception:
-        pass
-    for cb in targets:
+    for cb in real_colorbars(fig):
         try:
             cb.borderwidth = width
             if show_border:
@@ -2286,16 +2584,13 @@ def theme_figure(fig, mode=None):
                 tr.textfont.color = new
         except Exception:
             pass
+    # Real colour bars only. Reading ``.colorbar`` always yields a default
+    # object, and styling it would ADD a colour bar to a chart that never had
+    # one -- so a themed bar chart grew a ghost colour ramp in dark mode.
+    # See ``real_colorbars``.
+    for cb in real_colorbars(f2):
         try:
-            cb = getattr(tr, "colorbar", None)
-            if cb is not None:
-                _theme_one_colorbar(cb, key, tok)
+            _theme_one_colorbar(cb, key, tok)
         except Exception:
             pass
-    try:
-        ca = getattr(f2.layout, "coloraxis", None)
-        if ca is not None and ca.colorbar is not None:
-            _theme_one_colorbar(ca.colorbar, key, tok)
-    except Exception:
-        pass
     return f2

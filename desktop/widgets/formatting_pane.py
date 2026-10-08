@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QRect, Qt, Signal
+from PySide6.QtGui import QFontMetrics, QPen
 from PySide6.QtWidgets import (
     QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QSizePolicy,
     QVBoxLayout, QWidget,
@@ -193,14 +194,106 @@ class FieldRow(QWidget):
         self.caption = cap
 
 
+class PresetButton(QPushButton):
+    """One quick-theme cell: the theme's own colour bands plus its NAME.
+
+    The bands are painted in ``paintEvent`` rather than declared in a Qt
+    style sheet, because Qt Style Sheets implement a subset of CSS and
+    ``qlinear-gradient`` is not in it -- the declaration parses, is silently
+    dropped, and every button renders as an unstyled grey box. That is what
+    made the gallery read as a grid of blank rectangles.
+
+    The name is drawn on the card rather than left to a tooltip, so a
+    screenshot is enough to tell the themes apart, and so there is a visible
+    label for anyone who does not hover.
+    """
+
+    def __init__(self, name: str, colors: dict, parent=None) -> None:
+        super().__init__(parent)
+        self._name = name
+        self._bands = [str(colors.get(key, "#121a2e"))
+                       for key in PRESET_SWATCH_KEYS]
+        # The readable half of the card is filled with the theme's PAGE colour,
+        # so the ink has to contrast with THAT: a dark theme needs light text
+        # and a light theme needs dark text. Getting this backwards paints
+        # "Midnight Pulse" in near-black on near-black and the label vanishes.
+        self._label = _strip_emoji(name)
+        page_lum = luminance(colors.get("ex_bg", "#121a2e"))
+        self._fg = "#f8fbff" if page_lum < 0.5 else "#0f172a"
+        self._accent = str(colors.get("ex_accent", "#6163df"))
+        self.setCheckable(True)
+        self.setAutoExclusive(True)
+        self.setFixedHeight(46)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setProperty("kind", "preset")
+        self.setToolTip(f"Apply the {name} theme")
+        self.setAccessibleName(f"Apply the {name} dashboard theme")
+
+    def name(self) -> str:
+        return self._name
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        from PySide6.QtGui import QColor, QPainter
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect().adjusted(1, 1, -1, -1)
+        page = QColor(self._bands[0])
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(page)
+        p.drawRoundedRect(rect, 6, 6)
+
+        # Four equal bands across the TOP of the card: page, card, accent, KPI.
+        band_h = max(10, rect.height() // 2)
+        band_w = rect.width() / max(1, len(self._bands))
+        p.setClipRect(rect)
+        for i, colour in enumerate(self._bands):
+            p.fillRect(QRect(int(i * band_w), rect.top(),
+                             int(band_w) + 1, band_h), QColor(colour))
+        p.setClipping(False)
+
+        # Label on the page-coloured half, in a contrasting ink.
+        p.setPen(QColor(self._fg))
+        font = p.font()
+        font.setPointSizeF(max(7.0, font.pointSizeF() - 1.0))
+        font.setBold(True)
+        p.setFont(font)
+        text_rect = QRect(rect.left() + 4, rect.top() + band_h,
+                          rect.width() - 8, rect.height() - band_h)
+        p.drawText(text_rect, Qt.AlignmentFlag.AlignCenter,
+                   QFontMetrics(font).elidedText(
+                       self._label, Qt.TextElideMode.ElideRight,
+                       text_rect.width()))
+
+        # Selection / hover ring, in the theme's own accent.
+        if self.isChecked():
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(QColor(self._accent), 2))
+            p.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 6, 6)
+        p.end()
+
+
+def _strip_emoji(name: str) -> str:
+    """The preset's readable name, without its leading emoji.
+
+    ``⚡ Midnight Pulse`` is a fine tooltip and a bad 46px-tall button label:
+    the glyph eats a third of the width and pushes the words into an ellipsis.
+    """
+    out = "".join(ch for ch in str(name)
+                  if not (0x1F000 <= ord(ch) <= 0x1FAFF
+                          or 0x2600 <= ord(ch) <= 0x27BF
+                          or ch in "️☀️"))
+    return " ".join(out.split()) or str(name)
+
+
 class PresetGallery(QWidget):
     """The one-click dashboard themes.
 
     Each button paints the preset's own page / card / accent / KPI colours as
-    four bands, so the button IS the preview -- there is no separate preview
-    step, and applying one repaints the live board immediately. The caption text
-    is on the tooltip and the accessible name instead, because a light theme's
-    dark caption on a dark band (and vice versa) is unreadable at this size.
+    four bands and shows the theme's name, so the button IS the preview -- there
+    is no separate preview step, and applying one repaints the live board
+    immediately. See ``PresetButton`` for why this is painted rather than
+    style-sheeted.
     """
 
     preset_selected = Signal(str)
@@ -214,15 +307,7 @@ class PresetGallery(QWidget):
         grid.setVerticalSpacing(6)
         self._buttons: dict[str, QPushButton] = {}
         for i, (name, colors) in enumerate(EXPORT_PRESETS.items()):
-            btn = QPushButton()
-            btn.setCheckable(True)
-            btn.setAutoExclusive(True)
-            btn.setFixedHeight(34)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setProperty("kind", "preset")
-            btn.setToolTip(f"Apply the {name} theme")
-            btn.setAccessibleName(f"Apply the {name} dashboard theme")
-            btn.setStyleSheet(self._swatch_css(colors))
+            btn = PresetButton(name, colors, self)
             btn.clicked.connect(
                 lambda _checked=False, n=name: self.preset_selected.emit(n))
             grid.addWidget(btn, i // columns, i % columns)
@@ -230,26 +315,20 @@ class PresetGallery(QWidget):
 
     @staticmethod
     def _swatch_css(colors: dict) -> str:
-        """The four bands as a horizontal gradient, plus a focus/checked ring.
+        """Ring colours for a preset, kept for callers that set a sheet.
 
-        The stops are hard rather than blended: a smooth gradient between four
-        brand colours would invent colours that belong to no theme. The focus
-        ring is derived from the page background's luminance so it stays visible
-        on both the light and the dark presets.
+        No gradient here on purpose: Qt Style Sheets do not implement
+        ``qlinear-gradient``, so a stylesheet declaring one produces an
+        unstyled button rather than a gradient.
         """
-        page = colors.get("ex_bg", "#121a2e")
-        card = colors.get("ex_card", "#1b2245")
         accent = colors.get("ex_accent", "#6163df")
-        kpi = colors.get("ex_kpi", "#1b2245")
+        page = colors.get("ex_bg", "#121a2e")
         fg = "#0f172a" if luminance(page) < 0.5 else "#f8fbff"
         return (
             "QPushButton {"
-            f" qlinear-gradient(x1:0, y1:0, x2:1, y2:0, stop:0 {page},"
-            f" stop:0.25 {card}, stop:0.5 {accent}, stop:0.75 {kpi},"
-            f" stop:1 {kpi});"
-            " border: 1px solid palette(mid); border-radius: 6px; padding: 0px; }"
+            f" border: 1px solid {accent}; border-radius: 6px; padding: 0px;"
+            " background: transparent; }"
             f"QPushButton:checked {{ border: 2px solid {accent}; }}"
-            f"QPushButton:hover {{ border: 1px solid {accent}; }}"
             f"QPushButton:focus {{ border: 2px solid {fg}; }}"
         )
 

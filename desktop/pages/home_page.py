@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import getpass
 import logging
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
@@ -19,13 +20,35 @@ from PySide6.QtWidgets import (
 
 from desktop.theme import PAGE_MARGINS
 from desktop.session_bridge import SessionBridge
+from desktop.widgets.banner_label import BannerLabel
 from desktop.widgets.stat_card import StatCard
 from services.database_service import (
     get_user_sessions, invalidate_sessions_cache,
     delete_session_db, rename_session_db, get_user_stats,
 )
+from services.analysis_service import ANALYSIS_OPTIONS
 
 log = logging.getLogger(__name__)
+
+#: Where the bundled artwork lives -- the same directory the app icon and the
+#: sidebar logo are resolved from (``desktop/app.py``,
+#: ``desktop/main_window.py``), so the app has one assets location, not three.
+_ASSETS_DIR = Path(__file__).resolve().parent.parent.parent / "backend" / "assets"
+
+
+def _asset_path(name: str) -> Path:
+    """Resolve a bundled asset to a path.
+
+    Returns the first candidate that exists, else the preferred one. It must
+    NOT raise for a missing file: a packaging mistake should show as a banner
+    that quietly does not appear, not crash the page during construction.
+    """
+    for base in (_ASSETS_DIR,
+                 Path(__file__).resolve().parent.parent / "assets"):
+        candidate = base / name
+        if candidate.exists():
+            return candidate
+    return _ASSETS_DIR / name
 
 
 class HomePage(QWidget):
@@ -50,31 +73,28 @@ class HomePage(QWidget):
         root.setContentsMargins(*PAGE_MARGINS)
         root.setSpacing(12)
 
-        # -- Header --
+        # -- Header -------------------------------------------------------
+        # ONE row, three parts: the greeting on the left, the official banner in
+        # the middle, the Start button hard against the top-right.
+        #
+        # The banner used to sit in a row of its own above this one, which put
+        # the page title and the welcome card on a lower line and left a band of
+        # empty space beside the artwork -- the title appeared to float in the
+        # middle of the header while the banner towered above it. Sharing one
+        # row means the banner, the "Home" title and the welcome message are all
+        # on the same line, and the only vertical space is whatever the tallest
+        # of the three genuinely needs.
         header = QHBoxLayout()
+        header.setSpacing(16)
+
+        # Left: the page title stacked over the welcome card, so they read as one
+        # greeting block rather than two unrelated rows.
+        greeting = QVBoxLayout()
+        greeting.setSpacing(8)
         title = QLabel("🏠 Home")
         title.setProperty("class", "pageTitle")
-        header.addWidget(title)
-        header.addStretch()
+        greeting.addWidget(title, 0, Qt.AlignLeft)
 
-        self.btn_new = QPushButton("🚀 Start New Analysis")
-        self.btn_new.setProperty("kind", "primary")
-        header.addWidget(self.btn_new)
-
-        # Action buttons for selected session are built here (styles only);
-        # they are placed next to the "Saved Sessions" section header below,
-        # not in this page-level header, since they act on a selected session.
-        self.btn_rename = QPushButton("✏️ Rename")
-        self.btn_rename.setEnabled(False)
-        self.btn_rename.setProperty("kind", "ghost")
-
-        self.btn_delete = QPushButton("🗑 Delete")
-        self.btn_delete.setEnabled(False)
-        self.btn_delete.setProperty("kind", "danger")
-
-        root.addLayout(header)
-
-        # -- Welcome banner --
         try:
             username = getpass.getuser().strip() or "user"
         except Exception:
@@ -90,7 +110,51 @@ class HomePage(QWidget):
         lbl_welcome_desc = QLabel("Import a dataset, generate charts, and compose dashboards — all offline.")
         lbl_welcome_desc.setProperty("class", "muted")
         welcome_lay.addWidget(lbl_welcome_desc)
-        root.addWidget(welcome, 0, Qt.AlignLeft | Qt.AlignTop)
+        greeting.addWidget(welcome)
+        # The greeting column takes only the width its text needs; the banner
+        # claims the rest. It is wrapped in a plain widget rather than added
+        # with an alignment: QBoxLayout.addLayout takes no alignment argument
+        # (only addWidget does), and the nested column already hugs its content
+        # because both of its widgets are sized to their own text.
+        greeting_holder = QWidget()
+        greeting_holder.setLayout(greeting)
+        header.addWidget(greeting_holder, 0, Qt.AlignTop)
+
+        # Middle: the official banner artwork, scaling with the window
+        # (BannerLabel). fill="adapt" so the banner auto-adjusts to the window
+        # while keeping the artwork's own proportions and staying WHOLE -- an
+        # earlier "cover" render filled the band by cropping the top and bottom
+        # off the artwork, which lost the shields, the axis labels and both ends
+        # of the chart on a full screen, and a plain "fit" render left a wide
+        # empty strip beside a small image. Adapt makes the WIDGET take the
+        # artwork's shape instead, so it grows and shrinks with the window,
+        # never crops, and never letterboxes.
+        self.banner = BannerLabel(str(_asset_path("welcome-banner.png")),
+                                  fill="adapt", min_height=180, max_height=260)
+        # Stretch 1: the banner is what absorbs the leftover width, and in adapt
+        # mode that width is what drives the artwork's size. AlignVCentre keeps
+        # the band aligned with the greeting.
+        header.addWidget(self.banner, 1, Qt.AlignVCenter)
+
+        # Right: the Start button, pinned to the top-right corner. AlignTop keeps
+        # it on the title's line instead of drifting to the vertical middle of
+        # however tall the banner turns out to be.
+        self.btn_new = QPushButton("🚀 Start New Analysis")
+        self.btn_new.setProperty("kind", "primary")
+        header.addWidget(self.btn_new, 0, Qt.AlignTop | Qt.AlignRight)
+
+        # Action buttons for selected session are built here (styles only);
+        # they are placed next to the "Saved Sessions" section header below,
+        # not in this page-level header, since they act on a selected session.
+        self.btn_rename = QPushButton("✏️ Rename")
+        self.btn_rename.setEnabled(False)
+        self.btn_rename.setProperty("kind", "ghost")
+
+        self.btn_delete = QPushButton("🗑 Delete")
+        self.btn_delete.setEnabled(False)
+        self.btn_delete.setProperty("kind", "danger")
+
+        root.addLayout(header)
 
         # -- Stat cards: sessions saved, datasets analyzed, analyses run --
         stats_row = QHBoxLayout()
@@ -172,7 +236,16 @@ class HomePage(QWidget):
     def _refresh_stats(self) -> None:
         """Refresh the three summary stat cards from the database."""
         user_id = self.bridge.get("user_id")
-        stats = get_user_stats(user_id) if user_id else {"sessions": 0, "datasets": 0, "analyses": 0}
+        # "Analyses Available" is a property of the build, not of this user's
+        # history, so it comes straight from the analysis registry. Reading it
+        # from ANALYSIS_OPTIONS rather than hardcoding a number means adding a
+        # chart type updates the card with no second place to forget.
+        analyses_available = len(ANALYSIS_OPTIONS)
+        stats = (
+            get_user_stats(user_id, analyses_available=analyses_available)
+            if user_id
+            else {"sessions": 0, "datasets": 0, "analyses": analyses_available}
+        )
         self.stat_sessions.set_value(stats.get("sessions", 0))
         self.stat_datasets.set_value(stats.get("datasets", 0))
         self.stat_analyses.set_value(stats.get("analyses", 0))

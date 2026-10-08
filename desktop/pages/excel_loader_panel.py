@@ -9,6 +9,7 @@ Replaces the Streamlit ``show_excel_loader()`` with a native Qt panel that:
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Optional
 
 import pandas as pd
@@ -21,6 +22,121 @@ from PySide6.QtWidgets import (
 )
 
 log = logging.getLogger(__name__)
+
+
+class _LazySheets(Mapping):
+    """``{sheet_name: DataFrame}`` that parses each sheet on first access.
+
+    The panel's ``self._sheets[name]`` call sites are all "I need this sheet's
+    rows now" -- selection, preview, merge. Only ONE sheet is normally wanted,
+    so the mapping loads on ``__getitem__`` and memoises. ``in`` is answered
+    from the known sheet-name list, which is why the merge path can still test
+    ``dim_name not in self._sheets`` without triggering a read.
+    """
+
+    def __init__(self, names, loader):
+        self._names = list(names)
+        self._loader = loader
+        self._cache: dict = {}
+
+    def __getitem__(self, key):
+        if key not in self._names:
+            raise KeyError(key)
+        if key not in self._cache:
+            self._cache[key] = self._loader(key)
+        return self._cache[key]
+
+    def __iter__(self):
+        return iter(self._names)
+
+    def __len__(self):
+        return len(self._names)
+
+    def __contains__(self, key):
+        return key in self._names
+
+    def get(self, key, default=None):
+        if key not in self._names:
+            return default
+        try:
+            return self[key]
+        except Exception as exc:
+            log.debug("_LazySheets.get failed for %r: %s", key, exc)
+            return default
+
+    def loaded(self) -> list:
+        """Names actually parsed so far -- used by tests and diagnostics."""
+        return list(self._cache)
+
+
+def _xlsx_row_count(file_path: Optional[str], sheet_name: str) -> Optional[int]:
+    """Row count for *sheet_name* read straight from the xlsx XML.
+
+    An .xlsx is a zip of XML and the worksheet part declares its extent in
+    ``<dimension ref="A1:D5000"/>``, so the row count is available without
+    parsing a single cell value. That is what makes the sheet list cheap to
+    populate.
+
+    Returns None for any workbook this cannot introspect (.xls, a missing or
+    malformed dimension, a zip that is not a spreadsheet); the caller then
+    omits the count rather than falling back to a full read. Every failure is
+    non-fatal by design: a missing row count is not worth refusing to open
+    the file over.
+    """
+    if not file_path or not sheet_name:
+        return None
+    try:
+        import re
+        import zipfile
+        from xml.etree import ElementTree
+
+        with zipfile.ZipFile(file_path) as zf:
+            names = zf.namelist()
+            index = _xlsx_sheet_part(zf, sheet_name, ElementTree)
+            if index is None or index not in names:
+                parts = [n for n in names
+                         if n.startswith("xl/worksheets/sheet")
+                         and n.endswith(".xml")]
+                # Only unambiguous when the workbook has a single data sheet.
+                if len(parts) != 1:
+                    return None
+                index = parts[0]
+            with zf.open(index) as fh:
+                head = fh.read(8192).decode("utf-8", "ignore")
+        match = re.search(r'<dimension[^>]*ref="[A-Z]+\d+:([A-Z]+)(\d+)"', head)
+        if not match:
+            return None
+        return int(match.group(2)) - 1          # dimension ref is 1-based
+    except Exception as exc:
+        log.debug("_xlsx_row_count failed for %r: %s", sheet_name, exc)
+        return None
+
+
+def _xlsx_sheet_part(zf, sheet_name: str, ElementTree) -> Optional[str]:
+    """Zip path of *sheet_name*'s worksheet part, via workbook.xml + rels.
+
+    ``ElementTree`` is passed in rather than imported so the caller keeps a
+    single import of it inside its own ``try`` -- a local ``import`` here
+    would be a fresh name binding that the two helpers do not share.
+    """
+    ns_r = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    try:
+        wb = ElementTree.fromstring(zf.read("xl/workbook.xml"))
+        rel_id = None
+        for sheet in wb.iter():
+            if sheet.tag.endswith("}sheet") and sheet.get("name") == sheet_name:
+                rel_id = sheet.get(f"{ns_r}id")
+                break
+        if not rel_id:
+            return None
+        rels = ElementTree.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+        for rel in rels:
+            if rel.get("Id") == rel_id:
+                target = (rel.get("Target") or "").lstrip("/")
+                return target if target.startswith("xl/") else "xl/" + target
+    except Exception as exc:
+        log.debug("_xlsx_sheet_part failed for %r: %s", sheet_name, exc)
+    return None
 
 
 class ExcelLoaderPanel(QWidget):
@@ -37,7 +153,10 @@ class ExcelLoaderPanel(QWidget):
         super().__init__(parent)
         self.bridge = bridge
         self._file_path: Optional[str] = None
-        self._sheets: dict[str, pd.DataFrame] = {}
+        self._excel = None
+        # Swapped for a _LazySheets view in load_file(). A plain empty dict here
+        # keeps every `in` / `[]` call safe before a file has been opened.
+        self._sheets: Mapping[str, pd.DataFrame] = {}
         self._sheet_names: list[str] = []
 
         self._build_ui()
@@ -154,24 +273,50 @@ class ExcelLoaderPanel(QWidget):
     # -- Public API ---------------------------------------------------------
 
     def load_file(self, file_path: str) -> None:
-        """Load an Excel file and populate the sheet list."""
+        """Load an Excel file and populate the sheet list.
+
+        Sheets are read LAZILY. This used to be::
+
+            self._sheets = {name: pd.read_excel(excel, sheet_name=name)
+                            for name in self._sheet_names}
+
+        which parsed every sheet in the workbook into memory before the user
+        had chosen one -- and then kept them all alive for the rest of the
+        session. A 20-sheet workbook meant 20 DataFrames resident to look at
+        a list of names, and the row counts shown in that list could only be
+        produced by parsing every sheet first.
+
+        ``_sheet_cache`` reads a sheet the first time something asks for its
+        contents and memoises it, so the list is populated from cheap header
+        reads and only the sheets actually opened are ever parsed in full.
+        Every existing ``self._sheets[name]`` call site keeps working: ``_sheets``
+        is now a mapping view that loads on ``__getitem__``.
+        """
         self._file_path = file_path
-        self._sheets = {}
         self._sheet_names = []
 
         try:
-            # Read all sheets
             excel = pd.ExcelFile(file_path)
-            self._sheet_names = excel.sheet_names
-            self._sheets = {name: pd.read_excel(excel, sheet_name=name) for name in self._sheet_names}
+            self._sheet_names = list(excel.sheet_names)
+            self._excel = excel
+            # Installed BEFORE the list is populated: every ``self._sheets[name]``
+            # below now goes through the lazy view.
+            self._sheets = _LazySheets(
+                self._sheet_names,
+                lambda name: pd.read_excel(excel, sheet_name=name),
+            )
 
-            # Populate sheet list
+            # Populate sheet list. Shape comes from a header-only read, so
+            # this is O(columns) per sheet rather than O(rows x columns).
             self.list_sheets.clear()
             for name in self._sheet_names:
-                df = self._sheets[name]
-                item = QListWidgetItem(
-                    f"📄 {name}\n   {df.shape[0]:,} rows × {df.shape[1]} cols"
-                )
+                shape = self._peek_shape(name)
+                if shape is None:
+                    label = f"\U0001F4C4 {name}"
+                else:
+                    label = (f"\U0001F4C4 {name}\n"
+                             f"   {shape[0]:,} rows × {shape[1]} cols")
+                item = QListWidgetItem(label)
                 item.setData(Qt.UserRole, name)
                 self.list_sheets.addItem(item)
 
@@ -184,12 +329,30 @@ class ExcelLoaderPanel(QWidget):
             self.cmb_fact.addItems(self._sheet_names)
             self.list_dims.clear()
             for name in self._sheet_names:
-                item = QListWidgetItem(name)
-                self.list_dims.addItem(item)
+                self.list_dims.addItem(QListWidgetItem(name))
 
         except Exception as exc:
             QMessageBox.critical(self, "Load Error", f"Failed to read Excel file:\n{exc}")
             log.error("Failed to load Excel file: %s", exc)
+
+    def _peek_shape(self, name: str) -> Optional[tuple]:
+        """``(rows, cols)`` for *name* without parsing its cells.
+
+        Returns None when the shape cannot be determined cheaply, and the
+        caller then omits the count rather than triggering a full read.
+        """
+        try:
+            # ``nrows=0`` stops openpyxl after the header row, so this costs
+            # one row read per sheet rather than the whole table.
+            head = pd.read_excel(self._excel, sheet_name=name, nrows=0)
+            width = len(head.columns)
+            rows = _xlsx_row_count(self._file_path, name)
+            if rows is None or width == 0:
+                return None
+            return rows, width
+        except Exception as exc:
+            log.debug("_peek_shape failed for %r: %s", name, exc)
+            return None
 
     # -- Slots --------------------------------------------------------------
 

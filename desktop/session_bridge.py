@@ -12,6 +12,7 @@ signals to the main thread, which then applies the result.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Optional
 
 import pandas as pd
@@ -43,6 +44,17 @@ class SessionBridge(QObject):
         # Internal mirror to avoid emitting the same df twice
         self._last_df: Optional[pd.DataFrame] = None
 
+        # Async draft-save queue (latest-wins). save_draft() serialises the
+        # whole session (Plotly to_json + SQLite write) which stalls the UI
+        # on a large session, so the write runs on ONE background thread:
+        # at most one save in flight plus one pending carrying the newest
+        # snapshot. Tests that need determinism set _save_sync or call
+        # flush_draft_save().
+        self._save_lock = threading.Lock()
+        self._save_in_flight = False
+        self._save_pending = None
+        self._save_sync = False   # flipped by tests only
+
     # -- Access to the underlying manager --
     @property
     def manager(self) -> SessionManager:
@@ -51,6 +63,17 @@ class SessionBridge(QObject):
     # -- Python callbacks → Qt signals --
     def _on_df_changed(self, df: pd.DataFrame) -> None:
         self._last_df = df
+        # A new frame invalidates every cache keyed on the old one's identity:
+        # column roles and the slicer's distinct-value lists are memoised per
+        # frame (see services.column_roles / services.filter_service), and
+        # leaving them alive would answer from the dataset the user just left.
+        try:
+            from services.column_roles import clear_roles_cache
+            from services.filter_service import clear_distinct_cache
+            clear_roles_cache()
+            clear_distinct_cache()
+        except Exception:                 # caching must never break a load
+            pass
         self.df_changed.emit(df)
         if df is not None:
             self.charts_changed.emit(self._manager.get("charts", []))
@@ -140,6 +163,45 @@ class SessionBridge(QObject):
         self._manager.set(f"chart_meta_{uid}", meta)
 
     # -- Persistence helpers --
+    def record_dataset_analysed(self) -> bool:
+        """Record that the loaded dataset has reached the analysis stage.
+
+        Called from the two entry points that genuinely mean "the user started
+        analysing this data": proceeding to the Analysis page from Upload, and
+        successfully generating a chart when they jumped straight there from
+        the sidebar. Both call this one method so the identity used for
+        de-duplication is identical no matter which door the user came in by.
+
+        De-duplication is by ``file_signature`` ("<name>:<size>"), so the same
+        file analysed again in the same or a later session does not
+        double-count, while an updated file that happens to share the name does.
+
+        Returns True when the count actually went up.
+        """
+        df = self._manager.df
+        user_id = self._manager.get("user_id")
+        if df is None or user_id is None:
+            return False
+        file_name = str(self._manager.get("file_name") or "")
+        # file_signature is set at import time from the real on-disk size.
+        # Datasets that arrive by another route (an Excel sheet selection, a
+        # restored session) have no size, so fall back to name+shape, which
+        # still distinguishes genuinely different data.
+        signature = str(self._manager.get("file_signature") or "")
+        if not signature:
+            if not file_name:
+                return False
+            signature = f"{file_name}:{len(df)}x{df.shape[1]}"
+        try:
+            from services.database_service import record_dataset_analysed
+            return record_dataset_analysed(
+                user_id, file_name, signature, len(df), df.shape[1])
+        except Exception as exc:
+            # Counting is telemetry; never let it break navigation or chart
+            # generation.
+            log.warning("record_dataset_analysed failed: %s", exc)
+            return False
+
     def save_df_snapshot_async(self, user_id: int) -> None:
         df = self._manager.df
         if df is not None:
@@ -177,7 +239,7 @@ class SessionBridge(QObject):
                 chart_meta.get(uid, {}),
             ))
 
-        db_save_draft(
+        snapshot = dict(
             user_id=user_id,
             page=self._manager.get("page", "home"),
             charts_json=charts_to_json(serialisable, notes=notes, meta_map=chart_meta),
@@ -193,6 +255,56 @@ class SessionBridge(QObject):
             ),
             layout_mode=self._manager.get("layout_mode", "portrait"),
         )
+        if self._save_sync:
+            # Tests only: deterministic, same-thread write.
+            from services.database_service import save_draft as db_save_draft
+            db_save_draft(**snapshot)
+            return
+        with self._save_lock:
+            if self._save_in_flight:
+                # A save is already running: remember only the newest
+                # snapshot. Rapid generate/delete/edit bursts collapse to
+                # two writes (in-flight + latest) instead of N.
+                self._save_pending = snapshot
+                return
+            self._save_in_flight = True
+        threading.Thread(target=self._save_loop,
+                         args=(snapshot,), daemon=True).start()
+
+    def _write_draft_snapshot(self, snapshot: dict) -> None:
+        """Perform one draft write. Runs on the saver thread, never the UI."""
+        try:
+            from services.database_service import save_draft as db_save_draft
+            db_save_draft(**snapshot)
+        except Exception as exc:
+            log.warning("save_draft: write failed: %s", exc)
+
+    def _save_loop(self, first: dict) -> None:
+        """Drain the save queue: first snapshot, then the latest pending."""
+        snapshot = first
+        while snapshot is not None:
+            self._write_draft_snapshot(snapshot)
+            with self._save_lock:
+                snapshot = self._save_pending
+                self._save_pending = None
+                if snapshot is None:
+                    self._save_in_flight = False
+
+    def flush_draft_save(self, timeout: float = 10.0) -> bool:
+        """Block until the saver thread is idle. Tests only.
+
+        Returns True when the queue drained within *timeout* seconds.
+        """
+        import time
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._save_lock:
+                idle = (not self._save_in_flight
+                        and self._save_pending is None)
+            if idle:
+                return True
+            time.sleep(0.02)
+        return False
 
     def restore_draft(self) -> bool:
         """Reload the last auto-saved draft into the live session.

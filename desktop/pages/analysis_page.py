@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QGridLayout, QComboBox, QListWidget, QListWidgetItem,
     QLineEdit, QSpinBox, QCheckBox, QFrame, QMessageBox, QSplitter,
-    QStackedWidget, QSizePolicy, QTabWidget,
+    QStackedWidget, QSizePolicy, QTabWidget, QDialog,
 )
 
 from desktop.theme import PAGE_MARGINS
@@ -534,6 +534,16 @@ class AnalysisPage(QWidget):
         self._show_chart_area(True)
 
     def _refresh_descriptive_table(self) -> None:
+        """Build the descriptive overview off the UI thread.
+
+        ``run_analysis("descriptive", df)`` runs a full ``describe()`` over
+        every column on the CALLER's thread, so selecting Descriptive from
+        the sidebar used to stall the whole app on a large frame. The work
+        now runs in a ChartGenerationWorker (its default config path already
+        handles "descriptive"); a generation token discards a stale result
+        when the user switches type mid-run. Widget creation stays on the UI
+        thread in the completion slot -- Qt forbids it anywhere else.
+        """
         df = self.bridge.df
         if df is None:
             return
@@ -542,11 +552,30 @@ class AnalysisPage(QWidget):
             w = item.widget()
             if w is not None:
                 w.deleteLater()
-        try:
-            results = run_analysis("descriptive", df)
-        except Exception as exc:  # pragma: no cover
-            log.error("Descriptive run failed: %s", exc)
-            results = []
+        placeholder = QLabel("Computing overview…")
+        placeholder.setProperty("class", "faint")
+        self.descriptive_container_layout.addWidget(placeholder)
+        token = getattr(self, "_descriptive_token", 0) + 1
+        self._descriptive_token = token
+        worker = ChartGenerationWorker("descriptive", df, {}, self)
+        worker.finished_ok.connect(
+            lambda results: self._on_descriptive_finished(token, results))
+        worker.failed.connect(
+            lambda err: self._on_descriptive_failed(token, err))
+        self._descriptive_worker = worker
+        worker.start()
+
+    def _take_descriptive_placeholder(self):
+        while self.descriptive_container_layout.count():
+            item = self.descriptive_container_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+    def _on_descriptive_finished(self, token: int, results) -> None:
+        if token != getattr(self, "_descriptive_token", 0):
+            return  # stale: the user already moved to another type
+        self._take_descriptive_placeholder()
         if results:
             uid, title, fig = results[0]
             card = ChartCard(uid, title, fig, "descriptive")
@@ -555,6 +584,12 @@ class AnalysisPage(QWidget):
                         card.btn_up, card.btn_down, card.btn_fullwidth):
                 btn.setVisible(False)
             self.descriptive_container_layout.addWidget(card, stretch=1)
+
+    def _on_descriptive_failed(self, token: int, error: str) -> None:
+        if token != getattr(self, "_descriptive_token", 0):
+            return
+        self._take_descriptive_placeholder()
+        log.error("Descriptive run failed: %s", error)
 
     def _show_chart_area(self, descriptive: bool) -> None:
         """Switch the bottom pane between the chart tabs, the descriptive
@@ -766,6 +801,13 @@ class AnalysisPage(QWidget):
             "layout": dict(self._collect_layout),
             "typography": dict(self._collect_typo),
         }
+
+        # Second "counted" trigger: the user jumped straight to Analysis from
+        # the sidebar and produced a real chart, without ever pressing
+        # "Go to Analysis". Reaching a successful chart is what makes this
+        # dataset analysed under that route. Placed after the
+        # `if not new_charts` guard so a failed/empty run does not count.
+        self.bridge.record_dataset_analysed()
         # Batch the bridge writes below: each add/replace emits charts_changed,
         # and without this guard every emit rebuilds all tabs + rebinds the
         # settings form (Generate looked like the app "reopened itself";
@@ -943,6 +985,10 @@ class AnalysisPage(QWidget):
                 card.set_note(note)
                 card.delete_requested.connect(self._on_delete_chart)
                 card.edit_requested.connect(self._on_edit_chart)
+                # The per-chart slicer entry point: the card is where the
+                # user is looking when they decide this ONE chart needs a
+                # filter, so the form opens from here, pre-scoped to it.
+                card.slicer_requested.connect(self._on_add_chart_slicer)
                 # Analysis cards keep only edit + delete on the header: style
                 # lives in the Layout/Typography tabs, reorder via tab drag.
                 for _btn in (card.btn_up, card.btn_down, card.btn_style):
@@ -1063,6 +1109,44 @@ class AnalysisPage(QWidget):
         )
         return reply == QMessageBox.Yes
 
+    def _on_add_chart_slicer(self, uid: str) -> None:
+        """Open the slicer form pre-scoped to *uid*.
+
+        The per-chart entry point: the same dialog the dashboard's
+        "Add Slicer" opens, but born on "One chart" with this chart already
+        chosen, so the scope decision is made right where the user is
+        looking at the chart. The result is stored through the bridge --
+        slicers belong to the report, not to the analysis page, and the
+        dashboard rebuilds itself when it sees ``state_changed("slicers")``.
+        """
+        df = self.bridge.df
+        if df is None or df.empty:
+            QMessageBox.warning(self, "No Data",
+                                "Load a dataset before adding slicers.")
+            return
+        from desktop.widgets.slicer_dialog import SlicerDialog
+
+        charts = self.bridge.get("charts", [])
+        # Recipes (chart metas) let the dialog report which charts the draft
+        # will actually reach -- the same affected_charts() the recompute
+        # path uses, so the hint cannot drift from behaviour.
+        recipes = {c[0]: self.bridge.get_chart_meta(c[0]) for c in charts}
+        dialog = SlicerDialog(df, parent=self, charts=charts,
+                              recipes=recipes,
+                              preset_scope="One chart", preset_target=uid)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        try:
+            slicer = dialog.result_slicer()
+        except ValueError as exc:
+            # make_slicer refuses a chart-scoped slicer with no target; show
+            # it as the form error it is rather than swallowing it.
+            QMessageBox.warning(self, "Slicer", str(exc))
+            return
+        slicers = list(self.bridge.get("slicers", []) or [])
+        slicers.append(slicer)
+        self.bridge.set("slicers", slicers)
+
     def _on_delete_chart(self, uid: str) -> None:
         """Delete a chart (the card's 🗑 and the tab's ✕ both land here)."""
         if not uid or not self._ask_delete(uid):
@@ -1175,3 +1259,12 @@ class AnalysisPage(QWidget):
     def refresh(self) -> None:
         """Refresh the page when navigated to."""
         self._refresh_charts()
+        # A dashboard canvas pencil lands here via navigate_requested with
+        # the target uid on the bridge. Consumed once (popped first) so a
+        # later plain navigation does not re-open a stale chart.
+        try:
+            pending = self.bridge.pop("_pending_edit_chart", None)
+        except Exception:
+            pending = None
+        if pending and self.bridge.get(f"chart_type_{pending}", ""):
+            self._on_edit_chart(pending)

@@ -261,9 +261,7 @@ class UploadPage(QWidget):
 
     def _connect_signals(self) -> None:
         self.btn_import.clicked.connect(self._on_import)
-        self.btn_go_analysis.clicked.connect(
-            lambda: self.navigate_requested.emit("analysis")
-        )
+        self.btn_go_analysis.clicked.connect(self._on_go_analysis)
         self.preview_mode.currentIndexChanged.connect(self._on_preview_mode)
         self.search_box.textChanged.connect(self._on_search)
         self.bridge.df_changed.connect(self._on_df_changed)
@@ -435,18 +433,16 @@ class UploadPage(QWidget):
     def _run_search(self) -> None:
         """Filter the table by searching across all columns. Runs only
         after the user pauses typing for the debounce interval."""
-        text = self._pending_search_text
         df = self.bridge.df
-        if df is None or not text.strip():
+        if df is None or not self._pending_search_text.strip():
             self._model.set_dataframe(df if df is not None else pd.DataFrame())
             self._auto_fit_index_width()
             return
 
         try:
-            mask = df.astype(str).apply(
-                lambda col: col.str.contains(text, case=False, na=False)
-            ).any(axis=1)
-            self._model.set_dataframe(df[mask])
+            # Goes through the shared helper so the search COMBINES with the
+            # per-column filters instead of replacing them.
+            self._model.set_dataframe(self._current_view_df())
         except Exception as exc:
             log.warning("Search failed: %s", exc)
         finally:
@@ -559,24 +555,105 @@ class UploadPage(QWidget):
             self._filter_inputs.append(inp)
             self.filter_row.layout().addWidget(inp)
 
+    def _current_view_df(self) -> pd.DataFrame:
+        """The rows currently on screen, as a real DataFrame.
+
+        This is the single source of truth for "what the user is looking at".
+        The grid used to be the only record of the active filters -- each of
+        ``_run_search``, ``_run_filters`` and ``_refresh_table_preserving_filter``
+        recomputed its own subset and pushed it into the model -- which meant
+        the filtering was both duplicated in three places and mutually
+        exclusive: the search path rebuilt the frame from the *unfiltered* df,
+        so typing in the search box silently discarded the per-column filters,
+        and vice-versa. Anything that needs the visible rows (Save CSV, the
+        row counts in dialogs) now asks here instead.
+
+        Note this deliberately does NOT apply the preview mode. "Top 10" /
+        "Bottom 10" / "Random 10" are a viewport over the results, not a
+        filter on the data: exporting them would silently throw away 99.99%
+        of a 149k-row file because a combo box was left on its default.
+        """
+        df = self.bridge.df
+        if df is None:
+            return pd.DataFrame()
+
+        # Global search across every column.
+        text = (getattr(self, "_pending_search_text", "") or "").strip()
+        if text:
+            df = self._rows_matching(df, text)
+
+        # Per-column "contains" filters, combined with (not replacing) the
+        # search. Each one narrows what the previous ones left.
+        for inp, col in zip(self._filter_inputs, df.columns):
+            col_text = inp.text().strip()
+            if not col_text:
+                continue
+            try:
+                mask = df[col].astype(str).str.contains(
+                    col_text, case=False, na=False)
+                df = df[mask]
+            except Exception as exc:
+                log.warning("Column filter on %r failed: %s", col, exc)
+        return df
+
+    @staticmethod
+    def _rows_matching(df: pd.DataFrame, text: str) -> pd.DataFrame:
+        """Rows where *text* appears in ANY column, scanning one at a time.
+
+        The obvious spelling of this is::
+
+            df.astype(str).apply(lambda c: c.str.contains(text, ...)).any(axis=1)
+
+        which materialises a full stringified COPY of the entire frame before
+        matching anything. Measured on a 500k x 12 categorical frame that copy
+        was 286 MB against a 5.7 MB original -- a 50x amplification -- and it
+        ran on every debounced keystroke, so the page allocated and freed
+        hundreds of megabytes per character typed.
+
+        Here each column is stringified, tested and released before the next
+        one, so the peak extra allocation is one column rather than the whole
+        frame. The result is identical; only the memory profile changes.
+
+        The mask is also accumulated with ``|=`` per column and checked for
+        "everything already matches", so a needle found in an early column
+        stops the scan entirely -- ``any(axis=1)`` could not do that, because
+        it has to build the whole boolean frame first.
+        """
+        if df is None or df.empty or not text:
+            return df
+        keep = pd.Series(False, index=df.index)
+        total = len(df.index)
+
+        for column in df.columns:
+            try:
+                # One copy of ONE column at a time, released on the next
+                # iteration. ``case=False`` already does the case folding, so
+                # there is deliberately NO extra ``.str.lower()`` pass -- that
+                # would allocate a second full string Series per column, which
+                # is the very cost this rewrite exists to remove.
+                hit = df[column].astype(str).str.contains(
+                    text, case=False, na=False, regex=False)
+                keep |= hit
+            except Exception as exc:
+                log.debug("global search skipped %r: %s", column, exc)
+                continue
+            if keep.all():
+                # Every row already matches; no later column can change that.
+                break
+
+        if total and int(keep.sum()) == total:
+            return df
+        return df[keep]
+
     def _run_filters(self) -> None:
-        """Apply all active per-column filters. Runs only after the user
-        pauses typing for the debounce interval (see _filter_timer)."""
+        """Apply all active filters (search + per-column). Runs only after
+        the user pauses typing for the debounce interval (see _filter_timer).
+        """
         df = self.bridge.df
         if df is None or df.empty:
             return
 
-        filtered = df.copy()
-        for inp, col in zip(self._filter_inputs, df.columns):
-            text = inp.text().strip()
-            if text:
-                try:
-                    mask = filtered[col].astype(str).str.contains(text, case=False, na=False)
-                    filtered = filtered[mask]
-                except Exception:
-                    pass
-
-        self._model.set_dataframe(filtered)
+        self._model.set_dataframe(self._current_view_df())
         # Filtered row count changed -> re-measure the index gutter.
         self._auto_fit_index_width()
 
@@ -600,34 +677,51 @@ class UploadPage(QWidget):
 
     def _refresh_table_preserving_filter(self) -> None:
         """Re-render the preview grid from the current bridge df, keeping
-        the active search filter / preview mode so an operation does not
-        silently reset the user's view."""
+        the active search filter / per-column filters so an operation does
+        not silently reset the user's view."""
         df = self.bridge.df
         if df is None:
             self._model.set_dataframe(pd.DataFrame())
             return
-        text = getattr(self, "_pending_search_text", "") or ""
-        if text.strip():
-            try:
-                mask = df.astype(str).apply(
-                    lambda col: col.str.contains(text, case=False, na=False)
-                ).any(axis=1)
-                df = df[mask]
-            except Exception as exc:
-                log.warning("Filter re-apply failed: %s", exc)
-        self._model.set_dataframe(df)
+        self._model.set_dataframe(self._current_view_df())
 
     def _on_save_csv(self) -> None:
-        """Save the current DataFrame to a CSV file."""
-        df = self.bridge.df
-        if df is None:
+        """Save the rows the user is currently looking at to a CSV file.
+
+        This used to write ``self.bridge.df`` -- the raw loaded frame -- so
+        every filter on screen was ignored and you got all 149,116 rows back
+        regardless of what the grid showed. The preview mode is still
+        deliberately excluded: "Top 10" is a viewport, not a filter, so it
+        must not truncate the export.
+        """
+        if self.bridge.df is None:
             QMessageBox.warning(self, "No Data", "No dataset loaded to save.")
             return
 
+        df = self._current_view_df()
+        total = len(self.bridge.df)
+        filtered_out = total - len(df)
+
+        if df.empty:
+            QMessageBox.warning(
+                self,
+                "Nothing to Save",
+                "The current filters match no rows.\n\n"
+                "Clear the filters, or widen them, and try again.",
+            )
+            return
+
+        # Pre-fill the filename from the dataset so the dialog is usable
+        # without typing, and make the filtered state visible in the title
+        # rather than only in the confirmation afterwards.
+        suggestion = str(self.bridge.get("file_name") or "dataset")
+        default_name = Path(suggestion).stem or "dataset"
+        if filtered_out:
+            default_name = f"{default_name}_filtered"
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save CSV",
-            str(Path.home()),
+            str(Path.home() / f"{default_name}.csv"),
             "CSV Files (*.csv)",
         )
         if not file_path:
@@ -638,12 +732,22 @@ class UploadPage(QWidget):
 
         try:
             df.to_csv(file_path, index=False)
+            scope = (
+                f"{len(df):,} of {total:,} rows (filters applied)"
+                if filtered_out
+                else f"{len(df):,} rows"
+            )
             QMessageBox.information(
                 self,
                 "Success",
-                f"Dataset saved successfully:\n{file_path}\n\n{df.shape[0]:,} rows × {df.shape[1]} columns",
+                f"Dataset saved successfully:\n{file_path}\n\n"
+                f"{scope} × {df.shape[1]} columns",
             )
-            self.lbl_file.setText(f"💾 Saved to {Path(file_path).name}")
+            self.lbl_file.setText(
+                f"💾 Saved {Path(file_path).name} — {scope}"
+                if filtered_out
+                else f"💾 Saved to {Path(file_path).name}"
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Save Failed", f"Failed to save CSV:\n{exc}")
 
@@ -681,4 +785,23 @@ class UploadPage(QWidget):
 
     def _on_classification_ready(self, classification: dict) -> None:
         """Navigate to analysis page when classification is confirmed."""
+        self._mark_dataset_analysed()
         self.navigate_requested.emit("analysis")
+
+    def _on_go_analysis(self) -> None:
+        """Proceed to the Analysis page via the 'Go to Analysis' button."""
+        self._mark_dataset_analysed()
+        self.navigate_requested.emit("analysis")
+
+    def _mark_dataset_analysed(self) -> None:
+        """Count this dataset as analysed on the way to the Analysis page.
+
+        This is one of the two points that make a dataset "counted": reaching
+        the analysis stage counts even if the user never generates a chart.
+        The bridge de-duplicates on file name + size, so pressing this twice,
+        or re-analysing the same file in a later session, does not inflate the
+        Home counter -- while an updated file of the same name does count.
+        """
+        if self.bridge.df is None:
+            return
+        self.bridge.record_dataset_analysed()

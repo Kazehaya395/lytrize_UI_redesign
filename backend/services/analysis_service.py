@@ -180,6 +180,16 @@ WIDGET_SPEC = {
         ("choropleth_projection", "choropleth_projection", "scalar"),
         ("choropleth_scope", "choropleth_scope", "scalar"),
         ("choropleth_show_borders", "choropleth_show_borders", "bool"),
+        ("render_mode", "render_mode", "scalar"),
+        # The extra tooltip fields.  They are part of WIDGET_SPEC so a saved
+        # chart can restore them; without the entries here the edit panel would
+        # silently drop them on the next generate.
+        ("hover_dim1", "hover_dim1", "scalar"),
+        ("hover_dim2", "hover_dim2", "scalar"),
+        ("hover_val1", "hover_val1", "scalar"),
+        ("hover_val1_agg", "hover_val1_agg", "scalar"),
+        ("hover_val2", "hover_val2", "scalar"),
+        ("hover_val2_agg", "hover_val2_agg", "scalar"),
     ],
 }
 
@@ -404,6 +414,27 @@ def build_analysis_config(aid: str, df: pd.DataFrame,
             v = g(key, NONE)
             return None if v in (NONE, None, "") else v
         _mp_mode = g("map_mode", "Scatter (Lat/Lon)")
+
+        def _mp_hover_extras():
+            """Read the six extra tooltip fields (2 dims + 2 (col, agg) values)."""
+            dims = [d for d in (_mp_resolve("hover_dim1"),
+                                _mp_resolve("hover_dim2")) if d]
+            values = []
+            for vk, ak in (("hover_val1", "hover_val1_agg"),
+                           ("hover_val2", "hover_val2_agg")):
+                vc = _mp_resolve(vk)
+                if vc:
+                    values.append((vc, AGG_FUNCS.get(g(ak, "Sum"), "sum")))
+            return dims, values
+
+        def _apply_hover_extras(kwargs):
+            """Attach the hover extras to *kwargs* when any were chosen."""
+            dims, values = _mp_hover_extras()
+            if dims:
+                kwargs["hover_dims"] = dims
+            if values:
+                kwargs["hover_values"] = values
+
         if _mp_mode == "Choropleth (Location Names)":
             # The choropleth country column is collected as ``location_col`` by
             # the single Location control the form shows, but this branch names
@@ -428,6 +459,7 @@ def build_analysis_config(aid: str, df: pd.DataFrame,
                 choropleth_scope=g("choropleth_scope", "world"),
                 choropleth_show_borders=_borders,
             )
+            _apply_hover_extras(kwargs)
         else:
             kwargs.update(
                 lat_col=_mp_resolve("lat_col"),
@@ -438,11 +470,15 @@ def build_analysis_config(aid: str, df: pd.DataFrame,
                 color_col=_mp_resolve("color_col"),
                 agg_func=AGG_FUNCS.get(g("agg_func", "Avg"), "mean"),
                 invert_colorscale=bool(g("invert_colorscale", False)),
-                map_style=g("map_style", "carto-positron"),
+                map_style=g("map_style", "OpenStreetMap (Light)"),
                 marker_opacity=float(g("marker_opacity", 0.82)),
+                # Density by default: sampling must be an explicit choice,
+                # never a silent cap that hides locations from the analysis.
+                render_mode=g("render_mode", "Density (all points)"),
                 show_borders=bool(g("show_borders",
                                     g("choropleth_show_borders", True))),
             )
+            _apply_hover_extras(kwargs)
     elif aid == "time_series":
         x = _single_choice_value(g("x", NONE), NONE)
         y = _single_choice_value(g("y", num[0] if num else NONE), num[0] if num else NONE)

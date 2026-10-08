@@ -19,6 +19,18 @@ Design notes (why this file looks the way it does):
     instead of tearing down and reloading the whole document. This is
     what removes the "browser rerun" stutter -- ``Plotly.newPlot()``
     only runs once, on first render.
+  * The shell is loaded from a ``file://`` URL (see ``_shell_file_path`` for
+    why it cannot be a ``data:`` URL), which makes Qt WebEngine classify the
+    chart as *local content*. Its ``LocalContentCanAccessRemoteUrls`` setting
+    defaults to **False** -- a local page may not fetch remote resources -- and
+    every Plotly map basemap is exactly that: Plotly.js hands
+    ``layout.map.style`` to MapLibre, which fetches a style JSON over the
+    network (``https://basemaps.cartocdn.com/gl/positron-gl-style/style.json``
+    for ``carto-positron``, and so on). With the default the fetch fails
+    (``TypeError: Failed to fetch``), MapLibre raises "Map error", and the
+    chart renders as an EMPTY plot area -- axes and colour bar present, no
+    basemap and no markers. ``enable_remote_content_access()`` lifts that
+    restriction; every page that renders a figure applies it.
   * Falls back to a static PNG label if QWebEngine isn't available in
     the runtime environment (e.g. some headless/CI Linux builds).
 """
@@ -85,6 +97,28 @@ def _plotlyjs_source() -> str:
 _SHELL_FILE_PATH: Optional[Path] = None
 
 
+def plotlyjs_source() -> str:
+    """The Plotly.js bundle as a string, read from disk once per process.
+
+    Public accessor for the dashboard canvas, which serves the same bundle to
+    the report preview as a separate file rather than re-embedding it. Public
+    because the loader below is a module-level cache: calling this a second
+    time costs nothing and never re-reads the 4.5 MB file.
+    """
+    return _plotlyjs_source()
+
+
+def bundled_font_css() -> str:
+    """Public accessor for the bundled-font ``@font-face`` rules.
+
+    The report preview renders in Chromium, which cannot see fonts registered
+    with Qt, so the families the app ships have to be offered to the page
+    explicitly -- otherwise a chosen font silently substitutes and the preview
+    lies about what the exported file will look like.
+    """
+    return _font_face_css()
+
+
 def _font_face_css() -> str:
     """CSS @font-face rules for the bundled fonts, for the chart shell.
 
@@ -98,6 +132,61 @@ def _font_face_css() -> str:
     except Exception as exc:
         log.debug("bundled font CSS unavailable: %s", exc)
         return ""
+
+
+def enable_remote_content_access(page) -> bool:
+    """Let a locally-loaded chart page fetch the resources a figure needs.
+
+    Maps are the reason this exists. Plotly.js renders a map by handing
+    ``layout.map.style`` to MapLibre, which fetches a basemap style JSON and a
+    stream of tiles over HTTPS. The chart shell is loaded from a ``file://``
+    URL, so Qt WebEngine treats the document as *local content* and -- by
+    default -- forbids it from reaching the network at all. The fetch is
+    rejected before it leaves the renderer (``TypeError: Failed to fetch``),
+    MapLibre raises "Map error", and the figure comes out as an empty plot
+    area: the axes and colour bar are there, the basemap and every marker are
+    not. Nothing in the figure spec is wrong, which is why this looked like a
+    backend bug.
+
+    ``LocalContentCanAccessRemoteUrls`` is the switch. It is also what makes
+    ``LocalContentCanAccessFileUrls`` matter here: the shell's ``@font-face``
+    rules point at ``file://`` URLs under ``app_assets/fonts``, so the bundled
+    fonts are loaded by exactly the same local-to-local hop. Both are enabled
+    together rather than leaving the font half to chance.
+
+    ``LocalContentCanAccessDataUrls`` is left alone: the shell inlines the
+    ~4.5 MB Plotly.js bundle as a literal ``<script>`` body, which needs no
+    data-URL permission.
+
+    Safe to call on any page and more than once. Returns False (without
+    raising) when the page or the Qt version does not offer these attributes,
+    so a caller never needs to guard it -- the worst case is the old,
+    map-less behaviour rather than a crash.
+    """
+    if page is None:
+        return False
+    try:
+        from PySide6.QtWebEngineCore import QWebEngineSettings
+        attrs = QWebEngineSettings.WebAttribute
+    except Exception as exc:
+        log.debug("QWebEngine settings unavailable; remote content left "
+                  "at its default (maps will not load)", exc_info=True)
+        return False
+
+    applied = False
+    for name in ('LocalContentCanAccessRemoteUrls',
+                 'LocalContentCanAccessFileUrls'):
+        try:
+            attr = getattr(attrs, name)
+        except AttributeError:
+            # Older/newer Qt: leave that one at its default.
+            continue
+        try:
+            page.settings().setAttribute(attr, True)
+            applied = True
+        except Exception as exc:
+            log.debug("could not enable %s", name, exc_info=True)
+    return applied
 
 
 def _shell_file_path() -> Path:
@@ -172,15 +261,71 @@ _SHELL_TEMPLATE = """
   var chartDiv = document.getElementById('chart');
   var plotted = false;
   var pendingSpec = null;
+  var lastMapStyle = null;
+
+  /* The basemap style currently described by a figure spec, or null when the
+     figure is not a map. Reads BOTH subplot ids because the runner may emit
+     `map` (scattermap) or `mapbox` (scattermapbox) depending on the plotly
+     version's express path. */
+  function mapStyleOf(spec) {{
+      var lay = spec && spec.layout;
+      var sub = lay && (lay.map || lay.mapbox);
+      return (sub && typeof sub.style === 'string') ? sub.style : null;
+  }}
+
+  /* A MapLibre canvas whose backing store no longer matches its CSS size
+     (clientWidth x devicePixelRatio) is stretched by the compositor, which
+     is exactly what "the map is blurry" looks like: the pixels are there,
+     they are just being upscaled. MapLibre only re-measures on a window
+     resize, and Qt/plotly resizes happen without one, so nudge it -- but
+     only when a mismatch is actually detected, so the common case costs
+     nothing and no resize storm can start. */
+  function lyFixMapCanvases() {{
+      try {{
+          var dpr = window.devicePixelRatio || 1;
+          var cs = document.querySelectorAll(
+              'canvas.maplibregl-canvas, canvas.mapboxgl-canvas');
+          for (var i = 0; i < cs.length; i++) {{
+              var c = cs[i];
+              var w = c.clientWidth, h = c.clientHeight;
+              if (!w || !h) continue;
+              if (Math.abs(c.width - Math.round(w * dpr)) > 2 ||
+                  Math.abs(c.height - Math.round(h * dpr)) > 2) {{
+                  window.dispatchEvent(new Event('resize'));
+                  return true;
+              }}
+          }}
+      }} catch (e) {{ /* no map on this figure: nothing to fix */ }}
+      return false;
+  }}
+  window.lyFixMapCanvases = lyFixMapCanvases;
 
   function render(specJson) {{
       var spec = JSON.parse(specJson);
       var config = {{displayModeBar: true, responsive: true, scrollZoom: true}};
-      if (!plotted) {{
-          Plotly.newPlot(chartDiv, spec.data, spec.layout, config);
+      var style = mapStyleOf(spec);
+      /* A style CHANGE must go through Plotly.newPlot, not react: plotly.js
+         keeps the MapLibre instance across react() and swaps the style on it,
+         which aborts with "Mapbox error" when layout.map.layers is present
+         (setting a paint property on a layer the NEW style does not have yet)
+         -- the update chain dies and the basemap never changes. newPlot
+         tears the map down and builds it with the new style, which always
+         works. See plotly/plotly.js#5505. */
+      var styleChanged = plotted && style !== null && style !== lastMapStyle;
+      var p;
+      if (!plotted || styleChanged) {{
+          p = Plotly.newPlot(chartDiv, spec.data, spec.layout, config);
           plotted = true;
       }} else {{
-          Plotly.react(chartDiv, spec.data, spec.layout, config);
+          p = Plotly.react(chartDiv, spec.data, spec.layout, config);
+      }}
+      lastMapStyle = style;
+      /* After the (promise-returning) plot settles, make sure any map canvas
+         is at device resolution rather than a stretched 1x buffer. */
+      try {{
+          Promise.resolve(p).then(function () {{ setTimeout(lyFixMapCanvases, 0); }});
+      }} catch (e) {{
+          setTimeout(lyFixMapCanvases, 120);
       }}
   }}
 
@@ -281,6 +426,11 @@ class PlotlyWebView(QWidget):
 
             self._web_view = QWebEngineView()
             self._web_view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+            # Before any load: the basemap styles a map figure needs are remote,
+            # and this document is local (file://). See
+            # enable_remote_content_access() -- without this every map renders
+            # as an empty plot area.
+            enable_remote_content_access(self._web_view.page())
             self._layout.addWidget(self._web_view)
             self._use_web_engine = True
 
@@ -390,7 +540,14 @@ class PlotlyWebView(QWidget):
         self._schedule_legend_refit()
         try:
             self._web_view.page().runJavaScript(
-                "if(window.Plotly){Plotly.Plots.resize(document.getElementById('chart'))}"
+                # Re-fit, then make sure any MapLibre canvas is at device
+                # resolution: plotly re-lays-out the container, but MapLibre
+                # only re-measures on a window resize -- without the nudge the
+                # canvas keeps its old backing store and the map stays soft
+                # after every Qt-side resize.
+                "if(window.Plotly){Plotly.Plots.resize("
+                "document.getElementById('chart'));}"
+                "if(window.lyFixMapCanvases){window.lyFixMapCanvases();}"
             )
         except Exception as exc:  # pragma: no cover — JS runtime
             log.debug("Plotly relayout failed: %s", exc)
