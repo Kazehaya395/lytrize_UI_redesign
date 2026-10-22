@@ -2148,6 +2148,7 @@ class DashboardPage(QWidget):
         slicers[idx] = updated
         self._write_slicers(slicers)
         self._refresh_slicer_count()
+        self._refresh_charts()
         # The loaded report owns the live filter engine. Its change listener
         # updates only affected ECharts instances and KPI values in-place; a
         # document rebuild here used to re-filter every recipe, serialize the

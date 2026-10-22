@@ -200,7 +200,7 @@ class HomePage(QWidget):
     # -- Signal connections -------------------------------------------------
 
     def _connect_signals(self) -> None:
-        self.btn_new.clicked.connect(lambda: self.navigate_requested.emit("upload"))
+        self.btn_new.clicked.connect(lambda: [self.bridge.clear_session(), self.navigate_requested.emit("upload")])
         self.session_list.itemDoubleClicked.connect(self._on_session_open)
         self.session_list.itemSelectionChanged.connect(self._on_selection_changed)
         self.btn_rename.clicked.connect(self._on_session_rename)

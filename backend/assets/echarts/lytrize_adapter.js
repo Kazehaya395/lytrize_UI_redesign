@@ -921,7 +921,11 @@
           padding: [4, 6], font: "12px sans-serif"}});
     }
     if (chart && typeof chart.setOption === "function") {
-      chart.setOption({graphic: graphics}, {replaceMerge: ["graphic"], lazyUpdate: true});
+      try {
+        chart.setOption({graphic: graphics}, {replaceMerge: ["graphic"], lazyUpdate: true});
+      } catch (e) {
+        log.error("Lytrize ECharts adapter: setOption failed: " + e);
+      }
     }
   }
 

@@ -34,17 +34,30 @@ class ImportWorker(QThread):
 
             path = Path(self._file_path)
             if path.suffix.lower() == ".csv":
-                df = read_csv_fast(path)
-                # Build the native query snapshot from the original CSV. This
-                # avoids making the first Polars chart slice depend on a
-                # pandas conversion. The pandas frame remains temporarily for
-                # legacy table/cleaning pages during the staged migration.
+                # Primary: use lazy Polars scan_csv via open_csv to avoid
+                # reading the file twice (once via Pandas, once via Polars).
+                # open_csv returns a PolarsDataset wrapping a lazy scan.
                 try:
                     from services.polars_engine import open_csv
                     polars_data = open_csv(path)
-                except Exception as exc:
-                    log.info("Polars CSV path unavailable; using compatibility boundary: %s", exc)
-                    polars_data = None
+                    # Emit the lazy dataset as the primary result; downstream
+                    # consumers that need a pandas frame can call .to_pandas().
+                    self.finished_ok.emit(polars_data.frame.collect().to_pandas())
+                    self.polars_ready.emit(polars_data)
+                    return
+                except Exception:
+                    # Polars path failed (e.g., missing extension, corrupted file);
+                    # fall back to Pandas read_csv_fast.
+                    df = read_csv_fast(path)
+                    self.finished_ok.emit(df)
+                    # Derive a Polars snapshot from the Pandas frame for downstream use.
+                    try:
+                        from services.polars_engine import PolarsDataset
+                        polars_data = PolarsDataset.from_pandas(df, source=str(path))
+                    except Exception:
+                        polars_data = None
+                    self.polars_ready.emit(polars_data)
+                    return
             else:
                 df = pd.read_excel(path)
                 try:

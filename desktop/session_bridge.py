@@ -101,6 +101,14 @@ class SessionBridge(QObject):
     def pop(self, key: str, default: Any = None) -> Any:
         return self._manager.pop(key, default)
 
+    def clear_session(self) -> None:
+        """Reset all session state to start a fresh analysis session.
+
+        Clears the DataFrame, charts, KPIs, slicers, tile geometry, and
+        file metadata so that a new upload/analysis starts from a clean slate.
+        """
+        self._manager._state.clear()
+
     @property
     def df(self) -> Optional[pd.DataFrame]:
         return self._manager.df

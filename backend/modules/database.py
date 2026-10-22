@@ -468,7 +468,7 @@ def init_db() -> None:
             c.execute("SELECT COUNT(*) FROM users WHERE username=?", (_GUEST_USERNAME,))
             if c.fetchone()[0] == 0:
                 c.execute(
-                    "INSERT INTO users "
+                    "INSERT OR IGNORE INTO users "
                     "(username, email, password_hash, is_guest, uuid) "
                     "VALUES (?,?,?,?,?)",
                     (_GUEST_USERNAME, _GUEST_EMAIL, _hash(uuid.uuid4().hex), 1, uuid.uuid4().hex),
@@ -625,6 +625,19 @@ def get_or_create_guest_user() -> dict:
                 return {"id": row[0], "username": row[1], "is_guest": True}
 
         c    = conn.cursor()
+        # Resolve by email if no existing guest row found
+        c.execute(_ph("SELECT id, username FROM users WHERE email=?"), (_GUEST_EMAIL,))
+        row = c.fetchone()
+        if row:
+            # Update the username to the current OS username if it still says __lytrize_guest__
+            if row[1] == _GUEST_USERNAME:
+                try:
+                    c.execute(_ph("UPDATE users SET username=? WHERE id=?"), (_os_username(), row[0]))
+                    conn.commit()
+                except Exception:
+                    pass
+            return {"id": row[0], "username": row[1], "is_guest": True}
+
         cols = {"username": _os_username(), "email": _GUEST_EMAIL,
                 "password_hash": _hash(uuid.uuid4().hex)}
         if _column_exists(conn, "users", "is_guest"):
