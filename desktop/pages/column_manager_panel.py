@@ -253,6 +253,12 @@ class ColumnManagerPanel(QWidget):
         btn_row.addWidget(self.btn_apply_remove)
         layout.addLayout(btn_row)
 
+    def _update_remove_btn_state(self) -> None:
+        """Enable Remove Selected only when columns are selected AND confirmed."""
+        has_selection = self.list_remove.selectedItems()
+        is_checked = self.chk_confirm_remove.isChecked()
+        self.btn_apply_remove.setEnabled(bool(has_selection and is_checked))
+
     def _build_rename_tab(self) -> None:
         layout = QVBoxLayout(self.tab_rename)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -297,7 +303,8 @@ class ColumnManagerPanel(QWidget):
         self.btn_preview.clicked.connect(self._on_preview_add)
         self.btn_apply_add.clicked.connect(self._on_apply_add)
         self.btn_apply_remove.clicked.connect(self._on_apply_remove)
-        self.btn_apply_rename.clicked.connect(self._on_apply_rename)
+        self.list_remove.itemSelectionChanged.connect(self._update_remove_btn_state)
+        self.chk_confirm_remove.stateChanged.connect(self._update_remove_btn_state)
 
     # -- Public API ---------------------------------------------------------
 
