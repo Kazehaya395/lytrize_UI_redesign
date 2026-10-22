@@ -95,14 +95,12 @@ EDITOR_CSS = """
   content: ''; position: absolute; inset: -8px; }
 .ly-h-corner::after { inset: -10px; }
 
-/* The heading needs clearance from the edit chrome. The grip (top-left) and the
-   toolbar (top-right) are absolutely positioned in the card's corners and are
-   hidden in Preview, so the space is only reserved while editing -- otherwise
-   Preview would show a heading with a mysterious empty band above it. */
+/* Chart, KPI and slicer content needs clearance from the edit chrome. The grip
+   and toolbar are absolutely positioned in the card corners. The dashboard
+   title card has no toolbar and its title should stay centred in its own box. */
 .ly-editing .chart-card h2,
 .ly-editing .kpi-card .kpi-value,
-.ly-editing .slicer-card .slicer-title,
-.ly-editing .title-card h1 { margin-top: 26px; }
+.ly-editing .slicer-card .slicer-title { margin-top: 26px; }
 /* The slicer's control list needs the same bottom clearance the KPI label
    does: the resize handles are drawn over the card's lower edge, and the last
    value in a scrollable list is exactly what sits there. */
@@ -124,9 +122,9 @@ EDITOR_CSS = """
   font-size: 12px; line-height: 1; padding: 0; }
 .ly-btn:hover { filter: brightness(1.15); }
 
-/* A card being dragged must not also pan the Plotly chart underneath it. */
+/* A card being dragged must not also interact with the ECharts canvas. */
 .ly-dragging { user-select: none; }
-.ly-dragging .plotly, .ly-dragging .modebar { pointer-events: none !important; }
+.ly-dragging .chart { pointer-events: none !important; }
 
 /* The notes box becomes editable in place while editing. */
 .ly-editing .notes { cursor: text; }
@@ -157,6 +155,9 @@ EDITOR_JS = r"""
   /* Mirrors canvas_geometry.MIN_W / MIN_H. A card below this stops being
    * grabbable: the grip and the four handles no longer fit inside it. */
   var MIN_W = 0.12, MIN_H = 120;
+  /* Mirrors canvas_geometry.TITLE_MIN_H: the heading band is sized by its
+   * own text, so the title card alone may be resized below the chart floor. */
+  var TITLE_MIN_H = 24;
   var bridge = null;
 
   function uidOf(el) {
@@ -179,6 +180,19 @@ EDITOR_JS = r"""
   }
   function canvasOf(el) {
     return el.closest('.ly-canvas, .grid');
+  }
+
+  function syncCanvasHeight(host) {
+    if (!FREE || !host) return;
+    var base = Number(host.dataset.minHeight || 0);
+    if (!Number.isFinite(base) || base <= 0) base = host.offsetHeight;
+    var bottom = 0;
+    Array.prototype.forEach.call(host.querySelectorAll(
+      '.chart-card[data-uid], .kpi-card[data-kpi], .title-card[data-uid], ' +
+      '.slicer-card[data-slicer]'), function (el) {
+        bottom = Math.max(bottom, el.offsetTop + el.offsetHeight);
+      });
+    host.style.height = Math.ceil(Math.max(base, bottom + 32)) + 'px';
   }
 
   /* ---- free-form geometry -------------------------------------------
@@ -218,12 +232,13 @@ EDITOR_JS = r"""
    * somewhere the page would then refuse to store. Doing it on both sides is
    * deliberate: this one keeps the drag honest while it is happening, and the
    * Python one is still the authority for what gets persisted. */
-  function clampGeom(g) {
+  function clampGeom(g, el) {
     var w = Math.max(MIN_W, Math.min(1, g.w));
     g.w = w;
     g.x = Math.max(0, Math.min(g.x, 1 - w));
     g.y = Math.max(0, g.y);
-    g.h = Math.max(MIN_H, g.h);
+    var minH = (el && uidOf(el) === '__title__') ? TITLE_MIN_H : MIN_H;
+    g.h = Math.max(minH, g.h);
     return g;
   }
 
@@ -360,25 +375,18 @@ EDITOR_JS = r"""
     });
     if (el) { el.classList.add('ly-selected'); if (el.focus) el.focus(); }
   }
-  /* A resized card still renders its plot at the old pixel size until Plotly is
-   * told to re-fit, so every geometry change ends with this. Plotly.Plots.resize
-   * reads the container, which on the free canvas has just changed in BOTH
-   * axes -- so this is what makes a shortened card show a shorter chart rather
-   * than its original plot spilling out past the bottom edge. */
+  /* Refit ECharts after a dashboard card changes size. */
   function refit(el) {
-    var plot = el.querySelector('.js-plotly-plot');
-    if (!plot) return;
+    var root = el.querySelector('.chart');
+    if (!root || !window.echarts) return;
     try {
-      var wrap = el.querySelector('.chart-wrap');
-      var w = wrap ? wrap.offsetWidth : 0, h = wrap ? wrap.offsetHeight : 0;
-      Plotly.relayout(plot, {
-        width: w > 0 ? w : undefined,
-        height: h > 0 ? h : undefined,
-        autosize: true
-      });
-    } catch (e) {
-      try { Plotly.Plots.resize(plot); } catch (e2) {}
-    }
+      var chart = window.echarts.getInstanceByDom(root);
+      /* The chart's own ResizeObserver rebuilds its size-sensitive option once
+       * per animation frame. Rebuilding here as well caused two full option
+       * builds per card resize and left the last dimensions dependent on timer
+       * ordering. The editor only asks ECharts to repaint its current canvas. */
+      if (chart) chart.resize();
+    } catch (e) {}
   }
   /* ---- gestures ------------------------------------------------------- */
   var drag = null;
@@ -427,7 +435,7 @@ EDITOR_JS = r"""
         if (drag.edge !== 'bottom') g.w = drag.start.w + dx / c.w;
         if (drag.edge !== 'right')  g.h = drag.start.h + dy;
       }
-      clampGeom(g);
+      clampGeom(g, el);
     }
     /*__GRID_BEGIN__*/
     else {
@@ -472,12 +480,8 @@ EDITOR_JS = r"""
     var g = d.pending, b = d.start;
     writeGeom(d.el, g);
     refit(d.el);
-    /* The canvas was grown live to let a card be dropped below its old bottom
-     * (see paintGhost). Python re-renders with the correct height from the
-     * stored geometry, so the temporary growth must be handed back or the board
-     * keeps a canvas taller than its contents until something else redraws. */
     var host = canvasOf(d.el);
-    if (host && FREE && host.style.height) host.style.height = '';
+    syncCanvasHeight(host);
     if (!bridge) return;
     var same = Math.abs(g.x - b.x) < 0.0005 && Math.abs(g.y - b.y) < 0.5 &&
                Math.abs(g.w - b.w) < 0.0005 && Math.abs(g.h - b.h) < 0.5;
@@ -508,7 +512,7 @@ EDITOR_JS = r"""
     if (!hit) return;
     ev.preventDefault();
     if (FREE) {
-      clampGeom(g);
+      clampGeom(g, el);
     }
     /*__GRID_BEGIN__*/
     else {
@@ -521,6 +525,7 @@ EDITOR_JS = r"""
     /*__GRID_END__*/
     writeGeom(el, g);
     refit(el);
+    syncCanvasHeight(canvasOf(el));
     if (bridge) bridge.geometryChanged(uidOf(el), JSON.stringify(g));
   }
   /* ---- chrome --------------------------------------------------------- */
@@ -631,12 +636,129 @@ EDITOR_JS = r"""
         if (t.closest && t.closest('.ly-grip, .ly-handle, .ly-bar, .ly-sel, ' +
                                     'button, input, select, textarea, label, ' +
                                     '[contenteditable], ' +
-                                    '.notes, .slicer-body, .js-plotly-plot, ' +
-                                    '.modebar')) return;
+                                    '.notes, .slicer-body, .chart')) return;
         begin('move')(ev);
       });
     }
   }
+
+  /* KPI edits are content-only changes. Update their live DOM cards in place
+   * instead of serializing the whole dataset and reloading every ECharts view. */
+  function syncKpis(kpis, geometry) {
+    var host = document.getElementById('board');
+    if (!host) return;
+    kpis = Array.isArray(kpis) ? kpis : [];
+    geometry = geometry || {};
+    var keep = Object.create(null);
+    kpis.forEach(function (kpi, index) {
+      var key = String(index), card = host.querySelector(
+        '.kpi-card[data-kpi="' + key + '"]'), geom = geometry[key] || {};
+      keep[key] = true;
+      if (!card) {
+        card = document.createElement('section');
+        card.className = 'tile kpi-card';
+        card.setAttribute('data-kpi', key);
+        var content = document.createElement('div');
+        content.className = 'kpi';
+        content.setAttribute('data-ly-kpi', key);
+        var label = document.createElement('div');
+        label.className = 'kpi-label';
+        var value = document.createElement('strong');
+        value.className = 'kpi-value';
+        var delta = document.createElement('div');
+        delta.className = 'kpi-delta';
+        delta.setAttribute('data-ly-kpi-delta', key);
+        content.appendChild(label); content.appendChild(value);
+        content.appendChild(delta); card.appendChild(content);
+        host.appendChild(card);
+        decorate(card);
+      }
+      card.style.left = (Number(geom.x || 0) * 100) + '%';
+      card.style.top = Number(geom.y || 0) + 'px';
+      card.style.width = (Number(geom.w || 0.3) * 100) + '%';
+      card.style.height = Number(geom.h || 120) + 'px';
+      var labelNode = card.querySelector('.kpi-label');
+      var valueNode = card.querySelector('.kpi-value');
+      if (labelNode) labelNode.textContent = String(kpi.label || kpi.name || 'KPI');
+      if (valueNode) valueNode.textContent = String(kpi.prefix || '') +
+        String(kpi.value == null ? '--' : kpi.value) + String(kpi.suffix || '');
+    });
+    Array.prototype.forEach.call(host.querySelectorAll('.kpi-card[data-kpi]'),
+      function (card) {
+        if (!keep[String(card.getAttribute('data-kpi'))]) card.remove();
+      });
+    syncCanvasHeight(host);
+  }
+  window.__lytrizeSyncKpis = syncKpis;
+
+  /* Slicer cards are also content-only board changes. Rebuilding the report
+   * for add/edit/remove used to serialize the full data payload and reload all
+   * charts. Create the controls in place; the live-filter worker receives the
+   * new definitions and supplies list options without blocking this document.
+   * Python keeps the full regeneration fallback for widget families that are
+   * not represented by the live select controls yet. */
+  function syncSlicers(slicers, geometry) {
+    var host = document.getElementById('board');
+    if (!host) return;
+    slicers = Array.isArray(slicers) ? slicers : [];
+    geometry = geometry || {};
+    var keep = Object.create(null);
+    slicers.forEach(function (slicer, index) {
+      slicer = slicer || {};
+      var key = String(index), uid = String(slicer.uid || ('slicer-' + key));
+      var geom = geometry[key] || {}, card = host.querySelector(
+        '.slicer-card[data-slicer="' + key + '"]');
+      keep[key] = true;
+      if (!card) {
+        card = document.createElement('section');
+        card.className = 'tile slicer-card';
+        card.setAttribute('data-slicer', key);
+        var content = document.createElement('div');
+        content.className = 'slicer';
+        var title = document.createElement('b');
+        title.className = 'slicer-title';
+        var body = document.createElement('div');
+        body.className = 'slicer-body';
+        var select = document.createElement('select');
+        select.className = 'slicer-select';
+        select.setAttribute('data-ly-role', 'values');
+        body.appendChild(select); content.appendChild(title);
+        content.appendChild(body); card.appendChild(content); host.appendChild(card);
+        decorate(card);
+      }
+      card.style.left = (Number(geom.x || 0) * 100) + '%';
+      card.style.top = Number(geom.y || 0) + 'px';
+      card.style.width = (Number(geom.w || 0.24) * 100) + '%';
+      card.style.height = Number(geom.h || 180) + 'px';
+      var titleNode = card.querySelector('.slicer-title');
+      if (titleNode) titleNode.textContent = String(slicer.label || slicer.column || 'Filter');
+      var selectNode = card.querySelector('select.slicer-select');
+      if (selectNode) {
+        var widget = String(slicer.widget || 'list').toLowerCase();
+        selectNode.multiple = widget === 'list';
+        if (selectNode.multiple) selectNode.setAttribute('size', '5');
+        else selectNode.removeAttribute('size');
+        selectNode.setAttribute('data-ly-slicer', key);
+        selectNode.setAttribute('data-ly-uid', uid);
+        var spec = slicer.spec && typeof slicer.spec === 'object' ? slicer.spec : {};
+        var selected = Array.isArray(spec.values) ? spec.values : [];
+        selectNode.setAttribute('data-ly-selected', JSON.stringify(selected));
+        while (selectNode.options.length) selectNode.remove(0);
+        var all = document.createElement('option');
+        all.value = ''; all.textContent = 'All'; all.selected = selected.length === 0;
+        selectNode.appendChild(all);
+      }
+    });
+    Array.prototype.forEach.call(host.querySelectorAll('.slicer-card[data-slicer]'),
+      function (card) {
+        if (!keep[String(card.getAttribute('data-slicer'))]) card.remove();
+      });
+    wireSlicers();
+    syncCanvasHeight(host);
+  }
+  window.__lytrizeSyncSlicers = syncSlicers;
+  window.__lytrizeDecorateCard = decorate;
+  window.__lytrizeSyncCanvasHeight = syncCanvasHeight;
 
   /* Notes are edited in place, which is what the Qt card's QTextEdit did, and
    * committed on BLUR rather than per keystroke -- otherwise every character
@@ -705,9 +827,14 @@ EDITOR_JS = r"""
               if (c.checked) {
                 (payload[role] = payload[role] || []).push(c.value);
               }
-            } else if (c.tagName === 'SELECT' && c.multiple) {
-              payload[role] = Array.prototype.map.call(
-                c.selectedOptions || [], function (o) { return o.value; });
+            } else if (c.tagName === 'SELECT') {
+              // Single-select combo (All + one value). The empty All option
+              // sends an empty list, which apply_selection reads as "no
+              // constraint" -- the same as Clear. Multi-row listboxes are
+              // gone; the list widget is the multi-pick affordance.
+              var picked = [];
+              if (c.value !== '' && c.value !== undefined) picked = [c.value];
+              payload[role] = picked;
             } else {
               payload[role] = c.value;
             }
@@ -725,6 +852,34 @@ EDITOR_JS = r"""
         } else {
           send();
         }
+      });
+    });
+    /* The in-card Clear <button> (type="button") fires a ``click``, which
+     * the loop above never binds (it binds change/input only) -- so without
+     * this the button is inert live, exactly as it was in the saved file.
+     * Reset the visible controls and send empty constraints for every role;
+     * apply_selection reads empty values/bounds/text as "no constraint". */
+    Array.prototype.forEach.call(
+      document.querySelectorAll('[data-ly-role="clear"]'), function (btn) {
+      if (btn.dataset.lyWired) return;
+      btn.dataset.lyWired = '1';
+      btn.addEventListener('click', function () {
+        if (!bridge || !bridge.slicerChanged) return;
+        var card = btn.closest('.slicer-card');
+        if (card) {
+          Array.prototype.forEach.call(
+            card.querySelectorAll('input[type="checkbox"]'),
+            function (b) { b.checked = false; });
+          var sel = card.querySelector('select.slicer-select');
+          if (sel && sel.selectedIndex >= 0) sel.selectedIndex = 0;
+          var srch = card.querySelector('input.slicer-search');
+          if (srch) srch.value = '';
+        }
+        try {
+          if (window.__lytrizeDrawAll) window.__lytrizeDrawAll();
+          bridge.slicerChanged(String(btn.dataset.lySlicer),
+            JSON.stringify({ values: [], value: '', low: null, high: null }));
+        } catch (e) {}
       });
     });
   }

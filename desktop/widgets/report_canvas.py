@@ -31,8 +31,9 @@ geometryChanged  validate, clamp, persist,   JS PROPOSED a placement; Python
                  re-render once              is the authority on what is legal
 notesChanged     store note, re-render        text committed on blur
 actionRequested  run the page's own handler   per-card buttons live in the page
-slicerChanged    store the selection,         a slicer control was used; only
-                 re-render affected charts    the charts it plots are re-run
+slicerChanged    store the selection,         a slicer control was used; a
+                 whole-report slicer re-runs every
+                 all charts, a per-chart one only its target
 editingReady     mark the bridge usable       JS finished wiring up
 ===============  ==========================  ================================
 
@@ -48,10 +49,9 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QObject, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, QUrl, Signal, Slot
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
-from desktop.widgets.plotly_web_view import enable_remote_content_access
 
 log = logging.getLogger(__name__)
 
@@ -61,43 +61,30 @@ log = logging.getLogger(__name__)
 _REPORT_DIR = Path(tempfile.gettempdir()) / "lytrize_report_canvas"
 
 
-def _write_shared_plotly() -> Optional[Path]:
-    """Write plotly.js next to the report, once per process.
+class _ReportWriteSignals(QObject):
+    written = Signal(str, str, str)  # html digest, local path, error
 
-    The report is generated with ``inline_plotly=False`` so it references this
-    file by name. Two consequences make it necessary rather than merely nice:
-    re-embedding ~4.5 MB of JavaScript on every settings tweak would make the
-    live canvas unusable, and ``QWebEnginePage.setHtml()`` truncates above
-    roughly 2 MB (already hit in this codebase -- see PlotlyWebView's shell).
-    """
-    try:
-        from desktop.widgets.plotly_web_view import plotlyjs_source
-        src = plotlyjs_source()
-    except Exception:
-        log.warning("plotly.js unavailable; report charts will not render",
-                    exc_info=True)
-        return None
-    if not src:
-        return None
-    _REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    digest = hashlib.sha1(src.encode("utf-8")).hexdigest()[:10]
-    path = _REPORT_DIR / f"lytrize_plotly_{digest}.js"
-    if not path.exists():
-        path.write_text(src, encoding="utf-8")
-    # The report asks for a fixed name, so link it to the digest-named file
-    # once rather than rewriting the bundle under the stable name each run.
-    stable = _REPORT_DIR / "lytrize_plotly.js"
-    if not stable.exists() or stable.resolve() != path.resolve():
+
+class _ReportWriteTask(QRunnable):
+    """Write a rendered report away from the Qt UI thread."""
+
+    def __init__(self, html: str, signals: _ReportWriteSignals) -> None:
+        super().__init__()
+        self.html = html
+        self.signals = signals
+
+    def run(self) -> None:
         try:
-            stable.unlink()
-        except OSError:
-            pass
-        try:
-            stable.symlink_to(path.name)
-        except OSError:
-            # Windows without developer mode: fall back to a copy.
-            stable.write_text(src, encoding="utf-8")
-    return stable
+            _REPORT_DIR.mkdir(parents=True, exist_ok=True)
+            digest = hashlib.sha1(self.html.encode("utf-8")).hexdigest()[:12]
+            path = _REPORT_DIR / f"report_{digest}.html"
+            if not path.exists():
+                temporary = path.with_suffix(f".{id(self):x}.tmp")
+                temporary.write_text(self.html, encoding="utf-8")
+                temporary.replace(path)
+            self.signals.written.emit(self.html, str(path), "")
+        except OSError as exc:
+            self.signals.written.emit(self.html, "", str(exc))
 
 
 class _ReportBridge(QObject):
@@ -188,6 +175,8 @@ class ReportCanvas(QWidget):
         self._pending_edit_mode: Optional[bool] = None
         self._last_html: Optional[str] = None
         self._loading = False
+        self._write_signals = _ReportWriteSignals(self)
+        self._write_signals.written.connect(self._on_report_written)
 
         self._bridge = _ReportBridge(self)
         self._bridge.geometry_changed.connect(self.geometry_changed)
@@ -202,15 +191,17 @@ class ReportCanvas(QWidget):
         self._fallback: Optional[QLabel] = None
         try:
             from PySide6.QtWebChannel import QWebChannel
+            from PySide6.QtWebEngineCore import QWebEngineSettings
             from PySide6.QtWebEngineWidgets import QWebEngineView
 
             self._view = QWebEngineView(self)
             self._view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-            # A dashboard can carry a map chart. The report is a local (file://)
-            # document and its basemap styles are remote, which Qt WebEngine
-            # blocks by default -- the map then renders blank in the preview and
-            # in the PNG export, since both come through this view.
-            enable_remote_content_access(self._view.page())
+            self._view.settings().setAttribute(
+                QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls,
+                False,
+            )
+            # Dashboard charts and map boundaries are bundled local assets;
+            # the report canvas does not need network access.
             self._channel = QWebChannel(self._view.page())
             self._channel.registerObject("bridge", self._bridge)
             self._view.page().setWebChannel(self._channel)
@@ -234,6 +225,11 @@ class ReportCanvas(QWidget):
         """False when QtWebEngine is missing; the caller falls back."""
         return self._view is not None
 
+    def is_ready(self) -> bool:
+        """True after the current report document has installed its scripts."""
+        return (self._view is not None and self._bridge._ready
+                and not self._loading)
+
     def run_js(self, script: str) -> None:
         """Evaluate JS in the report document, if there is one.
 
@@ -254,11 +250,29 @@ class ReportCanvas(QWidget):
         if html == self._last_html:
             return
         self._last_html = html
-        path = self._write(html)
-        if path is None:
-            return
+        try:
+            from PySide6.QtWebEngineCore import QWebEngineSettings
+            online_imagery = 'name="lytrize-online-imagery" content="true"' in html
+            self._view.settings().setAttribute(
+                QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls,
+                online_imagery,
+            )
+        except Exception:
+            log.debug("could not update online basemap permission", exc_info=True)
         self._loading = True
-        self._view.load(QUrl.fromLocalFile(str(path)))
+        QThreadPool.globalInstance().start(
+            _ReportWriteTask(html, self._write_signals))
+
+    def _on_report_written(self, html: str, path: str, error: str) -> None:
+        """Load only the most recent report after its file write completes."""
+        if html != self._last_html:
+            return
+        if not path:
+            self._loading = False
+            log.error("could not write report canvas file: %s", error)
+            return
+        if self._view is not None:
+            self._view.load(QUrl.fromLocalFile(path))
 
     def _write(self, html: str) -> Optional[Path]:
         """Write the report to a digest-named file and return its path.
@@ -268,16 +282,12 @@ class ReportCanvas(QWidget):
         URL -- reloading the same path is served from cache and would keep
         showing the previous report.
 
-        The shared plotly bundle is best-effort. If it cannot be written the
-        report still loads, with its charts missing -- a visible, diagnosable
-        failure -- rather than the canvas staying blank, which is neither.
         """
         try:
-            _write_shared_plotly()
-        except Exception:
-            log.warning("shared plotly.js not written for the canvas",
-                        exc_info=True)
-        _REPORT_DIR.mkdir(parents=True, exist_ok=True)
+            _REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            log.exception("could not create report canvas directory")
+            return None
         digest = hashlib.sha1(html.encode("utf-8")).hexdigest()[:12]
         path = _REPORT_DIR / f"report_{digest}.html"
         try:

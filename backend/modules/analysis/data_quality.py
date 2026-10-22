@@ -10,9 +10,9 @@ through ``SessionBridge.set_df()`` itself.
 """
 
 
-import plotly.express as px
 import pandas as pd
-from modules.charts import chart_layout, DANGER
+from services.polars_engine import PolarsDataset
+from services.polars_chart_service import build_data_quality_charts
 
 
 # ── Pure summary/detection helpers ──────────────────────────────────────
@@ -61,44 +61,6 @@ def delete_rows(df: pd.DataFrame, indices: list) -> pd.DataFrame:
     return df.drop(index=list(indices)).reset_index(drop=True)
 
 
-# ── Chart builders (pure) ───────────────────────────────────────────────
-
-def _chart_missing_bar(mc: pd.DataFrame):
-    fig = px.bar(
-        mc, x="Column", y="Missing %",
-        title="Missing % by Column",
-        color="Missing %",
-        color_continuous_scale=DANGER,
-        text_auto=".1f",
-    )
-    fig.update_layout(**chart_layout())
-    return fig
-
-
-def _chart_missing_heatmap(df: pd.DataFrame):
-    sample = df.sample(min(100, len(df)), random_state=42) if len(df) > 100 else df
-    fig = px.imshow(
-        sample.isnull().astype(int),
-        title="Missing Values Map",
-        color_continuous_scale=["rgba(0,0,0,0)", "#ef4444"],
-        aspect="auto",
-    )
-    fig.update_layout(**chart_layout())
-    return fig
-
-
-def _chart_dup_donut(total: int, dup_count: int):
-    fig = px.pie(
-        values=[max(total - dup_count, 0), dup_count],
-        names=["Unique", "Duplicate"],
-        title=f"Row Uniqueness — {dup_count:,} duplicates of {total:,}",
-        color_discrete_sequence=["#6163df", "#ef4444"],
-        hole=0.48,
-    )
-    fig.update_layout(**chart_layout())
-    return fig
-
-
 # ── Standard runner entry point (used by services/analysis_service.py) ──
 
 def run_data_quality(df: pd.DataFrame, **kwargs) -> list:
@@ -109,15 +71,7 @@ def run_data_quality(df: pd.DataFrame, **kwargs) -> list:
     deleting duplicates/rows) is handled by the standalone functions
     above, called directly from the Qt data-cleaning page.
     """
-    charts = []
-
-    miss_total = int(df.isnull().sum().sum())
-    if miss_total > 0:
-        mc = missing_summary(df)
-        charts.append(("Missing % by Column", _chart_missing_bar(mc)))
-        charts.append(("Missing Values Map", _chart_missing_heatmap(df)))
-
-    n_dups = duplicate_count(df, None)
-    charts.append(("Duplicate Rows Summary", _chart_dup_donut(len(df), n_dups)))
-
-    return charts
+    dataset = (df if isinstance(df, PolarsDataset)
+               else PolarsDataset.from_pandas(df, source="data-quality"))
+    return [(model["title"], model)
+            for model in build_data_quality_charts(dataset)]

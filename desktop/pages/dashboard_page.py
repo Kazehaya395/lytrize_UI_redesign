@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -36,11 +37,14 @@ from desktop.widgets.formatting_pane import (
 from desktop.widgets.report_canvas import ReportCanvas
 from desktop.widgets import tile_geometry
 from modules.canvas_geometry import TITLE_UID as _TITLE_UID
+from modules.canvas_geometry import SLICER_DEFAULT_W
 # Key stored alongside the tile geometry to record that the board was saved on
 # the FREE canvas, so the grid migration never re-reads a free arrangement as
 # legacy cells. Its value is a bare string; every geometry consumer filters by
 # isinstance(dict), so it is ignored everywhere it is not explicitly read here.
 _MODE_KEY = "__ly_mode__"
+_FREE_MODE = "free-v2"
+_FREE_MODES = {"free", _FREE_MODE}
 from desktop.workers import ExportWorker, ReportPreviewWorker
 from services.export_service import (
     build_export_report, build_export_charts, apply_preset, EXPORT_PRESETS,
@@ -76,6 +80,37 @@ MIN_TILE_SPAN = 1
 # copies of one 23-key dict is how they silently drifted apart before.
 _STYLE_DEFAULTS = dict(EXPORT_DEFAULTS)
 
+# Appearance-only controls with a DOM patch do not need to regenerate and
+# reload the report document. Layout and board-content changes still use the
+# background render pipeline.
+_LIVE_STYLE_KEYS = frozenset({
+    "ex_bg", "ex_card", "ex_kpi", "ex_accent", "ex_border", "ex_text",
+    "ex_not_bg", "ex_not_bd", "ex_radius", "ex_meta",
+    "ex_kpi_text_color", "ex_kpi_val_size", "ex_kpi_val_color",
+    "ex_kpi_label_size", "ex_kpi_label_upper",
+    "ex_slicer_bg", "ex_slicer_bd", "ex_slicer_text", "ex_slicer_accent",
+    "ex_slicer_label_size", "ex_slicer_label_color",
+    "ex_slicer_value_size", "ex_slicer_value_color",
+    "ex_title_font", "ex_title_style", "ex_title_size", "ex_title_color",
+    "ex_notes_font", "ex_notes_style", "ex_notes_size", "ex_notes_color",
+    "ex_chart_image", "ex_chart_image_opacity", "ex_chart_blend",
+    "ex_chart_image_fit", "ex_chart_image_position",
+    "ex_chart_image_overrides",
+    "ex_kpi_image", "ex_kpi_image_opacity", "ex_kpi_blend",
+    "ex_kpi_image_fit", "ex_kpi_image_position",
+    "ex_title_image", "ex_title_image_opacity", "ex_title_blend",
+    "ex_title_image_fit", "ex_title_image_position",
+})
+
+# Image data URIs can be several megabytes. Routine KPI or slicer DOM patches
+# must never resend them through QWebChannel; only an explicit image edit or
+# reset marks these keys as changed. Per-chart overrides are handled separately
+# so the full image map is never part of an ordinary style message.
+_LIVE_STYLE_IMAGE_KEYS = frozenset({
+    "ex_chart_image", "ex_kpi_image", "ex_title_image",
+    "ex_chart_image_overrides",
+})
+
 # The colour keys the dashboard's own picker and the preset gallery write.
 #
 # These are the EXPORT palette, and that is now the ONLY palette the dashboard
@@ -96,6 +131,7 @@ _OVERRIDABLE_COLORS = (
     "ex_not_bg", "ex_not_bd", "ex_title_color", "ex_notes_color",
     "ex_kpi_text_color", "ex_kpi_val_color",
     "ex_slicer_bg", "ex_slicer_bd", "ex_slicer_text", "ex_slicer_accent",
+    "ex_slicer_label_color", "ex_slicer_value_color",
 )
 
 # Style keys that a quick theme must NOT touch, because they are not colours:
@@ -107,8 +143,12 @@ _NON_COLOUR_STYLE_KEYS = (
     "ex_title_font", "ex_title_style", "ex_title_size",
     "ex_notes_font", "ex_notes_style", "ex_notes_size",
     "ex_bg_image", "ex_bg_image_opacity", "ex_bg_blend",
-    "ex_card_image", "ex_card_image_opacity", "ex_card_blend",
-    "ex_card_image_groups",
+    "ex_chart_image", "ex_chart_image_opacity", "ex_chart_blend",
+    "ex_chart_image_fit", "ex_chart_image_position",
+    "ex_kpi_image", "ex_kpi_image_opacity", "ex_kpi_blend",
+    "ex_kpi_image_fit", "ex_kpi_image_position",
+    "ex_title_image", "ex_title_image_opacity", "ex_title_blend",
+    "ex_title_image_fit", "ex_title_image_position",
 )
 
 
@@ -131,6 +171,11 @@ def _load_saved_tiles(sm: dict) -> dict:
 
     cols = int(sm.get("grid_cols_n", 2) or 2)
     cols = max(1, cols)
+    legacy_grid = tile_geometry.is_grid_shaped(
+        {uid: value for uid, value in raw.items()
+         if uid not in {_TITLE_UID, _MODE_KEY}}, cols)
+    markerless_free = (_MODE_KEY not in raw and not legacy_grid and any(
+        isinstance(value, dict) and "x" in value for value in raw.values()))
     tiles: dict = {}
     for uid, val in raw.items():
         # The free-canvas mode marker is a bare string, not a tile. Passing it
@@ -138,22 +183,44 @@ def _load_saved_tiles(sm: dict) -> dict:
         # become a bogus full-width cell, so it is skipped here.
         if uid == _MODE_KEY:
             continue
-        # The title band is stored in free-form units like everything else, and
-        # it is always full width -- so int()-coercing it here would produce
-        # exactly the grid-shaped numbers this loader then mistakes for a
-        # legacy cell arrangement and scales the WHOLE board through from_grid.
-        # It is passed through untouched.
-        if uid == _TITLE_UID and isinstance(val, dict) and "x" in val:
-            tiles[uid] = {k: float(val.get(k, d))
-                          for k, d in (("x", 0.0), ("y", 0.0),
-                                       ("w", 1.0), ("h", 120.0))}
-        elif isinstance(val, dict) and "x" in val:
-            tiles[uid] = {"x": int(val.get("x", 0)), "y": int(val.get("y", 0)),
-                          "w": int(val.get("w", 1)), "h": int(val.get("h", 1))}
+        # Free-canvas x/w are fractions. Coercing them to int() collapses any
+        # fractional placement to zero (e.g. x=.5,w=.5 becomes x=0,w=0), which
+        # then clamps every restored card to the left edge at minimum width.
+        # Preserve free-form numbers for every entity, not only the title band.
+        if isinstance(val, dict) and "x" in val:
+            free_canvas = raw.get(_MODE_KEY) in _FREE_MODES or markerless_free
+            if uid == _TITLE_UID or free_canvas:
+                try:
+                    geom = {k: float(val.get(k, d))
+                            for k, d in (("x", 0.0), ("y", 0.0),
+                                         ("w", 1.0), ("h", 120.0))}
+                    if all(math.isfinite(v) for v in geom.values()):
+                        tiles[uid] = geom
+                except (TypeError, ValueError, OverflowError):
+                    continue
+            else:
+                # Marker-less sessions used integer grid cells. Keep that
+                # legacy interpretation and let the existing grid migration
+                # convert it once in _current_geometry.
+                try:
+                    tiles[uid] = {"x": int(val.get("x", 0)),
+                                  "y": int(val.get("y", 0)),
+                                  "w": int(val.get("w", 1)),
+                                  "h": int(val.get("h", 1))}
+                except (TypeError, ValueError, OverflowError):
+                    continue
         elif val:
             # Legacy boolean: "this chart spans the whole row".
             tiles[uid] = {"x": 0, "y": -1, "w": cols, "h": 1}
-    return _densify_legacy_tiles(tiles, cols)
+    tiles = _densify_legacy_tiles(tiles, cols)
+    # Reattach the marker after densification (which only accepts geometry
+    # dictionaries). It prevents a later _current_geometry call from applying
+    # the old grid heuristic to a valid free-canvas arrangement.
+    if raw.get(_MODE_KEY) in _FREE_MODES:
+        tiles[_MODE_KEY] = raw[_MODE_KEY]
+    elif markerless_free:
+        tiles[_MODE_KEY] = _FREE_MODE
+    return tiles
 
 
 def _densify_legacy_tiles(tiles: dict, cols: int) -> dict:
@@ -255,6 +322,8 @@ class DashboardPage(QWidget):
         # Set while the panel widgets are being written FROM the bridge, so the
         # change signals that fires are not mistaken for user edits.
         self._syncing_widgets = False
+        self._slicer_state_signature = self._slicer_signature(
+            self.bridge.get("slicers", []) or [])
 
         self._build_ui()
         self._connect_signals()
@@ -317,6 +386,31 @@ class DashboardPage(QWidget):
         self.btn_save.setProperty("kind", "success")
         header.addWidget(self.btn_save)
         root.addLayout(header)
+
+        # Task 3: dataset-missing warning. A saved session whose parquet is
+        # gone (deleted backup, moved profile) reopens as view-only figures:
+        # slicers/KPI edits silently do nothing. This notice says so and
+        # offers a jump to Upload for a re-upload, instead of leaving the
+        # user wondering why the board is dead.
+        _notice_row = QHBoxLayout()
+        _notice_row.setContentsMargins(0, 0, 0, 0)
+        _notice_row.setSpacing(8)
+        self.data_notice = QLabel(parent=self)
+        self.data_notice.setWordWrap(True)
+        self.data_notice.setStyleSheet(
+            "background:#3a2b12;border:1px solid #a97b1f;border-radius:6px;"
+            "padding:8px 12px;font-size:12px;")
+        self.data_notice.setVisible(False)
+        self.btn_reupload = QPushButton("⬆️ Re-upload dataset")
+        self.btn_reupload.setProperty("kind", "ghost")
+        self.btn_reupload.setToolTip(
+            "Go to the Upload page to load the dataset for this session again.")
+        self.btn_reupload.setVisible(False)
+        self.btn_reupload.clicked.connect(
+            lambda: self.navigate_requested.emit("upload"))
+        _notice_row.addWidget(self.data_notice, stretch=1)
+        _notice_row.addWidget(self.btn_reupload)
+        root.addLayout(_notice_row)
 
         # -- Split: left = controls (session/title/layout/KPIs/style),
         #    right = the live dashboard itself (charts + KPI row). The
@@ -442,6 +536,18 @@ class DashboardPage(QWidget):
         self.layout_mode.addItems(["Portrait", "Landscape"])
         info.add(FieldRow("Orientation", self.layout_mode,
                           "Page shape of the exported report."))
+        # Timestamp tick (default ON): shows the report timestamp as a slim
+        # strip at the extreme bottom edge of the dashboard. The timestamp was
+        # removed from the title card entirely, so this is its only home now.
+        # Unticked, the strip is not emitted at all and gives up its space.
+        self.chk_timestamp = QCheckBox("Show timestamp")
+        self.chk_timestamp.setChecked(bool(self.bridge.get("ex_meta", True)))
+        self.chk_timestamp.setToolTip(
+            "Show the report timestamp at the extreme bottom edge. "
+            "Unticked, it is removed completely and frees its space.")
+        self.chk_timestamp.toggled.connect(
+            lambda v: self._on_field_changed("ex_meta", bool(v)))
+        info.add(self.chk_timestamp)
         # The section has to go into the layout like every other one. Without
         # this line ``info`` was a local with no parent and no reference, so it
         # was garbage-collected the moment _build_left_panel returned -- taking
@@ -460,6 +566,14 @@ class DashboardPage(QWidget):
             "Add a card: totals, averages, shares, period-over-period change,\n"
             "running totals, or a custom expression over your columns.")
         kpi_group.add(self.btn_add_kpi)
+        self.kpi_selector = QComboBox()
+        self.kpi_selector.setToolTip("Choose the KPI whose calculation to edit.")
+        kpi_group.add(FieldRow("Selected KPI", self.kpi_selector))
+        self.btn_edit_kpi = QPushButton("Edit KPI value…")
+        self.btn_edit_kpi.setProperty("kind", "ghost")
+        self.btn_edit_kpi.setEnabled(False)
+        self.btn_edit_kpi.clicked.connect(self._on_edit_selected_kpi)
+        kpi_group.add(self.btn_edit_kpi)
         kpi_hint = QLabel("Hover a card to reorder, edit or remove it.")
         kpi_hint.setWordWrap(True)
         kpi_hint.setStyleSheet("font-size: 11px;")
@@ -504,6 +618,36 @@ class DashboardPage(QWidget):
              "Selection status line. Empty follows the theme accent."),
         ):
             slicer_group.add(FieldRow(label, self._make_color_field(key), tip))
+
+        # Slicer typography (the missing "label & value font size/colour"
+        # options). Label = the card title; value = the option/list text.
+        # Colour fields are empty-by-default (inherit), matching the swatches
+        # above; the sizes default to 13 like the export CSS.
+        for key, label, tip, spin_attr in (
+            ("ex_slicer_label_size", "Label size",
+             "Slicer card title font size (px).", "ex_slicer_label_size"),
+            ("ex_slicer_label_color", "Label color",
+             "Slicer card title colour. Empty follows the text colour.",
+             None),
+            ("ex_slicer_value_size", "Value size",
+             "Slicer option/list text font size (px).", "ex_slicer_value_size"),
+            ("ex_slicer_value_color", "Value color",
+             "Slicer option/list text colour. Empty follows the text colour.",
+             None),
+        ):
+            if spin_attr is not None:
+                spin = QSpinBox()
+                spin.setRange(7, 32)
+                spin.setSuffix(" px")
+                spin.setValue(int(self.bridge.get(
+                    key, _STYLE_DEFAULTS.get(key, 13)) or 13))
+                # valueChanged streams, so treat it like a dragged slider.
+                spin.valueChanged.connect(
+                    lambda v, k=key: self._on_field_changed(k, v, continuous=True))
+                setattr(self, spin_attr, spin)
+                slicer_group.add(FieldRow(label, spin, tip))
+            else:
+                slicer_group.add(FieldRow(label, self._make_color_field(key), tip))
         layout.addWidget(slicer_group)
 
         # -- Quick themes --------------------------------------------------
@@ -719,25 +863,20 @@ class DashboardPage(QWidget):
         layout.addWidget(section)
         self._refresh_bg_image_label()
 
-    # The card groups the per-card image can be applied to, in the order they
-    # are offered. Stored as one comma-separated style key rather than three
-    # booleans so that "which cards" is a single persisted value that survives
-    # a save/load round trip without the panel having to reconcile three
-    # independent keys that could disagree with each other.
-    _CARD_IMAGE_GROUPS = (("charts", "Chart cards"),
-                          ("kpi", "KPI cards"),
-                          ("title", "Title card"))
+    # Card kinds with independent image, opacity, and blend style keys.
+    _CARD_IMAGE_GROUPS = (("charts", "Chart cards", "ex_chart"),
+                          ("kpi", "KPI cards", "ex_kpi"),
+                          ("title", "Title card", "ex_title"))
 
     def _build_card_image_section(self, layout) -> None:
-        """Per-CARD background image: pick, where it applies, opacity, blend.
+        """Independent card background images with per-kind appearance.
 
         The page Background Image and this are deliberately two separate
         settings rather than one image with a "where" switch. They solve
         different problems: the page image dresses the whole report, while this
-        one is for a picture BEHIND THE CARDS -- a texture on the KPI strip, a
-        branded banner behind the title band, a photo behind the charts --
-        without touching the page at all. Sharing one control would mean
-        choosing between those, not having both.
+        image, opacity and blend are stored independently for chart, KPI and
+        title cards. The old shared-image fields are retained only for loading
+        sessions saved before this per-kind model existed.
         """
         section = CollapsibleSection("\U0001F4E6 Card Backgrounds",
                                      expanded=False)
@@ -749,11 +888,8 @@ class DashboardPage(QWidget):
         self.btn_card_image.setProperty("kind", "ghost")
         self.btn_card_image.clicked.connect(self._on_choose_card_image)
         self.btn_card_image.setToolTip(
-            "Use an image behind the CARDS instead of behind the whole "
-            "page.\n\nPick where it applies below -- the charts, the KPI "
-            "cards, the title band, or any combination. Like the page "
-            "background it is layered over the card colour and embedded into "
-            "the exported file, so the saved HTML shows it on any machine.")
+            "Choose an image for the card type selected below. Each type has "
+            "its own image, opacity and blend. Images are embedded in exports.")
         pick_row.addWidget(self.btn_card_image)
         self.btn_card_image_clear = QPushButton("Clear")
         self.btn_card_image_clear.setProperty("kind", "ghost")
@@ -765,24 +901,24 @@ class DashboardPage(QWidget):
         pick_row.addWidget(self.lbl_card_image, stretch=1)
         section.add(pick)
 
-        # One checkbox per card kind, all defaulting on. Written back as the
-        # single comma-separated key on every toggle.
-        self._card_image_checks: dict = {}
-        boxes = QWidget()
-        boxes_row = QHBoxLayout(boxes)
-        boxes_row.setContentsMargins(0, 0, 0, 0)
-        boxes_row.setSpacing(10)
-        for key, label in self._CARD_IMAGE_GROUPS:
-            box = QCheckBox(label)
-            box.setToolTip(f"Put the card image behind the {label.lower()}.")
-            box.toggled.connect(self._on_card_image_group_toggled)
-            boxes_row.addWidget(box)
-            self._card_image_checks[key] = box
-        boxes_row.addStretch()
+        self.card_image_group = QComboBox()
+        for key, label, _prefix in self._CARD_IMAGE_GROUPS:
+            self.card_image_group.addItem(label, key)
+        self.card_image_group.currentIndexChanged.connect(
+            lambda _index: self._sync_card_image_controls())
         section.add(FieldRow(
-            "Apply to", boxes,
-            "Which cards carry the picture. Unchecking every one of them is "
-            "the same as clearing it -- there is nowhere left to draw it."))
+            "Card type", self.card_image_group,
+            "Choose which card type to edit. Each type has independent settings."))
+
+        self.card_image_target = QComboBox()
+        self.card_image_target.addItem("All chart cards", "*")
+        self.card_image_target.currentIndexChanged.connect(
+            lambda _index: self._sync_card_image_controls())
+        self.card_image_target_row = FieldRow(
+            "Chart card", self.card_image_target,
+            "Apply image settings to every chart card or choose one chart. "
+            "A chart-specific image and appearance are saved with the session.")
+        section.add(self.card_image_target_row)
 
         self.ex_card_image_opacity = QSpinBox()
         self.ex_card_image_opacity.setRange(0, 100)
@@ -791,8 +927,7 @@ class DashboardPage(QWidget):
             "ex_card_image_opacity",
             _STYLE_DEFAULTS["ex_card_image_opacity"]) or 0))
         self.ex_card_image_opacity.valueChanged.connect(
-            lambda v: self._on_field_changed("ex_card_image_opacity", v,
-                                             continuous=True))
+            lambda _v: self._on_card_image_appearance_changed())
         section.add(FieldRow(
             "Opacity", self.ex_card_image_opacity,
             "How strongly the picture shows through the card colour. Keep it "
@@ -806,62 +941,192 @@ class DashboardPage(QWidget):
         _card_blend_keys = {"normal": 0, "multiply": 1, "screen": 2,
                             "overlay": 3, "soft light": 4, "soft-light": 4,
                             "luminosity": 5, "darken": 6, "lighten": 7}
-        current_card_blend = str(self.bridge.get(
-            "ex_card_blend",
-            _STYLE_DEFAULTS["ex_card_blend"]) or "normal").lower()
-        self.ex_card_blend.setCurrentIndex(
-            _card_blend_keys.get(current_card_blend, 0))
+        self.ex_card_blend.setCurrentIndex(0)
         self.ex_card_blend.currentTextChanged.connect(
-            lambda v: self._on_field_changed(
-                "ex_card_blend", v.lower().replace(" ", "-")))
+            lambda _v: self._on_card_image_appearance_changed())
         section.add(FieldRow(
             "Blend", self.ex_card_blend,
             "How the picture mixes with the card colour. Soft light and "
             "overlay sit a texture on top without washing out the number; "
             "Multiply darkens a light card."))
+
+        self.ex_card_image_fit = QComboBox()
+        self.ex_card_image_fit.addItems(["Cover", "Contain", "Tile"])
+        self.ex_card_image_fit.currentTextChanged.connect(
+            lambda _v: self._on_card_image_appearance_changed())
+        section.add(FieldRow(
+            "Fit", self.ex_card_image_fit,
+            "Cover fills the card and crops edges; Contain shows the full image; "
+            "Tile repeats it at its natural size."))
+
+        self.ex_card_image_position = QComboBox()
+        self.ex_card_image_position.addItems([
+            "center", "top", "bottom", "left", "right",
+            "top left", "top right", "bottom left", "bottom right",
+        ])
+        self.ex_card_image_position.currentTextChanged.connect(
+            lambda _v: self._on_card_image_appearance_changed())
+        section.add(FieldRow(
+            "Position", self.ex_card_image_position,
+            "Choose the focal point used when Cover crops the image."))
         layout.addWidget(section)
+        self._refresh_chart_image_targets()
+        self._sync_card_image_controls()
+
+    def _selected_card_image_group(self) -> tuple[str, str]:
+        group = str(self.card_image_group.currentData() or "charts")
+        prefix = next((prefix for key, _label, prefix in self._CARD_IMAGE_GROUPS
+                       if key == group), "ex_chart")
+        return group, prefix
+
+    def _refresh_chart_image_targets(self) -> None:
+        if not hasattr(self, "card_image_target"):
+            return
+        selected = self.card_image_target.currentData()
+        charts = self.bridge.get("charts", []) or []
+        self.card_image_target.blockSignals(True)
+        self.card_image_target.clear()
+        self.card_image_target.addItem("All chart cards", "*")
+        for item in charts:
+            try:
+                uid, title = str(item[0]), str(item[1])
+            except (TypeError, IndexError):
+                continue
+            self.card_image_target.addItem(title or uid, uid)
+        index = self.card_image_target.findData(selected)
+        self.card_image_target.setCurrentIndex(index if index >= 0 else 0)
+        self.card_image_target.blockSignals(False)
+
+    def _selected_card_image_config(self) -> dict:
+        group, prefix = self._selected_card_image_group()
+        if group == "charts":
+            target = str(self.card_image_target.currentData() or "*")
+            overrides = self.bridge.get("ex_chart_image_overrides", {}) or {}
+            if target != "*" and isinstance(overrides, dict) and target in overrides:
+                config = dict(overrides.get(target) or {})
+                return {
+                    "image": config.get("image", ""),
+                    "image_name": config.get("image_name", ""),
+                    "opacity": config.get("opacity", 35),
+                    "blend": config.get("blend", "normal"),
+                    "fit": config.get("fit", "cover"),
+                    "position": config.get("position", "center"),
+                }
+        return {
+            "image": self.bridge.get(f"{prefix}_image", ""),
+            "image_name": self.bridge.get(f"{prefix}_image_name", ""),
+            "opacity": self.bridge.get(f"{prefix}_image_opacity", 35),
+            "blend": self.bridge.get(f"{prefix}_blend", "normal"),
+            "fit": self.bridge.get(f"{prefix}_image_fit", "cover"),
+            "position": self.bridge.get(f"{prefix}_image_position", "center"),
+        }
+
+    def _store_selected_card_image_config(self, config: dict) -> tuple[str, ...]:
+        group, prefix = self._selected_card_image_group()
+        if group == "charts":
+            target = str(self.card_image_target.currentData() or "*")
+            if target != "*":
+                overrides = self.bridge.get("ex_chart_image_overrides", {}) or {}
+                overrides = dict(overrides) if isinstance(overrides, dict) else {}
+                overrides[target] = dict(config)
+                self.bridge.set("ex_chart_image_overrides", overrides)
+                return ("ex_chart_image_overrides",)
+        self.bridge.set(f"{prefix}_image", config.get("image", ""))
+        self.bridge.set(f"{prefix}_image_name", config.get("image_name", ""))
+        self.bridge.set(f"{prefix}_image_opacity", config.get("opacity", 35))
+        self.bridge.set(f"{prefix}_blend", config.get("blend", "normal"))
+        self.bridge.set(f"{prefix}_image_fit", config.get("fit", "cover"))
+        self.bridge.set(f"{prefix}_image_position", config.get("position", "center"))
+        return (f"{prefix}_image", f"{prefix}_image_opacity",
+                f"{prefix}_blend", f"{prefix}_image_fit",
+                f"{prefix}_image_position")
+
+    def _sync_card_image_controls(self) -> None:
+        """Load the selected card kind's image and appearance into the widgets."""
+        if not hasattr(self, "card_image_group"):
+            return
+        self._refresh_chart_image_targets()
+        _group, prefix = self._selected_card_image_group()
+        self.card_image_target_row.setVisible(_group == "charts")
+        config = self._selected_card_image_config()
+        self.ex_card_image_opacity.blockSignals(True)
+        self.ex_card_blend.blockSignals(True)
+        self.ex_card_image_fit.blockSignals(True)
+        self.ex_card_image_position.blockSignals(True)
+        self.ex_card_image_opacity.setValue(int(config.get("opacity", 35) or 0))
+        blend = str(config.get("blend", "normal") or "normal").lower()
+        blend_labels = {"normal": "Normal", "multiply": "Multiply",
+                        "screen": "Screen", "overlay": "Overlay",
+                        "soft-light": "Soft light", "luminosity": "Luminosity",
+                        "darken": "Darken", "lighten": "Lighten"}
+        index = self.ex_card_blend.findText(blend_labels.get(blend, "Normal"))
+        self.ex_card_blend.setCurrentIndex(max(0, index))
+        fit = str(config.get("fit", "cover") or "cover")
+        self.ex_card_image_fit.setCurrentText({"cover": "Cover", "contain": "Contain",
+                                               "tile": "Tile"}.get(fit, "Cover"))
+        position = str(config.get("position", "center") or "center")
+        self.ex_card_image_position.setCurrentText(position.replace("-", " "))
+        self.ex_card_image_opacity.blockSignals(False)
+        self.ex_card_blend.blockSignals(False)
+        self.ex_card_image_fit.blockSignals(False)
+        self.ex_card_image_position.blockSignals(False)
         self._refresh_card_image_label()
 
-    def _current_card_image_groups(self) -> list:
-        """The card kinds currently ticked, as a list of style-key values."""
-        return [key for key, _ in self._CARD_IMAGE_GROUPS
-                if self._card_image_checks[key].isChecked()]
-
-    def _on_card_image_group_toggled(self) -> None:
-        """Write the ticked card kinds back as the one style key.
-
-        Every toggle recomputes the whole list rather than toggling one entry:
-        that way the stored value is always exactly what is on screen, and a
-        load that found an unrecognised group name in the key cannot leave the
-        panel and the report disagreeing.
-        """
+    def _on_card_image_appearance_changed(self) -> None:
         if getattr(self, "_syncing_widgets", False):
             return
-        self.bridge.set("ex_card_image_groups",
-                        ",".join(self._current_card_image_groups()))
-        self._schedule_regen()
+        config = self._selected_card_image_config()
+        config.update({
+            "opacity": self.ex_card_image_opacity.value(),
+            "blend": self.ex_card_blend.currentText().lower().replace(" ", "-"),
+            "fit": self.ex_card_image_fit.currentText().lower(),
+            "position": self.ex_card_image_position.currentText().lower().replace(" ", "-"),
+        })
+        changed = self._store_selected_card_image_config(config)
+        if (changed == ("ex_chart_image_overrides",) and
+                str(self.card_image_target.currentData() or "*") != "*"):
+            # The image URI is already installed on that card. Appearance
+            # tweaks should not copy its multi-megabyte data URI over the
+            # bridge again.
+            changed = ("ex_chart_image_override_appearance",)
+        if not self._apply_live_style(changed):
+            self._schedule_regen()
 
     def _sync_card_image_enabled(self) -> None:
         """Grey out what cannot act until an image is actually chosen."""
-        has_image = bool(self.bridge.get("ex_card_image", ""))
+        _group, _prefix = self._selected_card_image_group()
+        config = self._selected_card_image_config()
+        has_image = bool(config.get("image"))
         self.ex_card_image_opacity.setEnabled(has_image)
         self.ex_card_blend.setEnabled(has_image)
+        self.ex_card_image_fit.setEnabled(has_image)
+        self.ex_card_image_position.setEnabled(has_image)
         # The group boxes stay enabled with no image: deciding WHERE the
         # picture will go before choosing it is a reasonable order of work, and
         # the choice is remembered either way.
-        self.btn_card_image_clear.setEnabled(has_image)
+        overrides = self.bridge.get("ex_chart_image_overrides", {}) or {}
+        target = str(self.card_image_target.currentData() or "*") if _group == "charts" else "*"
+        has_override = (target != "*" and isinstance(overrides, dict)
+                        and target in overrides)
+        self.btn_card_image_clear.setEnabled(has_image or has_override)
 
     def _refresh_card_image_label(self) -> None:
         """Show which card image is set, or that there is none."""
-        uri = str(self.bridge.get("ex_card_image", "") or "")
+        group, _prefix = self._selected_card_image_group()
+        config = self._selected_card_image_config()
+        uri = str(config.get("image", "") or "")
         if not uri:
-            self.lbl_card_image.setText("No image")
+            overrides = self.bridge.get("ex_chart_image_overrides", {}) or {}
+            target = str(self.card_image_target.currentData() or "*") if group == "charts" else "*"
+            overridden = (target != "*" and isinstance(overrides, dict)
+                          and target in overrides)
+            self.lbl_card_image.setText("No image override" if overridden else "No image")
             self._sync_card_image_enabled()
             return
         # The SOURCE filename, not the data URI: the bridge deliberately stores
         # an embedded copy, and "data:image/png;base64,iVBOR..." is not
         # something a user can recognise as their own file.
-        source = str(self.bridge.get("ex_card_image_name", "") or "image")
+        source = str(config.get("image_name", "") or "image")
         try:
             self.lbl_card_image.setText(
                 f"{Path(source).name}  "
@@ -885,21 +1150,43 @@ class DashboardPage(QWidget):
                 "are embedded into the report so the exported file keeps the "
                 "picture.")
             return
-        self.bridge.set("ex_card_image", uri)
+        config = self._selected_card_image_config()
+        config["image"] = uri
         # Remembered separately, for display only: the data URI is what the
         # report needs, and a user has to be able to recognise which file it
         # came from.
-        self.bridge.set("ex_card_image_name", str(path))
+        config["image_name"] = str(path)
+        changed_keys = self._store_selected_card_image_config(config)
+        # A new per-kind choice takes precedence over a pre-migration shared
+        # image. Clearing it prevents that legacy image from leaking onto the
+        # other card kinds via the export compatibility fallback.
+        self.bridge.set("ex_card_image", "")
+        self.bridge.set("ex_card_image_groups", "")
         self._refresh_card_image_label()
-        self._schedule_regen()
+        if not self._apply_live_style(changed_keys):
+            self._schedule_regen()
 
     def _on_clear_card_image(self) -> None:
-        if not self.bridge.get("ex_card_image", ""):
+        group, prefix = self._selected_card_image_group()
+        config = self._selected_card_image_config()
+        if group == "charts" and str(self.card_image_target.currentData() or "*") != "*":
+            target = str(self.card_image_target.currentData())
+            overrides = self.bridge.get("ex_chart_image_overrides", {}) or {}
+            overrides = dict(overrides) if isinstance(overrides, dict) else {}
+            config["image"] = ""
+            config["image_name"] = ""
+            overrides[target] = config
+            self.bridge.set("ex_chart_image_overrides", overrides)
+            changed_keys = ("ex_chart_image_overrides",)
+        elif not config.get("image"):
             return
-        self.bridge.set("ex_card_image", "")
-        self.bridge.set("ex_card_image_name", "")
+        else:
+            config["image"] = ""
+            config["image_name"] = ""
+            changed_keys = self._store_selected_card_image_config(config)
         self._refresh_card_image_label()
-        self._schedule_regen()
+        if not self._apply_live_style(changed_keys):
+            self._schedule_regen()
 
     def _refresh_bg_image_label(self) -> None:
         """Show what the background image currently is, or that there is none."""
@@ -1026,11 +1313,15 @@ class DashboardPage(QWidget):
                  "border-radius:4px;")
             )
 
-        # ex_density / ex_radius / ex_chart_h / ex_width / ex_meta have no
-        # widget any more (the Layout section is gone), so there is nothing to
-        # push their loaded values into. They are still carried in the style
-        # dict and still reach the exporter, so a saved session keeps whatever
-        # it was saved with.
+        # ex_density / ex_radius / ex_chart_h / ex_width have no widget any
+        # more (the Layout section is gone), so there is nothing to push their
+        # loaded values into. They are still carried in the style dict and
+        # still reach the exporter, so a saved session keeps whatever it was
+        # saved with. ex_meta DOES have a widget now -- the Dashboard Info
+        # timestamp tick -- so it is synced like every other checkbox.
+        w = getattr(self, "chk_timestamp", None)
+        if w is not None:
+            w.setChecked(bool(style.get("ex_meta", _STYLE_DEFAULTS.get("ex_meta", True))))
         self.ex_kpi_val_size.setValue(int(style.get("ex_kpi_val_size", 26)))
         self.ex_kpi_label_size.setValue(int(style.get(
             "ex_kpi_label_size",
@@ -1048,29 +1339,9 @@ class DashboardPage(QWidget):
         self.ex_bg_blend.setCurrentIndex(blend_index)
         self._refresh_bg_image_label()
 
-        # The card picture. Opacity and blend are ordinary controls, but the
-        # GROUP checkboxes have to be driven from the stored comma-separated
-        # key -- and they must be set INSIDE the sync guard, or each setChecked
-        # fires `toggled` and the first box would rewrite the key before the
-        # others had been read, silently dropping the groups it had not reached
-        # yet.
-        self.ex_card_image_opacity.setValue(int(style.get(
-            "ex_card_image_opacity",
-            _STYLE_DEFAULTS["ex_card_image_opacity"]) or 0))
-        card_blend_index = {"normal": 0, "multiply": 1, "screen": 2,
-                            "overlay": 3, "soft-light": 4, "luminosity": 5,
-                            "darken": 6, "lighten": 7}.get(
-                                str(style.get("ex_card_blend", "normal")
-                                    or "normal").lower().replace(" ", "-"),
-                                0)
-        self.ex_card_blend.setCurrentIndex(card_blend_index)
-        raw_groups = {
-            part.strip() for part in
-            str(style.get("ex_card_image_groups", "") or "").split(",")
-            if part.strip()}
-        for key, box in self._card_image_checks.items():
-            box.setChecked(key in raw_groups)
-        self._refresh_card_image_label()
+        # Per-card image controls read from the current card type; switching
+        # types updates these controls without writing values back to state.
+        self._sync_card_image_controls()
 
         for prefix in ("ex_title", "ex_notes"):
             font_widget = getattr(self, f"{prefix}_font", None)
@@ -1086,6 +1357,14 @@ class DashboardPage(QWidget):
                 # control visibly disagreed with the thing it controls.
                 size_widget.setValue(int(style.get(
                     f"{prefix}_size", _STYLE_DEFAULTS[f"{prefix}_size"])))
+
+        # Slicer typography sizes (the colour halves are swatches in
+        # _color_swatches and synced with the rest above).
+        for attr, key in (("ex_slicer_label_size", "ex_slicer_label_size"),
+                          ("ex_slicer_value_size", "ex_slicer_value_size")):
+            w = getattr(self, attr, None)
+            if w is not None:
+                w.setValue(int(style.get(key, _STYLE_DEFAULTS.get(key, 13)) or 13))
 
     def _make_color_field(self, key: str) -> QWidget:
         """One reusable color-picker row: a clickable swatch that opens
@@ -1161,8 +1440,19 @@ class DashboardPage(QWidget):
             self._on_report_field_changed)
 
     def _on_report_field_changed(self, *_args) -> None:
-        """Title / session name / orientation changed: rebuild the report."""
+        """Apply a title immediately; rebuild only for page orientation."""
         if getattr(self, "_syncing_widgets", False):
+            return
+        if self.sender() in (self.dash_title, self.session_name) and \
+                self.report_canvas.is_ready():
+            title = (self.dash_title.text().strip()
+                     or self.session_name.text().strip()
+                     or "Lytrize Report")
+            encoded = json.dumps(title, ensure_ascii=False)
+            self.report_canvas.run_js(
+                "(function(t){document.title=t;"
+                "document.querySelectorAll('.title-card .text-object').forEach("
+                "function(el){el.textContent=t;});})(%s);" % encoded)
             return
         self._schedule_regen(continuous=True)
 
@@ -1223,7 +1513,48 @@ class DashboardPage(QWidget):
         if getattr(self, "_syncing_widgets", False):
             return
         self.bridge.set(key, value)
+        if key in _LIVE_STYLE_KEYS and self._apply_live_style((key,)):
+            return
         self._schedule_regen(continuous=continuous)
+
+    def _apply_live_style(self, changed_keys=None) -> bool:
+        """Patch visual settings into the loaded report without a page reload."""
+        if not self.report_canvas.is_ready():
+            return False
+        changed_list = list(
+            _LIVE_STYLE_KEYS - _LIVE_STYLE_IMAGE_KEYS
+            if changed_keys is None else changed_keys)
+        style = self._current_style_dict()
+        chart_overrides = style.pop("ex_chart_image_overrides", {}) or {}
+        if not isinstance(chart_overrides, dict):
+            chart_overrides = {}
+        # Live patches carry only small IDs unless a specific chart image was
+        # actually edited. Multi-megabyte image URIs stay out of normal style
+        # updates.
+        style["ex_chart_image_override_ids"] = list(chart_overrides)
+        if ("ex_chart_image_overrides" in changed_list or
+                "ex_chart_image_override_appearance" in changed_list):
+            target = str(self.card_image_target.currentData() or "*")
+            style["ex_chart_image_target"] = target
+            override = dict(chart_overrides.get(target, {}) or {})
+            if "ex_chart_image_override_appearance" in changed_list:
+                override.pop("image", None)
+                override.pop("image_name", None)
+            style["ex_chart_image_override"] = override
+        # Embedded images can be several megabytes. Send an image URI to the
+        # WebEngine only when that specific image changed; opacity, typography,
+        # and palette adjustments should remain tiny DOM patches.
+        for prefix in ("ex_chart", "ex_kpi", "ex_title"):
+            image_key = f"{prefix}_image"
+            if image_key not in changed_list:
+                style.pop(image_key, None)
+        style.pop("ex_card_image", None)
+        payload = json.dumps(style, ensure_ascii=False, separators=(",", ":"))
+        changed = json.dumps(changed_list, separators=(",", ":"))
+        self.report_canvas.run_js(
+            "window.__lytrizeApplyDashboardStyle&&"
+            f"window.__lytrizeApplyDashboardStyle({payload},{changed});")
+        return True
 
     def _on_preset_selected(self, name: str) -> None:
         """Apply one of the quick themes across the whole board.
@@ -1242,7 +1573,8 @@ class DashboardPage(QWidget):
             if value is not None:
                 self.bridge.set(key, value)
         self.bridge.set("ex_preset", str(name))
-        self._schedule_regen()
+        if not self._apply_live_style(_OVERRIDABLE_COLORS):
+            self._schedule_regen()
         self._sync_style_widgets_from_bridge()
         self.preset_gallery.select(name)
 
@@ -1270,8 +1602,20 @@ class DashboardPage(QWidget):
         # "reset" is exactly the kind of thing the user does not notice.
         self.bridge.set("ex_card_image", "")
         self.bridge.set("ex_card_image_name", "")
+        self.bridge.set("ex_card_image_groups", "")
+        for _group, _label, prefix in self._CARD_IMAGE_GROUPS:
+            self.bridge.set(f"{prefix}_image", "")
+            self.bridge.set(f"{prefix}_image_name", "")
+            self.bridge.set(f"{prefix}_image_opacity",
+                            _STYLE_DEFAULTS[f"{prefix}_image_opacity"])
+            self.bridge.set(f"{prefix}_blend", _STYLE_DEFAULTS[f"{prefix}_blend"])
+            self.bridge.set(f"{prefix}_image_fit", _STYLE_DEFAULTS[f"{prefix}_image_fit"])
+            self.bridge.set(f"{prefix}_image_position",
+                            _STYLE_DEFAULTS[f"{prefix}_image_position"])
+        self.bridge.set("ex_chart_image_overrides", {})
         self.bridge.set("ex_preset", "")
-        self._schedule_regen()
+        if not self._apply_live_style(_LIVE_STYLE_KEYS):
+            self._schedule_regen()
         self._sync_style_widgets_from_bridge()
         self.preset_gallery.clear()
 
@@ -1301,12 +1645,27 @@ class DashboardPage(QWidget):
         cols = int(self.bridge.get("grid_cols_n", 2))
         tile_geom, kpi_geom = self._current_geometry(charts,
             self.bridge.get("kpis", []), cols)
+        # Materialize the first auto-placement/migration once, before a user
+        # can drag. Later geometry events can then patch exactly one object
+        # instead of re-running layout discovery for the whole canvas.
+        normalized_geometry = {
+            **tile_geom, **kpi_geom,
+            **{f"slicer:{key}": value for key, value in
+               (getattr(self, "_slicer_geom", {}) or {}).items()},
+            _MODE_KEY: _FREE_MODE,
+        }
+        if dict(self.bridge.get("tile_geometry", {}) or {}) != normalized_geometry:
+            self._persist_geometry(tile_geom, kpi_geom, cols, regen=False)
         return {
             "token": self._regen_token + 1,
             "charts": charts,
             "kpis": self.bridge.get("kpis", []),
             "slicers": slicers,
             "df": self.bridge.df,
+            # Use the already-imported Polars snapshot for live report data
+            # when available; creating a compatibility copy here would put a
+            # full-frame conversion back on the UI thread.
+            "polars_dataset": self.bridge.polars_dataset(create_if_missing=False),
             "recipes": {c[0]: r for c in charts
                           for r in (self._chart_recipe(c[0]),) if r},
             "meta_map": {uid: self.bridge.get_chart_meta(uid)
@@ -1353,11 +1712,36 @@ class DashboardPage(QWidget):
         token = snap["token"]
         self._pending_snap = snap
         from desktop.workers import ReportInputsWorker
+        # Single-flight: cancel any in-flight stage so at most one inputs
+        # build runs at a time. Without this a burst of drags/slider ticks
+        # each spawn a thread, and several full recipe re-runs over millions
+        # of rows contend for the GIL/CPU at once -- the "choppy / freezes"
+        # report. The new worker supersedes the old by token anyway.
+        self._cancel_worker(getattr(self, "_inputs_worker", None))
         worker = ReportInputsWorker(token, snap, parent=self)
         worker.ready.connect(self._on_inputs_ready)
         worker.failed.connect(self._on_preview_failed)
         self._inputs_worker = worker
         worker.start()
+
+    @staticmethod
+    def _cancel_worker(worker) -> None:
+        """Ask *worker* to stop as soon as it checks, if it is still running.
+
+        QThread has no hard kill; the worker's run() checks
+        ``isInterruptionRequested()`` at its safe points and returns early, so
+        an obsolete build stops between charts instead of running to
+        completion for a result that will be discarded.
+        """
+        if worker is None:
+            return
+        try:
+            if worker.isRunning():
+                worker.requestInterruption()
+        except RuntimeError:
+            # C++ object already deleted between the check and the call; it is
+            # gone, which is exactly the state we wanted.
+            pass
 
     def _on_inputs_ready(self, token: int, partial: dict) -> None:
         """Stage 1 done: merge worker results, kick off the HTML build."""
@@ -1366,6 +1750,9 @@ class DashboardPage(QWidget):
         snap = getattr(self, "_pending_snap", None) or {}
         d = dict(snap)
         d.update(partial)
+        # Supersede any in-flight stage-2 build before starting this one, so a
+        # rapid burst does not run several multi-second HTML builds at once.
+        self._cancel_worker(getattr(self, "_preview_worker", None))
         worker = ReportPreviewWorker(
             d["export_charts"],
             d["session_name"],
@@ -1382,6 +1769,8 @@ class DashboardPage(QWidget):
             slicer_values=d["slicer_values"],
             geometry_mode=d["geometry_mode"],
             extra_css=self._preview_extra_css(),
+            report_payload=d.get("report_payload"),
+            report_specs=d.get("report_specs"),
             parent=self,
         )
         worker.ready.connect(self._on_preview_ready)
@@ -1398,8 +1787,8 @@ class DashboardPage(QWidget):
         exported file never actually uses.
         """
         try:
-            from desktop.widgets.plotly_web_view import bundled_font_css
-            return bundled_font_css()
+            from font_bundle import font_face_css
+            return font_face_css()
         except Exception:
             log.debug("bundled font CSS unavailable for canvas", exc_info=True)
             return ""
@@ -1464,7 +1853,7 @@ class DashboardPage(QWidget):
         # and reset to a scrambled position. Only a MARKER-LESS blob (a genuine
         # legacy grid session) falls through to the heuristic, which now also
         # inspects y/h so even that path no longer misreads a free card.
-        if (stored and stored.get(_MODE_KEY) != "free"
+        if (stored and stored.get(_MODE_KEY) not in _FREE_MODES
                 and tile_geometry.is_grid_shaped(
                     {u: g for u, g in stored.items()
                      if u != _TITLE_UID and u != _MODE_KEY}, cols or 2)):
@@ -1486,15 +1875,26 @@ class DashboardPage(QWidget):
         title_map = {u: g for u, g in stored.items() if u == _TITLE_UID}
         # Normalised on read as well as on write, so a blob written before the
         # two spellings were reconciled still lands on real tiles.
-        kpi_map = {_kpi_key(u): g for u, g in stored.items()
-                   if _kpi_key(u) is not None}
+        # Safeguard: only treat bare digit keys as KPIs; ignore keys that
+        # already carry a prefix (e.g. "slicer:" or "kpi:") to avoid
+        # cross-contamination from mis-saved or mixed-format blobs.
+        kpi_map = {}
+        for u, g in stored.items():
+            k = _kpi_key(u)
+            if k is not None and u.isdigit() and not u.startswith("slicer:"):
+                kpi_map[k] = g
         # Slicer tiles are keyed "slicer:<i>" from the overlay and "0", "1"...
         # in the blob, exactly like KPIs. They are peeled off BEFORE the chart
         # filter below, because a "slicer:0" key would otherwise be filed as a
         # chart uid, fail the "is this chart still here" check, and be dropped --
         # which is what made a slicer drag silently do nothing.
-        slicer_map = {_slicer_key(u): g for u, g in stored.items()
-                      if _slicer_key(u) is not None}
+        # Namespacing safeguard: only pick keys that explicitly carry the "slicer:" prefix,
+        # so that a bare digit "0"/"1" in old or corrupted blobs is never treated as a slicer.
+        slicer_map = {}
+        for u, g in stored.items():
+            k = _slicer_key(u)
+            if k is not None and u.startswith("slicer:"):
+                slicer_map[k] = g
         # Drop anything whose block is gone. A restored arrangement naming a
         # deleted chart otherwise keeps contributing cells forever, so the saved
         # blob grows a little more on every session.
@@ -1507,12 +1907,29 @@ class DashboardPage(QWidget):
         # down by one band -- and because both sides call one function, the
         # canvas, the preview and the saved file shift by the same amount
         # instead of the file quietly disagreeing with the screen.
+        # KPIs and slicers are BOTH keyed by a bare index internally ("0",
+        # "1"). Merging them as-is collides on that key: **slicer_map overwrites
+        # the KPI tile**, and the split below then files the merged "0" as a KPI
+        # (_kpi_key("0")="0") while refusing it as a slicer
+        # (_slicer_key("0")=None) -- so the KPI card adopts the slicer's
+        # position and the slicer tile is lost, re-auto-placed at its default
+        # slot on the NEXT regen. That is the whole "add a slicer and the other
+        # cards glitch / the slicer snaps back" report. Namespacing both sides
+        # for the merge makes the keys unique; ensure_title_band only shifts y
+        # and never inspects the spelling, and the split below recovers both
+        # under their bare keys.
         merged, _title_g = tile_geometry.ensure_title_band(
-            {**chart_map, **kpi_map, **slicer_map, **title_map},
+            {**chart_map,
+             **{f"kpi:{k}": v for k, v in kpi_map.items()},
+             **{f"slicer:{k}": v for k, v in slicer_map.items()},
+             **title_map},
+            # The title card is heading-only now (the timestamp moved to the
+            # bottom-edge footer), so the band is sized for text alone -- the
+            # show_meta argument is intentionally not passed through.
             height=tile_geometry.title_band_height(
                 self.bridge.get("ex_title_size",
                                 _STYLE_DEFAULTS["ex_title_size"]),
-                bool(self.bridge.get("ex_meta", True))),
+                False),
             gap_px=gap)
         title_map = {_TITLE_UID: merged[_TITLE_UID]}
         chart_map = {u: g for u, g in merged.items()
@@ -1538,13 +1955,29 @@ class DashboardPage(QWidget):
         # belongs where the eye looks for it -- above the numbers it filters --
         # and at the KPI height (120px of mostly-empty card) rather than the
         # chart height, so a row of them does not push the board down.
-        slicer_count = len(self.bridge.get("slicers", []) or [])
-        if slicer_count:
-            slicer_map = tile_geometry.auto_place(
-                [str(i) for i in range(slicer_count)], slicer_map,
-                gap_px=gap, h=max(tile_geometry.MIN_H, 180.0),
-                floor_px=floor)
-            floor = tile_geometry.canvas_height(slicer_map, gap)
+        #
+        # NEW slicers only. auto_place fills slots for wanted uids that have no
+        # stored tile -- so passing ALL indices every render is fine UNLESS the
+        # floors chain: floor was recomputed from the (ephemeral) slicer_map,
+        # and the KPI/chart floors below shifted by a pixel each time, which
+        # read as "every card drifts when I add a slicer". Placed slicers keep
+        # their stored tiles; only the newcomer is wanted.
+        slicer_defs = list(self.bridge.get("slicers", []) or [])
+        if slicer_defs:
+            wanted = [str(i) for i in range(len(slicer_defs))
+                      if str(i) not in slicer_map]
+            floor_before = floor
+            if wanted:
+                slicer_map = tile_geometry.auto_place(
+                    wanted, slicer_map,
+                    gap_px=gap, h=max(tile_geometry.MIN_H, 180.0),
+                    w=SLICER_DEFAULT_W, floor_px=floor)
+            # The band below must start below BOTH the old floor (where the
+            # KPIs/charts the user already placed live) and the new slicer
+            # row -- never above the old floor, which is what shoved placed
+            # cards upward on every slicer add.
+            floor = max(floor_before,
+                        tile_geometry.canvas_height(slicer_map, gap))
         else:
             slicer_map = {}
         kpi_map = tile_geometry.auto_place(
@@ -1560,7 +1993,7 @@ class DashboardPage(QWidget):
                 tile_geometry.clamp_all(kpi_map))
 
     def _persist_geometry(self, chart_map: dict, kpi_map: dict,
-                          cols: int = 2) -> None:
+                          cols: int = 2, *, regen: bool = True) -> None:
         """Store both maps in one blob and refresh the board."""
         # Slicer tiles join the same blob, but under a namespaced key. KPIs are
         # keyed by a BARE index ("0", "1"), so a slicer keyed the same way
@@ -1573,91 +2006,102 @@ class DashboardPage(QWidget):
         # saved on the free canvas and never runs the legacy grid migration on
         # it (which is what reset a dragged full-width chart).
         self.bridge.set("tile_geometry", {
-            **chart_map, **kpi_map, **namespaced, _MODE_KEY: "free"})
+            **chart_map, **kpi_map, **namespaced, _MODE_KEY: _FREE_MODE})
         # Recorded so a session saved now can still be opened by an older build
         # (which expects a column count) even though the canvas no longer uses it.
         self.bridge.set("grid_cols_n", cols or 2)
-        self._schedule_regen()
+        # A geometry change is NOT a content change. The card is already where
+        # the user dropped it -- the overlay moved the real DOM element during
+        # the gesture -- so a full regeneration here (new digest URL, white
+        # flash) is pure cost. Persist only when regen=False is requested.
+        if regen:
+            self._schedule_regen()
 
     # -- KPI management -------------------------------------------------
 
     def _refresh_kpis(self) -> None:
-        """KPI cards are rendered by the report itself now.
-
-        This used to build a row of KpiCard widgets duplicating the exporter's
-        markup -- a second renderer to keep in step with the first, which is how
-        the live card and the exported card came to disagree about value sizes
-        and stale markers. The KPI list now only needs the board rebuilt.
-        """
+        """Update KPI cards in place, avoiding a full dashboard rebuild."""
+        self._sync_kpi_selector()
+        if self._sync_kpis_live():
+            return
         self._schedule_regen()
+
+    def _sync_kpis_live(self) -> bool:
+        """Patch KPI values/cards without reserializing the dataset or charts."""
+        if not self.report_canvas.is_ready():
+            return False
+        kpis = list(self.bridge.get("kpis", []) or [])
+        charts = self.bridge.get("charts", []) or []
+        cols = int(self.bridge.get("grid_cols_n", 2) or 2)
+        chart_map, kpi_map = self._current_geometry(charts, kpis, cols)
+        self._persist_geometry(chart_map, kpi_map, cols, regen=False)
+        kpis_json = json.dumps(kpis, ensure_ascii=False, separators=(",", ":"),
+                               default=str, allow_nan=False)
+        geometry_json = json.dumps(kpi_map, separators=(",", ":"),
+                                   allow_nan=False)
+        self.report_canvas.run_js(
+            "window.__lytrizeSyncKpis&&window.__lytrizeSyncKpis("
+            f"{kpis_json},{geometry_json});"
+            "window.__lytrizeUpdateKpis&&window.__lytrizeUpdateKpis("
+            f"{kpis_json});")
+        self._apply_live_style()
+        return True
+
+    def _sync_kpi_selector(self) -> None:
+        """Keep the left-panel KPI editor bound to the current KPI list."""
+        combo = getattr(self, "kpi_selector", None)
+        if combo is None:
+            return
+        kpis = list(self.bridge.get("kpis", []) or [])
+        current = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        for index, kpi in enumerate(kpis):
+            label = str(kpi.get("label") or kpi.get("name") or f"KPI {index + 1}")
+            value = str(kpi.get("value", "--"))
+            combo.addItem(f"{label}: {value}", index)
+        if current is not None:
+            pos = combo.findData(current)
+            if pos >= 0:
+                combo.setCurrentIndex(pos)
+        combo.blockSignals(False)
+        self.btn_edit_kpi.setEnabled(combo.count() > 0)
+
+    def _on_edit_selected_kpi(self) -> None:
+        index = self.kpi_selector.currentData()
+        if index is not None:
+            self._on_edit_kpi(int(index))
 
     # -- Canvas bridge: geometry -------------------------------------------
 
     def _on_canvas_geometry(self, uid: str, geom: dict) -> None:
         """A card was dragged or resized on the canvas.
 
-        The proposal is merged into the stored map, then the WHOLE arrangement
-        is re-clamped and re-packed before anything is persisted or rendered.
-        That is the point of keeping the authority in Python: the overlay can be
-        wrong, or from a stale document, and the result is still a legal layout.
+        Persist only this object's clamped rectangle. The full geometry map is
+        normalized once before the canvas is first shown; a drag never runs a
+        layout pass that can move a different card.
         """
-        charts = self.bridge.get("charts", [])
-        kpis = self.bridge.get("kpis", [])
-        cols = int(self.bridge.get("grid_cols_n", 2))
-        chart_map, kpi_map = self._current_geometry(charts, kpis, cols)
-
-        # A slicer is its OWN partition, checked before the KPI/chart split.
-        # "slicer:0" is neither a KPI key nor a chart uid, so the old code filed
-        # it in chart_map -- where it failed the "is this chart still here"
-        # filter, never reached _slicer_geom, and vanished on the next render.
-        # The drag looked like it worked (the overlay moved the card) and then
-        # sprang back, which is exactly the reported bug. _current_geometry has
-        # already refreshed self._slicer_geom from the stored blob above, so the
-        # proposal joins THAT map rather than a stale copy of it.
+        # A geometry event patches only the dragged object. Re-running
+        # _current_geometry here can auto-place cards that have no saved
+        # rectangle and makes a slicer drag appear to shuffle unrelated cards.
+        stored = dict(self.bridge.get("tile_geometry", {}) or {})
         slicer_key = _slicer_key(uid)
-        if slicer_key is not None:
-            self._slicer_geom[slicer_key] = tile_geometry.clamp(geom)
-            self._persist_geometry(chart_map, kpi_map, cols)
-            return
-
         kpi_uid = _kpi_key(uid)
-        target = kpi_map if kpi_uid is not None else chart_map
-        # Keyed by the PERSISTED spelling, so a KPI dragged as "kpi:0" lands on
-        # the same tile the exporter and the next render read back.
-        key = kpi_uid if kpi_uid is not None else str(uid)
-        # Stored through the same clamp the exporter uses. NOT int()-coerced:
-        # free-form positions are fractions of the canvas width, so rounding one
-        # to an int would quantise every card's left edge and width to whole
-        # columns -- the grid behaviour all over again, and the reason a dragged
-        # card used to spring back to a cell.
-        target[key] = tile_geometry.clamp(geom)
-
-        # Bridge order follows the visual arrangement, so the chart list, the
-        # reorder buttons and the exported order can never disagree.
-        #
-        # The title card is excluded from that order: it is in chart_map now, so
-        # leaving it in would make the "is every card still here" test fail for
-        # EVERY drag -- no chart is ever renamed to "__title__" -- and the chart
-        # order would silently stop tracking the board the moment the title was
-        # moved.
-        if kpi_uid is None:
-            ordered = {u: g for u, g in chart_map.items() if u != _TITLE_UID}
-            ordered[key] = target[key]
-            order = tile_geometry.visual_order(tile_geometry.clamp_all(ordered))
-            by_uid = {c[0]: c for c in charts}
-            if all(u in by_uid for u in order):
-                wanted = [by_uid[u] for u in order]
-                # Write ONLY when the order actually moved. Emitting
-                # charts_changed re-runs every listener (tab rebuild, geometry
-                # prune, a second scheduled preview build) and it used to fire
-                # on EVERY drag frame -- one of the two rebuilds racing the
-                # drag the user was still performing.
-                if [c[0] for c in wanted] != [c[0] for c in charts]:
-                    self.bridge.set("charts", wanted)
-        # No pack(). Overlap is LEGAL on a free canvas -- a card may be dropped on
-        # top of another, exactly as a window can. Pushing the offender down
-        # instead was what made every drag look like it had been ignored.
-        self._persist_geometry(chart_map, kpi_map, cols)
+        if slicer_key is not None:
+            key = f"slicer:{slicer_key}"
+            self._slicer_geom[slicer_key] = tile_geometry.clamp(geom)
+        elif kpi_uid is not None:
+            key = kpi_uid
+        else:
+            key = str(uid)
+        stored[key] = tile_geometry.clamp(geom)
+        stored[_MODE_KEY] = _FREE_MODE
+        self.bridge.set("tile_geometry", stored)
+        self.bridge.set("grid_cols_n", int(self.bridge.get("grid_cols_n", 2) or 2))
+        # No pack(), global layout pass, or report regeneration. The overlay
+        # already moved the DOM object; the next genuine content render reads
+        # this one-object geometry patch.
+        return
 
     def _on_canvas_notes(self, uid: str, text: str) -> None:
         """Notes edited in place on the canvas; committed on blur.
@@ -1702,12 +2146,13 @@ class DashboardPage(QWidget):
         for role, raw in data.items():
             updated = apply_selection(updated, str(role), raw)
         slicers[idx] = updated
-        self.bridge.set("slicers", slicers)
+        self._write_slicers(slicers)
         self._refresh_slicer_count()
-        # Continuous controls (search box, slider drag) already debounce on
-        # the JS side; the discrete ones are single events. Either way a
-        # selection change is not a drag, so the fast timer is enough.
-        self._schedule_regen()
+        # The loaded report owns the live filter engine. Its change listener
+        # updates only affected ECharts instances and KPI values in-place; a
+        # document rebuild here used to re-filter every recipe, serialize the
+        # full embedded dataset, and reload WebEngine on every selection.
+        # The bridge state above is retained for later save/export/regeneration.
 
     def _on_canvas_action(self, uid: str, action: str) -> None:
         """A per-card button on the canvas was pressed.
@@ -1882,7 +2327,9 @@ class DashboardPage(QWidget):
             QMessageBox.warning(self, "No Data",
                                 "Load a dataset before adding KPIs.")
             return
-        dialog = KpiDialog(df, parent=self)
+        dialog = KpiDialog(
+            df, parent=self,
+            calculation_data=self.bridge.polars_dataset(create_if_missing=False))
         if dialog.exec() != QDialog.Accepted:
             return
         kpi = dialog.result_kpi()
@@ -1913,7 +2360,9 @@ class DashboardPage(QWidget):
             QMessageBox.warning(self, "No Data",
                                 "Load a dataset before editing KPIs.")
             return
-        dialog = KpiDialog(df, parent=self, existing=kpis[index])
+        dialog = KpiDialog(
+            df, parent=self, existing=kpis[index],
+            calculation_data=self.bridge.polars_dataset(create_if_missing=False))
         if dialog.exec() != QDialog.Accepted:
             return
         updated = dialog.result_kpi()
@@ -1971,22 +2420,67 @@ class DashboardPage(QWidget):
             self.bridge.get("charts", []), self.bridge.get("kpis", []), cols)
         a, b = str(i), str(j)
         if a not in kpi_map or b not in kpi_map:
-            self._schedule_regen()
             return
         kpi_map[a], kpi_map[b] = kpi_map[b], kpi_map[a]
-        self._persist_geometry(chart_map, kpi_map, cols)
+        self._persist_geometry(chart_map, kpi_map, cols, regen=False)
 
     # -- Slicer management -------------------------------------------------
 
     def _set_slicers(self, slicers: list) -> None:
-        """Store the slicer list and rebuild the board.
+        """Store definitions, patch supported controls live, then fall back.
 
-        One write plus one debounced regen, exactly as KPIs behave, so editing
-        a slicer is a single visible change rather than a flash per mutation.
+        List and dropdown card changes need no chart rebuild: the embedded
+        worker already owns the data and can derive the new options off the UI
+        thread. Other widgets keep the existing background-render fallback.
         """
-        self.bridge.set("slicers", list(slicers))
+        self._write_slicers(slicers)
         self._refresh_slicer_count()
+        if self._sync_slicers_live():
+            return
         self._schedule_regen()
+
+    @staticmethod
+    def _slicer_signature(slicers: list) -> str:
+        return json.dumps(slicers or [], sort_keys=True, ensure_ascii=False,
+                          separators=(",", ":"), default=str)
+
+    def _write_slicers(self, slicers: list) -> None:
+        """Write local slicer state without triggering a duplicate rebuild."""
+        normalized = list(slicers or [])
+        # SessionBridge notifies the generic state listener for every write.
+        # Record the exact state before publishing it; this prevents a local
+        # control change from being mistaken for an external card edit.
+        self._slicer_state_signature = self._slicer_signature(normalized)
+        self.bridge.set("slicers", normalized)
+
+    def _sync_slicers_live(self) -> bool:
+        """Patch list/dropdown slicers and their filter metadata in place."""
+        if not self.report_canvas.is_ready():
+            return False
+        slicers = list(self.bridge.get("slicers", []) or [])
+        if any(not isinstance(s, dict) or
+               str(s.get("widget") or "list").lower() not in
+               ("list", "dropdown") for s in slicers):
+            return False
+        charts = self.bridge.get("charts", []) or []
+        kpis = self.bridge.get("kpis", []) or []
+        cols = int(self.bridge.get("grid_cols_n", 2) or 2)
+        chart_map, kpi_map = self._current_geometry(charts, kpis, cols)
+        slicer_geometry = dict(getattr(self, "_slicer_geom", {}) or {})
+        self._persist_geometry(chart_map, kpi_map, cols, regen=False)
+        definitions = [dict(s, index=index) for index, s in enumerate(slicers)]
+        definition_json = json.dumps(
+            definitions, ensure_ascii=False, separators=(",", ":"),
+            default=str, allow_nan=False)
+        geometry_json = json.dumps(
+            slicer_geometry, separators=(",", ":"), allow_nan=False)
+        self.report_canvas.run_js(
+            "window.__lytrizeSyncSlicers&&window.__lytrizeSyncSlicers("
+            f"{definition_json},{geometry_json});"
+            "window.__lytrizeUpdateSlicers&&window.__lytrizeUpdateSlicers("
+            f"{definition_json});")
+        self._apply_live_style()
+        return True
 
     def _refresh_slicer_count(self) -> None:
         """Keep the panel's count honest.
@@ -2159,15 +2653,21 @@ class DashboardPage(QWidget):
         slicers = list(self.bridge.get("slicers", []) or [])
         if 0 < index < len(slicers):
             slicers[index - 1], slicers[index] = slicers[index], slicers[index - 1]
-            self._set_slicers(slicers)
+            self._write_slicers(slicers)
             self._swap_slicer_tiles(index - 1, index)
+            self._refresh_slicer_count()
+            if not self._sync_slicers_live():
+                self._schedule_regen()
 
     def _on_move_slicer_down(self, index: int) -> None:
         slicers = list(self.bridge.get("slicers", []) or [])
         if 0 <= index < len(slicers) - 1:
             slicers[index], slicers[index + 1] = slicers[index + 1], slicers[index]
-            self._set_slicers(slicers)
+            self._write_slicers(slicers)
             self._swap_slicer_tiles(index, index + 1)
+            self._refresh_slicer_count()
+            if not self._sync_slicers_live():
+                self._schedule_regen()
 
     def _swap_slicer_tiles(self, i: int, j: int) -> None:
         """Trade the placements of two slicer cards.
@@ -2182,15 +2682,20 @@ class DashboardPage(QWidget):
         chart_map, kpi_map = self._current_geometry(
             self.bridge.get("charts", []), self.bridge.get("kpis", []), cols)
         geom = getattr(self, "_slicer_geom", {}) or {}
-        a, b = str(i), str(j)
-        if a not in geom or b not in geom:
+        # _slicer_geom keys are bare indices ("0", "1", ...) -- the "slicer:"
+        # prefix is added only at persist time (_persist_geometry namespaces
+        # them before writing to the bridge blob). Use bare keys here so the
+        # lookup matches what _current_geometry stored.
+        a_key = str(i)
+        b_key = str(j)
+        if a_key not in geom or b_key not in geom:
             # Not placed yet. auto_place arranges them on this very render, so
             # there is nothing to trade and nothing that could fail.
-            self._persist_geometry(chart_map, kpi_map, cols)
+            self._persist_geometry(chart_map, kpi_map, cols, regen=False)
             return
-        geom[a], geom[b] = geom[b], geom[a]
+        geom[a_key], geom[b_key] = geom[b_key], geom[a_key]
         self._slicer_geom = geom
-        self._persist_geometry(chart_map, kpi_map, cols)
+        self._persist_geometry(chart_map, kpi_map, cols, regen=False)
 
     # -- Slots ---------------------------------------------------------------
 
@@ -2214,7 +2719,8 @@ class DashboardPage(QWidget):
         rebuild a figure.
         """
         meta = self.bridge.get_chart_meta(uid)
-        if not isinstance(meta, dict) or not meta.get("config"):
+        if (not isinstance(meta, dict)
+                or (not meta.get("config") and not meta.get("engine"))):
             return {}
         recipe = dict(meta)
         # Injected, NOT read from meta: analysis_page stores meta as
@@ -2235,48 +2741,44 @@ class DashboardPage(QWidget):
         no longer under the selection -- the most misleading thing a slicer
         could do, and a silent one.
         """
-        import plotly.graph_objects as go
-
-        fig = go.Figure()
-        fig.update_layout(
-            xaxis={"visible": False}, yaxis={"visible": False},
-            annotations=[{"text": "No data<br>for this selection",
-                          "xref": "paper", "yref": "paper",
-                          "showarrow": False,
-                          "font": {"size": 13, "color": "#8b93b5"}}],
-            margin=dict(l=8, r=8, t=8, b=8),
-            height=240, plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-        )
-        return fig
+        from modules.chart_model import make_chart_model
+        return make_chart_model(
+            uid="empty-filter-result", chart_type="categorical",
+            title="No data for this selection",
+            data={"dimensions": [], "series": []},
+            display={"empty_message": "No data for this selection",
+                     "chart_background": "transparent",
+                     "legend": {"show": False}},
+            source={"engine": "polars"})
 
     def _apply_slicers(self, charts: list, slicers: list) -> list:
-        """Re-run only the charts a slicer touches, against the filtered rows.
+        """Re-run the charts the slicers affect, each against its own rows.
 
         Returns the list unchanged when nothing is active, which is the common
         case: a freshly added slicer has nothing ticked, and treating that as
         "match no rows" would blank the board the moment it is created.
 
-        The rebuild is restricted to ``affected_charts`` -- the intersection of
-        slicer columns against the chartspec. Re-running all thirteen analysis
-        types on every click is what would make a slicer feel heavy on a large
-        dataset, and most of that work would be thrown away.
+        ``affected_charts`` decides WHICH charts to rebuild. A report-scoped
+        slicer is universal -- every chart re-runs against the filtered rows
+        (Power BI's model-filter behaviour), even charts that never plot the
+        slicer's column. A chart-scoped slicer rebuilds only its target.
+
+        Each chart is filtered against only the slicers that constrain it
+        (:func:`slicers_for_chart`), so a chart-scoped slicer never leaks into
+        an untargeted chart now that report slicers touch the whole board.
+        ``filter_frames_by_chart`` computes each distinct filter set once, so a
+        report-only board filters the data a single time regardless of chart
+        count.
         """
         from services.chart_service import run_chart_recipe
         from services.slicer_service import (
-            active_slicers, affected_charts, filter_frame,
+            active_slicers, affected_charts, filter_frames_by_chart,
         )
 
         if not charts or not active_slicers(slicers):
             return list(charts)
         df = self.bridge.df
         if df is None or df.empty:
-            return list(charts)
-        try:
-            filtered = filter_frame(df, slicers)
-        except Exception:
-            log.warning("_apply_slicers: filter failed; charts left unfiltered",
-                        exc_info=True)
             return list(charts)
 
         recipes = {c[0]: r for c in charts
@@ -2285,12 +2787,21 @@ class DashboardPage(QWidget):
         if not hit:
             return list(charts)
 
+        try:
+            frames = filter_frames_by_chart(
+                df, slicers, [c[0] for c in charts if c[0] in hit])
+        except Exception:
+            log.warning("_apply_slicers: filter failed; charts left unfiltered",
+                        exc_info=True)
+            return list(charts)
+
         out = []
         for chart in charts:
             uid = chart[0]
             if uid not in hit:
                 out.append(chart)
                 continue
+            filtered = frames.get(uid, df)
             rebuilt = run_chart_recipe(recipes[uid], filtered)
             if rebuilt:
                 # The STORED title is kept: ``rebuilt`` carries the runner's own
@@ -2298,7 +2809,9 @@ class DashboardPage(QWidget):
                 # set in Layout.
                 out.append((uid, chart[1], rebuilt[2], *chart[3:]))
             elif filtered.empty:
-                out.append((uid, chart[1], self._empty_fig(), *chart[3:]))
+                empty = self._empty_fig()
+                empty["uid"] = uid
+                out.append((uid, chart[1], empty, *chart[3:]))
             else:
                 # None means either "no rows" or "recipe could not be rebuilt".
                 # Only the first is a fact about the data. Reporting a fault as
@@ -2363,21 +2876,27 @@ class DashboardPage(QWidget):
         # discarded and the card fell back to auto-place -- a drag that appears
         # to work and then springs back on the next render.
         slicer_geom = dict(getattr(self, "_slicer_geom", {}) or {})
-        # Column-pruned dataset for the in-browser slicer engine of the SAVED
-        # file. Built here because this is the only layer that has the
-        # DataFrame -- build_export_report itself is deliberately headless.
-        # Only worth building when there ARE slicers: without them
-        # generate_html_report emits no engine and would drop the payload
-        # again. Failures degrade to a static export, never an export error.
+        # FULL column-pruned dataset for the in-browser engine of the SAVED
+        # file (no row cap). Built here because this is the only layer that
+        # has the DataFrame -- build_export_report itself is headless.
+        # Always built when a frame exists so the file filters + recomputes
+        # KPIs offline. Failures degrade to a static export, never an error.
         report_payload = None
-        if slicers:
+        if self.bridge.df is not None:
             try:
                 from modules.report_data import build_report_payload
+                # _chart_recipe (not meta_map): payload_columns needs recipes
+                # carrying chart_type + config. Raw meta is {config, layout,
+                # typography} with no chart_type, so chart_spec() on it yields
+                # no filter columns and the file would embed slicer/KPI columns
+                # only -- charts unfiltrable offline.
                 report_payload = build_report_payload(
-                    self.bridge.df, meta_map, slicers)
+                    self.bridge.df,
+                    {uid: self._chart_recipe(uid) for uid, _, _ in charts},
+                    slicers, kpis)
             except Exception:
-                log.debug("report payload not built; exporting without live "
-                          "slicers", exc_info=True)
+                log.debug('report payload not built; static export', exc_info=True)
+                report_payload = None
         return {
             "charts": charts,
             "export_charts": build_export_charts(
@@ -2465,6 +2984,18 @@ class DashboardPage(QWidget):
         self.btn_export.setText("⏳ Working…")
         self.btn_export_png.setText("⏳ Rendering…")
         self._export_format = fmt
+        # Task 1: stash the payload summary for the save dialog's
+        # data-inclusion note (the finish handler only gets html + name).
+        try:
+            _pay = d.get("report_payload") or {}
+            self._export_payload_rows = int(_pay.get("total_rows") or 0)
+            self._export_payload_cols = len(_pay.get("columns") or [])
+            from modules.report_data import payload_json_size
+            self._export_payload_mb = payload_json_size(_pay) / (1024 * 1024)
+        except Exception:
+            self._export_payload_rows = 0
+            self._export_payload_cols = 0
+            self._export_payload_mb = 0.0
         self._export_worker = ExportWorker(
             d["export_charts"], d["session_name"], d["state"],
             orientation=d["orientation"],
@@ -2513,8 +3044,27 @@ class DashboardPage(QWidget):
             return
 
         self._reset_export_buttons()
+        # Task 1: data-inclusion summary. The file embeds the FULL pruned
+        # dataset (user decision 2026-10-19, no row cap), so say how much
+        # data travels with it before the user picks a location.
+        n_rows = int(getattr(self, "_export_payload_rows", 0) or 0)
+        n_cols = int(getattr(self, "_export_payload_cols", 0) or 0)
+        if n_rows and n_cols:
+            try:
+                mb = float(getattr(self, "_export_payload_mb", 0.0) or 0.0)
+                size_note = (f"\n\nThis interactive copy embeds ~{mb:.1f} MB "
+                             f"({n_rows:,} rows × {n_cols} columns).")
+            except Exception:
+                size_note = (f"\n\nThis interactive copy embeds {n_rows:,} rows "
+                             f"× {n_cols} columns.")
+        elif n_rows or n_cols:
+            size_note = "\n\nThis copy embeds session data for offline filtering."
+        else:
+            size_note = ("\n\nStatic copy: no dataset embedded (slicers show "
+                         "snapshots only).")
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Dashboard", str(Path.home() / f"{safe_file}.html"),
+            self, "Save Dashboard" + size_note,
+            str(Path.home() / f"{safe_file}.html"),
             "HTML Files (*.html)",
         )
         if not file_path:
@@ -2571,17 +3121,6 @@ class DashboardPage(QWidget):
         # Keep references alive on self -- a local variable view/timer would
         # get garbage-collected before the async load/render finishes.
         self._png_render_view = QWebEngineView()
-        # Same reason as the other chart views: a map chart in the dashboard
-        # needs a remote basemap style, which Qt WebEngine refuses to load for
-        # a local (file://) document unless told otherwise. Set before load, and
-        # on this view specifically -- it is a separate page from the report
-        # canvas, so it does not inherit those settings.
-        try:
-            from desktop.widgets.plotly_web_view import enable_remote_content_access
-            enable_remote_content_access(self._png_render_view.page())
-        except Exception:
-            log.debug("could not enable remote content for the PNG export "
-                      "view; map charts may export blank", exc_info=True)
         # CRITICAL, confirmed by direct testing: a QWebEngineView that is
         # never shown never actually produces rendered frames for grab()
         # to capture, even after loadFinished fires and JS executes
@@ -2626,31 +3165,16 @@ class DashboardPage(QWidget):
         self._png_render_view.loadFinished.connect(on_load_finished)
         self._png_render_view.load(QUrl.fromLocalFile(str(html_path)))
     # One-shot JS predicate run against the offscreen export page. Returns
-    # "wait" until every chart has been laid out, the slicer engine has
-    # drained its recompute queue, and every MapLibre canvas has a
-    # device-resolution backing store; "ok:<maps>" once ready, where <maps>
-    # is how many map canvases were seen (used to give tiles a little longer
-    # to blit before the grab). A stale canvas triggers ONE window-resize
-    # nudge (MapLibre only re-measures on that event) and reports "wait" so
-    # the next poll can confirm it. Any JS error degrades to "ok" so a
-    # broken probe can never block the export forever.
+    # "wait" until ECharts has initialized and sized every chart before PNG
+    # capture. The data and map boundaries are local and do not need tiles.
     _PNG_SETTLE_JS = (
         "(function(){try{"
-        "if(!window.Plotly){return 'wait';}"
-        "if((window.__lyPending||0)>0){return 'wait';}"
-        "var ps=document.querySelectorAll('.js-plotly-plot');"
-        "for(var i=0;i<ps.length;i++){var p=ps[i];"
-        "if(!p._fullLayout||p._transitioning){return 'wait';}}"
-        "var dpr=window.devicePixelRatio||1,fixed=false,maps=0;"
-        "var cs=document.querySelectorAll("
-        "'canvas.maplibregl-canvas,canvas.mapboxgl-canvas');"
-        "for(var j=0;j<cs.length;j++){maps++;var c=cs[j];"
-        "var w=c.clientWidth,h=c.clientHeight;if(!w||!h){continue;}"
-        "if(Math.abs(c.width-Math.round(w*dpr))>2||"
-        "Math.abs(c.height-Math.round(h*dpr))>2){"
-        "if(!fixed){window.dispatchEvent(new Event('resize'));fixed=true;}}}"
-        "if(fixed){return 'wait';}"
-        "return 'ok:'+maps;"
+        "if(!window.echarts){return 'wait';}"
+        "var rs=document.querySelectorAll('.chart'),ready=0;"
+        "for(var i=0;i<rs.length;i++){var c=echarts.getInstanceByDom(rs[i]);"
+        "if(!c||!rs[i].clientWidth||!rs[i].clientHeight){return 'wait';}"
+        "c.resize();ready++;}"
+        "return 'ok:'+ready;"
         "}catch(e){return 'ok:0';}})()"
     )
 
@@ -2756,10 +3280,12 @@ class DashboardPage(QWidget):
         charts = self.bridge.get("charts", [])
         if not charts:
             QMessageBox.warning(self, "No Charts", "No charts to save.")
+            return
 
         user_id = self.bridge.get("user_id")
         if not user_id:
             QMessageBox.warning(self, "No User", "No user session found.")
+            return
 
         session_name = self.session_name.text().strip() or "Lytrize Session"
         dash_title = self.dash_title.text().strip()
@@ -2808,7 +3334,16 @@ class DashboardPage(QWidget):
         # before KPIs were tiles still round-trips untouched.
         chart_geom, kpi_geom = self._current_geometry(
             charts, self.bridge.get("kpis", []), grid_cols_n)
-        grid_fullwidth_json = json.dumps({**chart_geom, **kpi_geom})
+        # Persist the entire free-canvas arrangement, including slicers and
+        # the mode marker. Omitting the marker caused fractional x/w values to
+        # be interpreted as legacy integer grid cells on restore; omitting the
+        # slicer map made slicers jump back to their default positions.
+        slicer_geom = dict(getattr(self, "_slicer_geom", {}) or {})
+        grid_fullwidth_json = json.dumps({
+            **chart_geom, **kpi_geom,
+            **{f"slicer:{key}": value for key, value in slicer_geom.items()},
+            _MODE_KEY: _FREE_MODE,
+        }, allow_nan=False)
         # The 23-key style dict (colors, typography, layout density from
         # the dashboard style panel) was being read/applied correctly
         # during a live session but never persisted at all -- the DB
@@ -2827,6 +3362,14 @@ class DashboardPage(QWidget):
         # deliberate user override on the next load, so the dashboard would
         # stick to light colours after switching back to dark.
         export_colours_json = json.dumps(self._export_style_dict())
+        # The whole-package bundle: persist the DataFrame + slicer definitions
+        # alongside the charts, so a session reopened after the app is closed
+        # has its data back and its slicers work -- the reported "session gets
+        # cleaned / can't filter after reopen" bug. Best-effort: a failure here
+        # still saves the session (the pre-bundle behaviour), never the reverse.
+        from services.session_bundle import save_dataset
+        dataset_hash, dataset_uri = save_dataset(df)
+        slicers_json = json.dumps(list(self.bridge.get("slicers", []) or []))
         try:
             if editing_sid:
                 # Update existing session.
@@ -2860,6 +3403,9 @@ class DashboardPage(QWidget):
                     grid_cols_n=grid_cols_n,
                     grid_fullwidth_json=grid_fullwidth_json,
                     export_colours_json=export_colours_json,
+                    dataset_uri=dataset_uri,
+                    dataset_hash=dataset_hash,
+                    slicers_json=slicers_json,
                 )
                 clear_draft(user_id)
                 invalidate_sessions_cache()
@@ -2885,6 +3431,9 @@ class DashboardPage(QWidget):
                     grid_cols_n=grid_cols_n,
                     grid_fullwidth_json=grid_fullwidth_json,
                     export_colours_json=export_colours_json,
+                    dataset_uri=dataset_uri,
+                    dataset_hash=dataset_hash,
+                    slicers_json=slicers_json,
                 )
                 clear_draft(user_id)
                 invalidate_sessions_cache()
@@ -2894,19 +3443,25 @@ class DashboardPage(QWidget):
             log.error("Save failed: %s", exc)
             QMessageBox.critical(self, "Save Error", str(exc))
 
-    def _on_bridge_state_changed(self, key: str, _value) -> None:
+    def _on_bridge_state_changed(self, key: str, value) -> None:
         """A state key changed somewhere other than this page.
 
         The per-chart slicer entry on the Analysis page writes
         ``bridge.set("slicers", ...)``; this board is a different page, so it
-        listens for that key and rebuilds -- otherwise the new slicer would
-        only surface on the next unrelated regen.
+        listens for that key and patches/rebuilds only when an external change
+        actually altered slicer state. Local filter selections already update
+        the worker and must never trigger a report rebuild.
         """
         if str(key) != "slicers":
             return
+        signature = self._slicer_signature(value or [])
+        if signature == self._slicer_state_signature:
+            return
+        self._slicer_state_signature = signature
         try:
             self._refresh_slicer_count()
-            self._schedule_regen()
+            if not self._sync_slicers_live():
+                self._schedule_regen()
         except Exception:
             log.debug("slicer state refresh failed", exc_info=True)
 
@@ -2929,6 +3484,7 @@ class DashboardPage(QWidget):
         """
         charts = self.bridge.get("charts", [])
         cols = int(self.bridge.get("grid_cols_n", 2))
+        self._refresh_chart_image_targets()
 
         # Drop geometry for charts that are gone. Otherwise a restored
         # arrangement naming a deleted chart keeps contributing cells and gets
@@ -2944,8 +3500,23 @@ class DashboardPage(QWidget):
         # The free-canvas mode marker is preserved: it is not a chart or KPI
         # tile, but dropping it here would make the next _current_geometry treat
         # the board as a marker-less legacy blob and re-run the grid heuristic.
+        # Slicer tiles are preserved too: "slicer:0" matches neither a chart
+        # uid nor a KPI key, so the old filter deleted the slicer's placement
+        # on EVERY prune -- and prune runs on every _refresh_charts. The next
+        # render then auto-placed the slicer back at its default slot, which
+        # is the "slicer won't stay where I put it" report. Slicer list
+        # membership is owned by the slicer handlers, not by this pruner.
+        #
+        # The title band is preserved for the SAME reason. It is not a chart
+        # (its key is the reserved __title__), so the old filter dropped it on
+        # every prune; the next _current_geometry then took ensure_title_band's
+        # "first board" branch and shifted EVERY card down by one title band +
+        # gap. That is the "a card I put at the top jumps back down every time I
+        # open its settings and come back" report -- the board visibly sank a
+        # row on each edit round-trip.
         keep = {u: g for u, g in stored.items() if u in set(chart_uids)
-                or _is_kpi_key(u) or u == _MODE_KEY}
+                or _is_kpi_key(u) or _is_slicer_key(u)
+                or u == _MODE_KEY or u == _TITLE_UID}
         if keep != stored:
             self.bridge.set("tile_geometry", keep)
 
@@ -3097,6 +3668,52 @@ class DashboardPage(QWidget):
                         self.preset_gallery.select(saved_preset)
                     else:
                         self.preset_gallery.clear()
+
+                    # The whole-package restore: reload the DataFrame and the
+                    # slicers so the reopened board is LIVE, not just pictures.
+                    # Without this a session reopened after the app closed had
+                    # figures but no data behind them, so every slicer was dead
+                    # -- the reported "session gets cleaned / can't filter"
+                    # bug. Best-effort: if the bundle is missing we still show
+                    # the stored figures (the pre-bundle behaviour).
+                    try:
+                        from services.session_bundle import load_dataset
+                        restored_df = load_dataset(sm.get("dataset_uri", ""))
+                        if restored_df is not None and len(restored_df):
+                            self.bridge.set_df(restored_df)
+                            self.data_notice.setVisible(False)
+                            self.btn_reupload.setVisible(False)
+                        else:
+                            # Task 3: the session's data is gone (deleted
+                            # parquet, moved profile, pre-bundle row). The
+                            # stored figures still paint, but every slicer is
+                            # dead and KPI/chart edits cannot recompute --
+                            # say so and offer the re-upload path.
+                            self.data_notice.setText(
+                                "⚠️ This session's dataset is missing, so the "
+                                "board is view-only: slicers won't filter and "
+                                "edits can't recompute. Re-upload the dataset "
+                                "to make it live again.")
+                            self.data_notice.setVisible(True)
+                            self.btn_reupload.setVisible(True)
+                    except Exception:
+                        log.debug("session bundle dataset restore failed",
+                                  exc_info=True)
+                        self.data_notice.setText(
+                            "⚠️ This session's dataset couldn't be loaded -- "
+                            "view-only. Re-upload the dataset to restore "
+                            "filtering.")
+                        self.data_notice.setVisible(True)
+                        self.btn_reupload.setVisible(True)
+                    try:
+                        from services.slicer_service import normalise_all
+                        self.bridge.set(
+                            "slicers",
+                            normalise_all(json.loads(sm.get("slicers_json", "[]"))),
+                        )
+                    except Exception:
+                        log.debug("session bundle slicer restore failed",
+                                  exc_info=True)
         else:
             # Not viewing saved — use current session state
             editing_name = self.bridge.get("editing_session_name")
@@ -3106,6 +3723,9 @@ class DashboardPage(QWidget):
                 self.session_name.setText(
                     self.bridge.get("file_name", "Analysis Session")
                 )
+            # Leaving a saved session clears its missing-data notice too.
+            self.data_notice.setVisible(False)
+            self.btn_reupload.setVisible(False)
         self._refresh_charts()
         self._refresh_kpis()
         # Navigating to the page must show the real count: a draft restored in

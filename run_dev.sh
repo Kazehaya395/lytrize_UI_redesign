@@ -28,20 +28,8 @@ if [ -d "venv" ] && [ -x "venv/bin/python" ]; then
 else
     # Check if required packages are installed
     echo "Checking dependencies..."
-    if ! python3 -c "import PySide6" 2>/dev/null; then
-        echo "ERROR: PySide6 not found. Please install dependencies first:"
-        echo ""
-        echo "  python3 -m pip install --user \\"
-        echo "      pandas>=2.2.0,<3.0.0 \\"
-        echo "      plotly>=5.22.0,<6.0.0 \\"
-        echo "      openpyxl>=3.1.0,<4.0.0 \\"
-        echo "      scipy>=1.12.0,<2.0.0 \\"
-        echo "      statsmodels>=0.14.0,<0.15.0 \\"
-        echo "      pycountry>=23.12.11,<25.0.0 \\"
-        echo "      PySide6>=6.11.0,<7.0.0 \\"
-        echo "      PySide6-Addons>=6.11.0,<7.0.0"
-        echo ""
-        echo "Or install from requirements.txt:"
+    if ! python3 -c "import PySide6, numpy, pandas, polars, pyarrow, scipy, openpyxl" 2>/dev/null; then
+        echo "ERROR: One or more Lytrize dependencies are missing. Install them with:"
         echo "  python3 -m pip install --user -r requirements.txt"
         exit 1
     fi

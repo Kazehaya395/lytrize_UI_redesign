@@ -33,7 +33,7 @@ column, in the same order the old popover listed them. The old "Advanced" is
 not a Qt concept.
 """
 from __future__ import annotations
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QComboBox, QSpinBox
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QComboBox, QSpinBox, QCheckBox
 from .base import (hint_label, cap_widget, color_swatch, slider_with_readout,
                    page_root, section_box, grid_row, FlowGrid, GEN_W, HINT_GAP)
 from .statistical import StatisticalSettings, NONE_SENTINEL
@@ -68,7 +68,8 @@ class PieChartSettings(StatisticalSettings):
                          'sort': PIE_SORTS[0], 'top_n': 0, 'palette': None}
         for attr in ('_combo_dim', '_combo_metric', '_combo_agg', '_combo_sort',
                      '_combo_palette', '_spin_topn', '_cb_textinfo', '_cb_pdir',
-                     '_dh_spin', '_pl_spin', '_pr_spin', '_pvs_spin', '_sw_pvc'):
+                     '_dh_spin', '_cb_center_total', '_pl_spin', '_pr_spin',
+                     '_pvs_spin', '_sw_pvc'):
             if not hasattr(self, attr):
                 setattr(self, attr, None)
 
@@ -254,9 +255,20 @@ class PieChartSettings(StatisticalSettings):
         try:
             self._dh_spin.valueChanged.connect(
                 lambda v: self._set_layout(donut_hole=float(v)))
+            self._dh_spin.valueChanged.connect(self._sync_center_total_enabled)
         except Exception:
             pass
         self._add_option_row(root, grid_row('Donut', dh))
+
+        self._cb_center_total = QCheckBox('Show metric total in centre')
+        self._cb_center_total.setChecked(
+            bool(self._layout_opts.get('donut_center_total', False)))
+        self._cb_center_total.setToolTip(
+            'Show the sum of the visible pie slices inside the donut hole.')
+        self._cb_center_total.toggled.connect(
+            lambda checked: self._set_layout(donut_center_total=bool(checked)))
+        self._add_option_row(root, grid_row('Centre total', self._cb_center_total))
+        self._sync_center_total_enabled()
 
         # -- The five options that sat behind the old "Advanced" popover -----
         pl = slider_with_readout(0.0, 0.5,
@@ -301,6 +313,17 @@ class PieChartSettings(StatisticalSettings):
             str(self._layout_opts.get("pie_value_color", "#e2e8f0")),
             lambda c: self._set_layout(pie_value_color=c))
         self._add_option_row(root, grid_row('Value color', self._sw_pvc))
+
+    def _sync_center_total_enabled(self, *_args):
+        """Only offer the center-total toggle while the chart has a hole."""
+        checkbox = getattr(self, '_cb_center_total', None)
+        spin = getattr(self, '_dh_spin', None)
+        if checkbox is None or spin is None:
+            return
+        try:
+            checkbox.setEnabled(float(spin.value()) > 0)
+        except (TypeError, ValueError):
+            checkbox.setEnabled(False)
 
     def build_layout(self):
         """The shared Layout tab plus the pie-only rows, minus the bar rows."""

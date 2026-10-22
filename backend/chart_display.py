@@ -90,7 +90,7 @@ def installed_font_families() -> set:
 def font_is_available(name: str) -> bool:
     """True when *name* can really be drawn: bundled by the app, or installed.
 
-    A family the app ships in ``app_assets/fonts`` counts as available even
+    A family the app ships in ``backend/assets/fonts`` counts as available even
     though fontconfig has never heard of it -- it is registered with Qt at
     startup and offered to the chart shell as @font-face, so it renders
     without any system package being installed.
@@ -123,7 +123,7 @@ def available_fonts(prefer: Optional[Iterable[str]] = None) -> list:
 
     Order of authority:
 
-    1. **Bundled** fonts (``app_assets/fonts``, registered at startup) always
+    1. **Bundled** fonts (``backend/assets/fonts``, registered at startup) always
        qualify -- the app ships them, so they work on any machine.
     2. **System** families that fontconfig can resolve are also offered, so a
        user who has installed extra fonts still sees them.
@@ -213,9 +213,33 @@ _LEGEND_ANCHORS = {
 LEGEND_STRIP = 0.26
 LEGEND_STRIP_MIN = 0.20
 LEGEND_STRIP_MAX = 0.50
-# Extra outer margin on the legend's side, so the y-axis title has somewhere
-# to live that is NOT the legend's column.
+# A domain figure (pie/donut/treemap/sunburst/funnel) has no axes, so the
+# legend plate is the ONLY thing sharing the reserved strip. The shared
+# ``LEGEND_STRIP_MAX`` cap can therefore leave the strip narrower than the
+# plate on a compact tile with long labels (a 380px card, ten categories),
+# which parks the plate back over the marks. For a domain figure the strip is
+# allowed to grow a little further -- the pie simply takes a smaller box, it
+# is never crushed to nothing the way a cartesian plot's width would be -- so
+# the plate always fits beside it instead of on top of it.
+LEGEND_STRIP_MAX_DOMAIN = 0.62
+# Breathing room kept between a domain figure's marks and its legend plate, in
+# pixels, when the strip has to be widened to hold the plate (see
+# ``reserve_legend_column``). Without it the plate sits flush against the
+# pie's box edge, which reads as touching.
+_LEGEND_DOMAIN_GAP_PX = 10
+# Belt-and-braces outer margin floor on the legend's side.  The strip
+# reservation already carves the tick labels and axis title out of the PLOT
+# AREA (they are drawn inside the strip), so this margin is no longer the only
+# thing keeping them off the card edge -- but it is kept as a floor so a
+# stripped-down saved layout can never crush the outer chrome to nothing.
 LEGEND_AXIS_MARGIN = 72
+# A pie/donut/treemap/sunburst draws NO axes, so nothing competes for the
+# outer margin on the legend's side.  Widening it to LEGEND_AXIS_MARGIN there
+# leaves a dead slab at the card edge AND -- because the domain fraction
+# resolves against the card minus margins -- shrinks the box the pie is sized
+# from, which is half of the "oversized legend strip + tiny pie" pair on the
+# dashboard.  Domain-only figures get breathing room instead.
+LEGEND_AXIS_MARGIN_DOMAIN = 12
 # The reserved column has to hold the legend box AND, on the left, the y-axis
 # tick labels -- those are drawn just outside the axis, i.e. at the RIGHT edge
 # of the column, so a column sized for the box alone leaves the labels under
@@ -262,9 +286,149 @@ LEGEND_COLUMN_MAX_SHARE = 0.34
 # fits inside the band that was reserved for it.
 _LEGEND_ROW_PX = 22
 _LEGEND_BAND_GAP_PX = 10
-# Cap on how much vertical space a horizontal band may claim. Past this the
-# plot area stops being worth protecting, so the column is used instead.
+# Cap on how much vertical space a horizontal band may claim on a SIDE dock
+# (Top/Bottom Left/Right).  Past this the plot area stops being worth
+# protecting, so the reservation is capped -- a side dock always has a column to
+# fall back to, so an over-tall band is never the answer there.  A share of the
+# PLOT-AREA height (card minus the top/bottom margins), not the card height.
+# Centred positions are handled separately in ``reserve_legend_band`` (they have
+# no column to fall back to, so their band is reserved in full).
 LEGEND_BAND_MAX_SHARE = 0.30
+
+# ---------------------------------------------------------------------------
+# Card-aware type scaling.
+#
+# A dashboard tile can be handed anything from a ~300px sliver to a ~1900px
+# full-width card, but the legend / slice-label sizes are absolute pixels
+# (11px by default). Pinned at 11px, a Horizontal legend on a narrow card has
+# nowhere to shrink: it wraps to two rows and collides with itself (the "I set
+# legends horizontal but they don't stay horizontal unless I widen the card"
+# report), and on a small card the outside slice labels + legend text simply
+# overflow the shrunken plot (the "resize the card small and the legend/label
+# text doesn't adjust" report). Power BI scales the type with the visual.
+#
+# Both reports are HORIZONTAL-fit problems -- a legend row wraps on width, and
+# an outside slice label runs off the plot's width -- so the factor is derived
+# from the card WIDTH. It is clamped so it only ever SHRINKS text on a narrow
+# card and never grows it: the factor is 1.0 at or above ``_TYPE_SCALE_FULL_PX``
+# (so a full-width card, and every half-card and up, keep the exact size the
+# user chose -- the wide-card look is unchanged) and falls to
+# ``_TYPE_SCALE_MIN`` at ``_TYPE_SCALE_MIN_PX`` and below.
+_TYPE_SCALE_FULL_PX = 640
+_TYPE_SCALE_MIN_PX = 300
+_TYPE_SCALE_MIN = 0.72
+
+
+def _type_scale(width_px=None, height_px=None):
+    """Font-size multiplier for the card, in [ ``_TYPE_SCALE_MIN``, 1.0 ].
+
+    Derived from the card WIDTH (the binding constraint on a wrapped legend row
+    and on an outside slice label). Returns 1.0 when no width is known, so
+    headless callers / export keep their exact, un-scaled sizes, and for any
+    card at least ``_TYPE_SCALE_FULL_PX`` wide.
+    """
+    try:
+        w = float(width_px or 0)
+    except Exception:
+        return 1.0
+    if w <= 0:
+        return 1.0
+    if w >= _TYPE_SCALE_FULL_PX:
+        return 1.0
+    if w <= _TYPE_SCALE_MIN_PX:
+        return _TYPE_SCALE_MIN
+    # Linear in the card width between the two anchors.
+    span = float(_TYPE_SCALE_FULL_PX - _TYPE_SCALE_MIN_PX)
+    frac = (w - _TYPE_SCALE_MIN_PX) / span
+    return _TYPE_SCALE_MIN + (1.0 - _TYPE_SCALE_MIN) * frac
+
+
+def _scale_size(size, factor):
+    """Scale one font size by *factor*, rounded and floored at a legible 7px.
+
+    A missing size (``None``) is passed through untouched so a caller that
+    never set one keeps Plotly's own default.
+    """
+    if size is None:
+        return None
+    try:
+        v = float(size) * float(factor)
+    except Exception:
+        return size
+    return int(max(7, round(v)))
+
+
+# Floor for the horizontal-legend fit shrink (see ``_horizontal_fit_scale``).
+# A legend may shrink well below the card-scale floor to stay on ONE row --
+# that is the whole point of choosing "Horizontal". 0.52 was measured against
+# a ~630px dashboard tile carrying nine long category names plus a legend
+# title: at the old 0.70 floor the row still wrapped (the "not horizontal
+# single row" report) and the wrapped rows sat on the pie's outside slice
+# labels. The JS re-reserve pass in ``modules.export`` mirrors this floor.
+_HLEGEND_FIT_MIN = 0.52
+
+
+def _horizontal_fit_scale(names, fig, width_px, legend_title=""):
+    """Font factor that makes a HORIZONTAL legend fit on a single row.
+
+    A horizontal legend lays its entries left-to-right and wraps; at the default
+    size a nine-entry legend with long category names overflows one row, wraps
+    to two, and (with the band reserved for the wrapped height) the rows collide
+    -- the "I set legends horizontal but they only stay horizontal if I widen
+    the card" report.  The user's intent in picking Horizontal is ONE row, so
+    the font is shrunk until the entries fit the plot width on one row.
+
+    The measurement covers the whole row: every entry PLUS the legend title
+    (which sits inline in the same row), sized at the font actually drawn
+    (``_LEGEND_CHAR_PX`` was measured at 12px, so other sizes scale it).
+
+    Returns a factor in [ ``_HLEGEND_FIT_MIN``, 1.0 ]: 1.0 when the entries
+    already fit (or there is no width / no text to measure), down to the floor
+    when they never quite fit (in which case the legend wraps, but the band is
+    reserved for the wrapped rows so they never overlap).
+    """
+    items = [str(n) for n in (names or []) if str(n or "").strip()]
+    try:
+        w = float(width_px or 0)
+    except Exception:
+        w = 0.0
+    if not items or w <= 0:
+        return 1.0
+    try:
+        m = fig.layout.margin.to_plotly_json() or {}
+    except Exception:
+        m = {}
+    avail = max(80.0, w - _margin_px(m, "l") - _margin_px(m, "r"))
+    n = len(items)
+    # Include Plotly's item padding as well as the colour swatch. The previous
+    # 24px allowance was optimistic for compact legends and selected a band
+    # that then wrapped in the actual renderer.
+    fixed = 32.0 * n
+    # The title rides on the same row, to the left of the entries, so it costs
+    # width too -- a 21-character title is ~170px of the row at 13px.
+    text = sum(len(x) for x in items) + len(str(legend_title or ""))
+    if text <= 0:
+        return 1.0
+    # Per-character width tracks the font that will actually be drawn.
+    try:
+        meta = fig.layout.meta if isinstance(fig.layout.meta, dict) else {}
+        fsize = float(meta.get("lytrize_base_legend_font")
+                       or fig.layout.legend.font.size or 12)
+    except Exception:
+        fsize = 12.0
+    char_px = max(9.0, _LEGEND_CHAR_PX) * max(0.5, fsize / 12.0)
+    # Need: fixed + (char_px * s) * text <= avail  ->  s <= (avail-fixed)/(char*text)
+    room = avail - fixed
+    if room <= 0:
+        return _HLEGEND_FIT_MIN
+    fit = room / (char_px * text)
+    return max(_HLEGEND_FIT_MIN, min(1.0, fit))
+
+
+
+
+
+
 
 
 def _legend_need_px(names, legend_title="", side="left", axis_px=None):
@@ -279,10 +443,7 @@ def _legend_need_px(names, legend_title="", side="left", axis_px=None):
     function only sees label strings, not the axes they are competing with.
     When it is not supplied the flat fallback constants apply.
     """
-    longest = 0
-    for n in list(names or []) + ([legend_title] if legend_title else []):
-        longest = max(longest, len(str(n)))
-    need = _LEGEND_CHROME_PX + _LEGEND_CHAR_PX * longest
+    need = _legend_plate_px(names, legend_title)
     if axis_px is None:
         # No figure to measure: keep the historic allowance on the left, and
         # still give the right a gap so a secondary axis is never painted over.
@@ -290,6 +451,43 @@ def _legend_need_px(names, legend_title="", side="left", axis_px=None):
     else:
         need += max(0, int(axis_px))
     return need
+
+
+def _legend_plate_px(names, legend_title=""):
+    """Estimated pixel width of the legend PLATE itself, without axis furniture.
+
+    Kept separate from ``_legend_need_px`` because the anchor clamp in
+    ``reserve_legend_column`` needs the plate's own width (how far it extends
+    from its anchor), not the width of the whole reserved column.
+    """
+    longest = 0
+    for n in list(names or []) + ([legend_title] if legend_title else []):
+        longest = max(longest, len(str(n)))
+    return _LEGEND_CHROME_PX + _LEGEND_CHAR_PX * longest
+
+
+def _legend_side_margin(fig, default=LEGEND_AXIS_MARGIN):
+    """Outer-margin floor for the legend's side of *fig*.
+
+    Axis-bearing charts need the wide floor (``LEGEND_AXIS_MARGIN``) because
+    the tick labels and the rotated axis title share the legend's strip.  A
+    domain-only figure (pie/donut/treemap/sunburst) draws no axes at all, so
+    that width is dead space that also shrinks the plot box the pie is sized
+    from -- it gets the narrow breathing-room floor instead.  Both the area
+    probe in ``plan_legend_layout`` and the margin write in
+    ``reserve_legend_column`` go through this, so the strip fraction is always
+    resolved against the same margins that are actually written.
+    """
+    try:
+        doms = _domain_traces(fig)
+    except Exception:
+        doms = []
+    if doms:
+        data = list(getattr(fig, "data", None) or [])
+        # Domain-only: every trace sizes itself from its own domain box.
+        if len(doms) >= len(data):
+            return float(min(float(default), LEGEND_AXIS_MARGIN_DOMAIN))
+    return float(default)
 
 
 def _legend_strip(names, legend_title="", side="left", width_px=None,
@@ -371,18 +569,80 @@ def legend_anchor(legend_position):
 _LEGEND_BAND_REF_HEIGHT = 400
 
 
-def _band_plan(fig, names, legend_title, edge, side, axis_px):
+def _legend_wrap_rows(names, legend_title, fig, width_px, type_scale=1.0):
+    """How many ROWS a horizontal legend wraps into at this card width.
+
+    A horizontal legend lays its items left-to-right and WRAPS, so the height
+    it actually occupies is the number of wrapped rows -- NOT the item count.
+    Sizing the band from ``len(names)`` (the old worst case) both over-reserved
+    on a wide card and, once the result was clamped, still under-reserved on a
+    narrow one; that under-reservation is what let the plate spill onto a
+    centred pie/donut.  Measuring the wrap against the real width gives the
+    height the legend will really take, so the reserved band matches it.
+
+    ``type_scale`` shrinks the per-character width to match a smaller legend
+    font (see ``_type_scale``), so the row count reflects the text that is
+    actually drawn -- a smaller font fits more items per row and the band is
+    not over-reserved for rows that no longer exist.
+    """
+    items = [str(n) for n in (names or []) if str(n or "").strip()]
+    if not items:
+        return 1
+    try:
+        w = float(width_px or 0)
+    except Exception:
+        w = 0.0
+    if w <= 0:
+        # No width to wrap against: keep the safe worst case (one item per
+        # row) so a headless caller never under-reserves and overlaps.
+        return len(items)
+    # The row wraps within the plot area's horizontal extent -- the card width
+    # minus the outer margins the legend is drawn between.
+    try:
+        m = fig.layout.margin.to_plotly_json() or {}
+    except Exception:
+        m = {}
+    avail = max(80.0, w - _margin_px(m, "l") - _margin_px(m, "r"))
+    # This function only describes HORIZONTAL bands, so the single-row fit
+    # shrink is part of the measurement: when ``_horizontal_fit_scale`` will
+    # pull the font down to make one row, the wrap is computed against THAT
+    # text width and the band is reserved for one row, not the wrapped count
+    # the unscaled font would have needed.
+    fit = _horizontal_fit_scale(items, fig, width_px, legend_title)
+    try:
+        char_px = _LEGEND_CHAR_PX * float(type_scale or 1.0) * fit
+    except Exception:
+        char_px = _LEGEND_CHAR_PX * fit
+    total = 0.0
+    for n in items:
+        # swatch + gap + text (per-character width from _LEGEND_CHAR_PX).
+        total += 24 + char_px * len(n)
+    rows = int(-(-total // avail))  # ceil, without importing math
+    return max(1, rows)
+
+
+def _band_plan(fig, names, legend_title, edge, side, axis_px, width_px=None,
+               type_scale=1.0):
     """Describe the horizontal-band layout for a legend.
 
-    Band height follows the ITEM COUNT -- the items now sit side by side, so a
-    long series name costs width, not height -- plus a row for the legend
-    title when one is set. ``edge`` is "top" or "bottom"; "middle" (the Left /
-    Right docks) has no band to reserve and falls back to a plain column.
+    Band height follows the WRAPPED ROW COUNT -- the items sit side by side and
+    wrap, so a long series name costs width, not height -- plus a row for the
+    legend title when one is set. ``edge`` is "top" or "bottom"; "middle" (the
+    Left / Right docks) has no band to reserve and falls back to a plain column.
+
+    ``type_scale`` is the card's font factor (see ``_type_scale``); it scales
+    both the row height and the per-character wrap width so the band matches
+    the smaller text actually drawn on a compact card.
     """
-    rows = max(1, len([n for n in (names or []) if str(n or "").strip()]))
-    band_px = rows * _LEGEND_ROW_PX + _LEGEND_BAND_GAP_PX
+    rows = _legend_wrap_rows(names, legend_title, fig, width_px,
+                             type_scale=type_scale)
+    try:
+        row_px = _LEGEND_ROW_PX * float(type_scale or 1.0)
+    except Exception:
+        row_px = _LEGEND_ROW_PX
+    band_px = rows * row_px + _LEGEND_BAND_GAP_PX
     if legend_title:
-        band_px += _LEGEND_ROW_PX
+        band_px += row_px
     return {"mode": "band", "side": side, "top": edge == "top",
             "band_px": band_px, "rows": rows,
             "need_px": _legend_need_px(names, legend_title, side or "right",
@@ -390,7 +650,8 @@ def _band_plan(fig, names, legend_title, edge, side, axis_px):
 
 
 def plan_legend_layout(fig, legend_position, names=None, legend_title="",
-                       width_px=None):
+                       width_px=None, legend_orientation="Auto",
+                       type_scale=1.0):
     """Decide HOW the legend is laid out for the pixels this card really has.
 
     Returns a dict describing the plan, or None when the position is unknown:
@@ -410,6 +671,14 @@ def plan_legend_layout(fig, legend_position, names=None, legend_title="",
     should adjust as per the viewport area" asks for. With no ``width_px``
     there is nothing to adapt to, so the column is kept and every headless
     caller (export, background generation) keeps its current output.
+
+    ``legend_orientation`` lets the user's explicit Auto / Vertical /
+    Horizontal choice WIN over that pixel heuristic: "Horizontal" on a corner
+    (Top/Bottom Left/Right) must be a top/bottom band, and "Vertical" must be
+    a side column. Without it a later orientation pass would flip a horizontal
+    row into the side strip a column reserved (or the reverse) and the items
+    would land on the axis -- the "horizontal legend overlaps" report. "Auto"
+    (the default) keeps the pixel-based decision.
     """
     place = legend_anchor(legend_position)
     if not place:
@@ -417,9 +686,41 @@ def plan_legend_layout(fig, legend_position, names=None, legend_title="",
     side = place["side"]
     edge = place["edge"]
     if not side:
-        # A centred Top/Bottom legend has no side strip to reserve; it always
-        # uses a horizontal band so the plot keeps its full width.
-        return _band_plan(fig, names, legend_title, edge, side, None)
+        # A centered Top/Bottom legend normally uses a horizontal band. If a
+        # requested one-row legend cannot fit at a readable size, move it to a
+        # right-side column instead of letting Plotly wrap it over the pie.
+        # Keep the requested position in metadata so a later resize can switch
+        # back to the band when there is room again.
+        orient = str(legend_orientation or "Auto").strip().lower()
+        if orient == "vertical":
+            axis_px = _legend_axis_need_px(fig, "right")
+            area = _plot_area_width(fig.layout.margin.to_plotly_json() or {},
+                                    width_px)
+            return {"mode": "column", "side": "right", "effective_position": "Right",
+                    "need_px": _legend_need_px(names, legend_title, "right", axis_px),
+                    "axis_px": axis_px,
+                    "strip": _legend_strip(names, legend_title, "right",
+                                           area if width_px else None,
+                                           axis_px=axis_px)}
+        if orient == "horizontal" and width_px:
+            fit = _horizontal_fit_scale(names, fig, width_px, legend_title)
+            if fit < 0.78:
+                axis_px = _legend_axis_need_px(fig, "right")
+                try:
+                    margins = fig.layout.margin.to_plotly_json() or {}
+                except Exception:
+                    margins = {}
+                area = _plot_area_width(margins, width_px)
+                return {"mode": "column", "side": "right",
+                        "effective_position": "Right",
+                        "need_px": _legend_need_px(names, legend_title,
+                                                   "right", axis_px),
+                        "axis_px": axis_px,
+                        "strip": _legend_strip(names, legend_title, "right",
+                                               area if area > 0 else None,
+                                               axis_px=axis_px)}
+        return _band_plan(fig, names, legend_title, edge, side, None,
+                          width_px=width_px, type_scale=type_scale)
     try:
         m = fig.layout.margin.to_plotly_json() or {}
     except Exception:
@@ -427,12 +728,64 @@ def plan_legend_layout(fig, legend_position, names=None, legend_title="",
     key = "l" if side == "left" else "r"
     # Measure against the margins that WILL exist, i.e. after the legend's own
     # side is widened -- otherwise the plot area is over-estimated and the
-    # column comes out short by the margin.
+    # column comes out short by the margin.  The widening floor is
+    # axis-bearing vs domain-only aware (``_legend_side_margin``), so a pie
+    # is not measured against a 72px margin it will never get.
     probe = dict(m)
-    probe[key] = max(int(probe.get(key) or 0), int(LEGEND_AXIS_MARGIN))
+    probe[key] = max(_margin_px(probe, key), _legend_side_margin(fig))
     area = _plot_area_width(probe, width_px)
     axis_px = _legend_axis_need_px(fig, side)
     need = _legend_need_px(names, legend_title, side, axis_px)
+
+    # An explicit orientation overrides the pixel heuristic for CORNER docks --
+    # a Top/Bottom Left/Right position, which carries BOTH a side and an edge
+    # (centred positions already returned above, and the Left/Right docks have
+    # edge "middle" and are handled further down):
+    #   Horizontal -> a top/bottom band, so a wide row is laid across the edge
+    #                  instead of being crammed into a narrow side column (the
+    #                  "horizontal legend overlaps the plot" report).
+    #   Vertical   -> keep the side column even when it is wider than a band
+    #                  would be, simply capped so the plot is never crushed.
+    # "Auto" (and every headless caller, which passes the default) falls
+    # through to the pixel decision below, so exports are unchanged.
+    orient = str(legend_orientation or "Auto").strip().lower()
+    if edge in ("top", "bottom"):
+        if orient == "horizontal":
+            return _band_plan(fig, names, legend_title, edge, side, axis_px,
+                              width_px=width_px, type_scale=type_scale)
+        if orient == "vertical":
+            sized_area = (area if (float(width_px or 0) > 0 and area > 0)
+                          else None)
+            # Exactly what the labels need, never more.  This used to be
+            # ``max(strip, LEGEND_COLUMN_MAX_SHARE)`` -- a 34% FLOOR that
+            # reserved a third of the card for a two-item legend and left a
+            # slab of empty strip around the pie (the "oversized legend
+            # strip" report).  The cap the comment always described is already
+            # inside ``_legend_strip`` (``LEGEND_STRIP_MAX``), so the floor
+            # only ever over-reserved.
+            return {"mode": "column", "side": side, "need_px": need,
+                    "axis_px": axis_px,
+                    "strip": _legend_strip(names, legend_title, side,
+                                           sized_area, axis_px=axis_px)}
+
+    # A CORNER position (Top/Bottom Left/Right) on a DOMAIN figure must not
+    # collapse to a horizontal band when its labels are wide.  The band<->column
+    # switch is decided by one pixel cliff -- ``need / area`` crossing
+    # ``LEGEND_COLUMN_MAX_SHARE`` -- so the SAME corner flips layout as the card
+    # is resized, and because the left carries a little more furniture than the
+    # right, "Top Left" and "Top Right" flip at DIFFERENT widths (asymmetric at
+    # one size).  That flip is the "the pie jumps / looks weird when I resize"
+    # report.  A pie/donut has no axes, so a side column is always the clean,
+    # stable, overlap-free answer: keep it for every corner at every width.
+    # Centred Top/Bottom positions carry no side and keep the band (returned
+    # above); cartesian corners keep the pixel heuristic -- test [N].
+    if side and edge in ("top", "bottom") and _domain_traces(fig):
+        sized_area = (area if (float(width_px or 0) > 0 and area > 0)
+                      else None)
+        return {"mode": "column", "side": side, "need_px": need,
+                "axis_px": axis_px,
+                "strip": _legend_strip(names, legend_title, side,
+                                       sized_area, axis_px=axis_px)}
 
     w = float(width_px or 0)
     if w <= 0 or area <= 0:
@@ -456,20 +809,67 @@ def plan_legend_layout(fig, legend_position, names=None, legend_title="",
 
     if edge == "middle":
         # A Left/Right dock has no top/bottom band to collapse into, so the
-        # column is kept and simply capped -- the plot must not be crushed to
-        # nothing by an over-long legend on a narrow card.
+        # column is kept and simply sized from the labels -- exactly what they
+        # need, capped inside ``_legend_strip`` at ``LEGEND_STRIP_MAX`` so an
+        # over-long legend on a narrow card can never crush the plot to
+        # nothing.  (The old ``max(strip, LEGEND_COLUMN_MAX_SHARE)`` was that
+        # cap inverted into a 34% floor, which over-reserved for short labels
+        # and left the empty strip around the pie.)
         return {"mode": "column", "side": side, "need_px": need,
                 "axis_px": axis_px,
-                "strip": max(_legend_strip(names, legend_title, side, area,
-                                           axis_px=axis_px),
-                             LEGEND_COLUMN_MAX_SHARE)}
+                "strip": _legend_strip(names, legend_title, side, area,
+                                       axis_px=axis_px)}
 
     # Too wide for a column: go horizontal, keeping the requested edge and the
     # requested left/right alignment of the row.
-    return _band_plan(fig, names, legend_title, edge, side, axis_px)
+    return _band_plan(fig, names, legend_title, edge, side, axis_px,
+                      width_px=width_px, type_scale=type_scale)
 
 
-def reserve_legend_band(fig, legend_position, band_px):
+def _pie_label_pad_frac(fig, area_h):
+    """Fraction of the plot height a pie's OUTSIDE slice labels need beyond
+    its domain box, so a reserved band is never painted over by them.
+
+    Plotly draws a pie's outside slice labels OUTSIDE the trace domain --
+    projecting below/above the circle and past the box edge. Reserving the
+    legend band at exactly the legend's measured height therefore still let
+    the bottom/top slice labels land on the legend rows: the "legend overlaps
+    the pie in bottom & top centre" report. This returns the extra clearance
+    (in plot-height fractions) the caller adds past the band on its edge.
+
+    Returns 0.0 for figures that draw no pie labels, and never more than 0.2
+    so a small card is not crushed.
+    """
+    if area_h <= 0:
+        return 0.0
+    pad_px = 0.0
+    # Every pie counts, not just those with an explicit trace domain: a pie
+    # without one follows ``yaxis.domain`` and its outside labels project past
+    # that box exactly the same way.
+    for tr in (getattr(fig, "data", None) or []):
+        try:
+            if str(getattr(tr, "type", "")).lower() != "pie":
+                continue
+            pos = str(getattr(tr, "textposition", None) or "auto").lower()
+            if "inside" in pos and "outside" not in pos and "auto" not in pos:
+                continue  # labels never leave the box
+            size = 0
+            for src in (getattr(tr, "outsidetextfont", None),
+                        getattr(tr, "textfont", None)):
+                try:
+                    if src is not None and src.size:
+                        size = int(src.size)
+                        break
+                except Exception:
+                    pass
+            # ~1.6 line heights of label text plus Plotly's own standoff.
+            pad_px = max(pad_px, (size or 12) * 1.6 + 6.0)
+        except Exception:
+            continue
+    return max(0.0, min(0.2, pad_px / float(area_h)))
+
+
+def reserve_legend_band(fig, legend_position, band_px, height_px=None):
     """Reserve a horizontal legend band along the top or bottom edge.
 
     The mirror image of ``reserve_legend_column``: instead of shrinking
@@ -481,6 +881,10 @@ def reserve_legend_band(fig, legend_position, band_px):
     The legend's own anchor is written here too (``orientation="h"`` and the
     matching x/y/anchor), because in this mode it is a genuinely different
     placement rather than just a different reserved strip.
+
+    ``height_px`` is the live view height, used when the figure carries no
+    ``layout.height`` (responsive preview) so the band fraction is resolved
+    against the real plot height instead of the reference constant.
 
     Returns True when the layout was rewritten.
     """
@@ -495,19 +899,71 @@ def reserve_legend_band(fig, legend_position, band_px):
         band_px = 0
     if band_px <= 0:
         return False
-    # Never claim so much height that the plot stops being a plot.
-    band_px = min(band_px, int(LEGEND_BAND_MAX_SHARE * _LEGEND_BAND_REF_HEIGHT))
-    frac = band_px / float(_LEGEND_BAND_REF_HEIGHT)
     try:
         m = fig.layout.margin.to_plotly_json() or {}
     except Exception:
         m = {}
+    # The domain fraction is measured against the PLOT-AREA height (card minus
+    # the top/bottom margins), NOT the card height and NOT a fixed constant.
+    # Converting ``band_px`` against the old ``_LEGEND_BAND_REF_HEIGHT`` (400)
+    # constant under-reserved on any card shorter than 400px: the wrapped
+    # horizontal legend is taller than the strip the fraction freed, so it
+    # overflowed straight down onto a centred pie/donut -- the reported
+    # overlap.  The card height is known on the export/dashboard path (the
+    # figure carries ``layout.height``); when it is absent (headless build)
+    # fall back to the reference so those callers are unchanged.
+    base_t = _margin_px(m, "t")
+    base_b = _margin_px(m, "b")
+    try:
+        card_h = float(getattr(fig.layout, "height", 0) or 0)
+    except Exception:
+        card_h = 0.0
+    if card_h <= 0:
+        # Responsive preview: no layout.height of its own, so fall back to the
+        # live view height the caller measured.
+        try:
+            card_h = float(height_px or 0)
+        except Exception:
+            card_h = 0.0
+    area_h = (card_h - base_t - base_b) if card_h > (base_t + base_b) \
+        else float(_LEGEND_BAND_REF_HEIGHT)
+    area_h = max(1.0, area_h)
+    # Reserve exactly the band the rows need.  The band lives ENTIRELY in the
+    # domain reservation below; the outer margin is deliberately left at its
+    # base so the plot area is not shrunk twice (inflating the margin AND the
+    # domain ate the band's own space, which is what made the reserved strip
+    # too short for the plate -- the overlap).
+    #
+    # The ``LEGEND_BAND_MAX_SHARE`` cap exists so a band never crushes the plot
+    # to nothing.  It is only safe where the caller has a column to fall back
+    # to -- a SIDE dock (Top/Bottom Left/Right).  A CENTRED legend (Top/Bottom
+    # Center) has no side strip to collapse into, so capping it would leave the
+    # plate taller than the band and drop it straight onto the centred pie,
+    # which is the exact reported bug.  For a centred position the band is
+    # reserved in full (the plot shrinks, but the legend never overlaps it).
+    frac = band_px / area_h
+    if side:
+        frac = min(LEGEND_BAND_MAX_SHARE, frac)
+    # A valid domain always needs to leave SOME plot: never reserve the whole
+    # card, even for a centred legend with no column fallback.  Past this the
+    # legend is genuinely too tall for the card and a sliver of overlap is the
+    # least-bad outcome (a zero-height plot is worse).
+    frac = min(0.85, frac)
+    # A pie/donut's OUTSIDE slice labels are drawn BEYOND its domain box. With
+    # the band reserved at exactly the legend's own height, the slice labels at
+    # the band edge painted straight over the legend rows -- the "legend
+    # overlaps the pie in bottom & top centre" report. Keep an extra
+    # allowance clear past the band, sized from the font the labels use
+    # (see ``_pie_label_pad_frac``). The legend itself stays anchored in the
+    # band proper; only the PLOT is pushed the extra pad away from it.
+    pad = _pie_label_pad_frac(fig, area_h)
+    total = min(0.95, frac + pad)
     if top:
-        m["t"] = max(int(m.get("t") or 0), band_px)
-        domain = [frac, 1.0]
+        m["t"] = int(base_t)
+        domain = [0.0, 1.0 - total]
     else:
-        m["b"] = max(int(m.get("b") or 0), band_px)
-        domain = [0.0, 1.0 - frac]
+        m["b"] = int(base_b)
+        domain = [total, 1.0]
     try:
         fig.update_layout(margin=m, yaxis=dict(domain=domain))
         # A secondary y axis created by make_subplots OVERLAYS 'y' and simply
@@ -538,14 +994,41 @@ def reserve_legend_band(fig, legend_position, band_px):
             # mean what they say once they collapse to a band.
             x=0.5 if place["xanchor"] == "center"
             else (0.0 if side == "left" else 1.0),
-            y=1.0 if top else 0.0,
+            # Anchor INSIDE the band the domain reservation just freed, at the
+            # plot edge -- not at the paper edge. A top band freed the strip
+            # y in [1-frac, 1] and a bottom band freed y in [0, frac]; centring
+            # the row in that strip puts it flush against the plot border. The
+            # old anchor (y=1.0 / y=0.0 with yanchor bottom/top) parked it in
+            # the outer MARGIN, straight on top of the x tick labels / axis
+            # title -- the "bottom centre legend overlays the axis" report.
+            y=(1.0 - frac / 2.0) if top else (frac / 2.0),
             xanchor=place["xanchor"] if place["xanchor"] == "center"
             else ("left" if side == "left" else "right"),
-            yanchor="bottom" if top else "top",
+            yanchor="middle",
         ))
     except Exception:
         pass
     return True
+
+
+# Margins Plotly.js applies when the JSON leaves a side unset.  Measured by
+# rendering a figure with no margin block and probing the spine positions:
+# l=76/r=80/t=100/b=80 (the 4px on l is the spine's own half-width, so 80 is
+# the right default to assume).  Reading unset sides as 0 -- the old
+# behaviour -- over-estimated the plotting area by up to 160px, which
+# under-sized every strip and mis-anchored every docked plate.
+_PLOTLY_DEFAULT_MARGIN = {"l": 80, "r": 80, "t": 100, "b": 80}
+
+
+def _margin_px(margins, side):
+    """One margin side in px, falling back to Plotly.js's own default."""
+    try:
+        v = (margins or {}).get(side)
+        if v is None:
+            return float(_PLOTLY_DEFAULT_MARGIN.get(side, 80))
+        return float(v)
+    except Exception:
+        return float(_PLOTLY_DEFAULT_MARGIN.get(side, 80))
 
 
 def _plot_area_width(margin, width_px):
@@ -563,13 +1046,71 @@ def _plot_area_width(margin, width_px):
         w = float(width_px or 0)
         if w <= 0:
             return width_px
-        l = float(margin.get("l") or 0)
-        r = float(margin.get("r") or 0)
+        l = _margin_px(margin, "l")
+        r = _margin_px(margin, "r")
         # Never let a large margin invert or zero out the area; a card that
         # narrow is degenerate and any sane fraction still beats crashing.
         return max(1.0, w - l - r)
     except Exception:
         return width_px
+
+
+def _domain_edge_paper(fig, side, strip, width_px, axis_px=None):
+    """Paper x where a docked frame (legend plate / colour bar) STARTS.
+
+    Two facts pin this down; both were verified by rendering figures and
+    measuring the actual pixels:
+
+    1. ``legend.x`` / ``colorbar.x`` are paper coordinates over the PLOTTING
+       AREA -- the box inside the outer margins -- which is the SAME ruler an
+       ``xaxis.domain`` fraction is measured on (a domain edge at 0.807 and a
+       legend.x of 0.807 land on the same pixel column).  So the domain edge
+       IS the paper coordinate ``1 - strip`` (Right) / ``strip`` (Left), with
+       no margin conversion at all.  The old conversion -- ``(l + edge*area)
+       / card_width`` -- mixed the two rulers and parked the plate tens of
+       pixels off the plot: ON the axis furniture on some widths, inside the
+       plot on others.  That is the "legend still overlaps the right axis
+       title" report that survived the first two fixes.
+
+    2. The axis furniture on the docked side -- tick labels and the rotated
+       axis title -- is drawn FROM the domain edge OUTWARDS, inside the strip
+       the reservation carved.  So the frame must start past it: the
+       furniture width (px, measured by ``_legend_axis_need_px``, passed in
+       as ``axis_px`` or measured here) is added to the paper coordinate as
+       a plotting-area fraction.
+
+    Returns None only when the side is unrecognised.
+    """
+    try:
+        m = fig.layout.margin.to_plotly_json() or {}
+    except Exception:
+        m = {}
+    s = max(0.0, min(1.0, float(strip)))
+    try:
+        area = float(width_px or 0)
+    except Exception:
+        area = 0.0
+    if area <= 0:
+        # Headless (export / dashboard generate): fall back to the reference
+        # width, the same basis ``_legend_strip`` sized the strip fraction
+        # against, so the anchor and the reservation stay on one ruler.
+        area = float(_LEGEND_REF_WIDTH)
+    else:
+        area = float(_plot_area_width(m, width_px) or area)
+    if axis_px is None:
+        try:
+            axis_px = _legend_axis_need_px(fig, side)
+        except Exception:
+            axis_px = 0
+    try:
+        furn = max(0.0, float(int(axis_px or 0))) / max(1.0, area)
+    except Exception:
+        furn = 0.0
+    if side == "right":
+        return min(1.0, (1.0 - s) + furn)
+    if side == "left":
+        return max(0.0, s - furn)
+    return None
 
 
 def _domain_traces(fig) -> list:
@@ -596,9 +1137,68 @@ def _domain_traces(fig) -> list:
     return out
 
 
+def _domain_square_frac(fig, width_px, height_px=None):
+    """Fraction of the plot-area WIDTH to give a domain trace so its box is
+    about as wide as the plot is tall -- a square, which is what a pie/donut
+    wants -- plus a little room for outside text labels.
+
+    Returns None when the figure has no domain traces or no width to measure
+    against (the caller then keeps the full-width domain, the old behaviour).
+    A domain trace is centred in its domain box and sized to the box's smaller
+    side, so a square box anchored against the legend's side keeps the pie
+    right next to the legend at every card width instead of letting it drift to
+    the middle of a wide box (the "big gap between chart and legend" report).
+
+    ``height_px`` is the live view height, for the responsive preview where the
+    figure deliberately carries NO ``layout.height`` (plotly.js fills the
+    container).  Without it the square could never be computed there -- the
+    box stayed full-width and the pie centred in it, which is the "gap around
+    the pie in the preview" report.  Export/dashboard figures set
+    ``layout.height`` before the reservation and are unaffected.
+    """
+    if not _domain_traces(fig):
+        return None
+    try:
+        w = float(width_px or 0)
+    except Exception:
+        w = 0.0
+    if w <= 0:
+        return None
+    try:
+        m = fig.layout.margin.to_plotly_json() or {}
+    except Exception:
+        m = {}
+    plot_w = _plot_area_width(m, width_px)
+    try:
+        card_h = float(getattr(fig.layout, "height", 0) or 0)
+    except Exception:
+        card_h = 0.0
+    if card_h <= 0:
+        # Responsive preview: the figure has no height of its own, so use the
+        # pixels the caller measured off the view.
+        try:
+            card_h = float(height_px or 0)
+        except Exception:
+            card_h = 0.0
+    if card_h <= 0:
+        return None
+    plot_h = max(1.0, card_h - _margin_px(m, "t") - _margin_px(m, "b"))
+    try:
+        plot_w = float(plot_w or 0)
+    except Exception:
+        plot_w = 0.0
+    if plot_w <= 0:
+        return None
+    # Square box + ~35% for outside percent/label text; never wider than the
+    # whole plot area, and never so thin the pie disappears.
+    frac = min(1.0, (plot_h * 1.35) / plot_w)
+    return max(0.2, frac)
+
+
 def reserve_legend_column(fig, legend_position, strip=None,
                           axis_margin=LEGEND_AXIS_MARGIN, names=None,
-                          legend_title="", width_px=None, axis_px=None):
+                          legend_title="", width_px=None, axis_px=None,
+                          height_px=None):
     """Carve a dedicated legend column out of *fig*'s plot domain.
 
     Shrinks the x-domain on the legend's side and widens the matching outer
@@ -610,6 +1210,9 @@ def reserve_legend_column(fig, legend_position, strip=None,
     Pass ``width_px`` (the live view width) to size the column against the
     pixels the labels actually need; without it the reservation falls back to
     a fixed fraction of the card, which is what left the wide-card gap.
+    ``height_px`` is the live view height, used only by the pie/donut square
+    box when the figure carries no ``layout.height`` of its own (responsive
+    preview) -- see ``_domain_square_frac``.
 
     Returns the side that was reserved, or None when the position is unknown
     (figure left untouched).
@@ -631,10 +1234,17 @@ def reserve_legend_column(fig, legend_position, strip=None,
         m = {}
     # Widen the outer margin on the legend's side FIRST, so the plot area the
     # domain fraction is resolved against is the one that will actually exist.
+    # Unset sides default to Plotly's own margins (see ``_margin_px``) rather
+    # than 0, so writing the floor never SHRINKS a margin Plotly would have
+    # applied anyway and invalidates every area computed below.
+    # The floor itself is domain-aware: a pie has no axis labels to house, so
+    # it gets breathing room instead of the 72px axis slab (see
+    # ``_legend_side_margin``).
+    _floor = _legend_side_margin(fig, default=axis_margin)
     if side == "left":
-        m["l"] = max(int(m.get("l") or 0), int(axis_margin))
+        m["l"] = int(max(_margin_px(m, "l"), _floor))
     else:
-        m["r"] = max(int(m.get("r") or 0), int(axis_margin))
+        m["r"] = int(max(_margin_px(m, "r"), _floor))
     if strip is None:
         # The tick labels of the axis on the legend's side are drawn INSIDE the
         # strip being freed (they sit just outside the plot edge), so the column
@@ -650,6 +1260,22 @@ def reserve_legend_column(fig, legend_position, strip=None,
                               _plot_area_width(m, width_px),
                               axis_px=(_legend_axis_need_px(fig, side)
                                        if axis_px is None else axis_px))
+    # A domain figure (pie/donut/treemap/sunburst/funnel) has no axes, so the
+    # legend plate is the ONLY thing sharing the reserved strip.  The plan caps
+    # the strip at ``LEGEND_STRIP_MAX`` (0.50) -- tuned for a cartesian plot,
+    # whose width must never be crushed -- but a compact tile with long labels
+    # can need more than that just to HOLD the plate, and a plate wider than its
+    # strip is anchored back over the marks (the narrow-tile overlap).  A pie
+    # only shrinks within its own box when the strip grows, so for a domain
+    # figure the strip is allowed to widen to whatever the plate needs (up to
+    # ``LEGEND_STRIP_MAX_DOMAIN``), keeping the marks and the plate disjoint.
+    if _domain_traces(fig) and float(width_px or 0) > 0:
+        _area0 = _plot_area_width(m, width_px)
+        if _area0 and _area0 > 0:
+            _plate_frac = ((_legend_plate_px(names, legend_title)
+                            + _LEGEND_DOMAIN_GAP_PX) / float(_area0))
+            strip = float(max(float(strip),
+                              min(LEGEND_STRIP_MAX_DOMAIN, _plate_frac)))
     if side == "left":
         domain = [float(strip), 1.0]
     else:
@@ -661,6 +1287,23 @@ def reserve_legend_column(fig, legend_position, strip=None,
     # the legend plate stayed exactly where it was, on top of the marks. Squeeze
     # the trace domain instead, and keep writing the xaxis for the cartesian
     # case so existing charts are unaffected.
+    #
+    # A domain trace is CENTRED in its domain box and sized to the box's smaller
+    # side.  Spanning the box all the way to the far edge ([strip, 1.0]) makes it
+    # as wide as the whole remaining card, so on a wide card the pie stays
+    # height-limited and drifts to the MIDDLE of that wide box -- leaving a big
+    # empty gap between the legend and the pie that grows with the card width
+    # (the "big gap between chart & legend" report).  Instead, give the trace a
+    # box that is about as wide as the plot is tall (a square, which is what a
+    # pie wants) and anchor that box against the legend's side, so the pie sits
+    # right next to the legend at every width.  A little extra width is left for
+    # outside text labels.
+    _sq = _domain_square_frac(fig, width_px, height_px)
+    if _sq is not None:
+        if side == "left":
+            domain = [float(strip), min(1.0, float(strip) + _sq)]
+        else:
+            domain = [max(0.0, 1.0 - float(strip) - _sq), 1.0 - float(strip)]
     squeezed = 0
     for tr in _domain_traces(fig):
         try:
@@ -674,19 +1317,61 @@ def reserve_legend_column(fig, legend_position, strip=None,
         fig.update_layout(margin=m, xaxis=dict(domain=domain))
     except Exception:
         return None
-    if squeezed:
-        # The legend is only guaranteed to sit in the freed strip if it is
-        # anchored there. A pie drawn with no explicit anchor gets Plotly's
-        # default (inside the plot), so the domain squeeze alone would leave the
-        # plate on the pie -- which is the reported overlap.
-        try:
+    # Anchor the plate clear of the plot for EVERY column reservation, not just
+    # the squeezed-trace case.  This is the single owner of the legend anchor,
+    # so the build-time draw and the later ``refit_legend_width`` (which only
+    # re-runs this reservation at the real width) always agree.  legend.x is a
+    # paper coordinate over the PLOTTING AREA -- the same ruler the domain
+    # fraction is on -- and the axis furniture (tick labels + rotated title)
+    # is drawn from the domain edge outwards INSIDE the strip, so the anchor
+    # is placed past the furniture (``_domain_edge_paper``); the plate then
+    # grows AWAY from the plot, never over the axis text.
+    try:
+        edge_x = _domain_edge_paper(
+            fig, side, strip, width_px,
+            axis_px=(axis_px if axis_px is not None
+                     else _legend_axis_need_px(fig, side)))
+    except Exception:
+        edge_x = None
+    try:
+        if edge_x is not None and float(width_px or 0) > 0:
+            _area = _plot_area_width(m, width_px)
+            if _area and _area > 0:
+                _pw = _legend_plate_px(names, legend_title) / float(_area)
+                if _domain_traces(fig):
+                    # A domain figure's marks live entirely to one side of the
+                    # reserved strip, so the plate must sit at or BEYOND the
+                    # domain edge -- never pulled back toward the plot.  The
+                    # generic clamp below (``min(edge_x, 1 - plate)``) does the
+                    # opposite for a too-wide plate: it drags the anchor back
+                    # over the marks to keep the plate on-card, which is exactly
+                    # the narrow-tile overlap.  Clamp the anchor to the strip
+                    # side instead so the plate always grows AWAY from the pie,
+                    # even if its far end then runs a little past the paper edge
+                    # (a clipped legend corner is strictly better than a legend
+                    # painted over the chart).
+                    edge_x = (max(edge_x, 1.0 - float(strip)) if side == "right"
+                              else min(edge_x, float(strip)))
+                else:
+                    # A strip clamped smaller than the labels need (very long
+                    # series name on a narrow card) would push the plate past the
+                    # paper edge; cap the anchor so the estimated plate still fits
+                    # in paper [0, 1] instead of being clipped at the card border.
+                    edge_x = (min(edge_x, 1.0 - _pw) if side == "right"
+                              else max(edge_x, _pw))
+    except Exception:
+        pass
+    try:
+        if edge_x is None:
             x, xanchor = (0.0, "left") if side == "left" else (1.0, "right")
-            y, yanchor = place["y"], place["yanchor"]
-            fig.update_layout(legend=dict(x=x, xanchor=xanchor,
-                                          y=y, yanchor=yanchor))
-        except Exception:
-            log.debug("could not anchor the legend for a domain-squeezed figure",
-                      exc_info=True)
+        else:
+            x, xanchor = edge_x, ("right" if side == "left" else "left")
+        y, yanchor = place["y"], place["yanchor"]
+        fig.update_layout(legend=dict(x=x, xanchor=xanchor,
+                                      y=y, yanchor=yanchor))
+    except Exception:
+        log.debug("could not anchor the legend for a column reservation",
+                  exc_info=True)
     return side
 
 
@@ -759,17 +1444,41 @@ def legend_layout_mode(fig):
     return None
 
 
-def _record_legend_layout(fig, position, mode):
-    """Remember the position/mode on the figure so a refit can reproduce it."""
+def _record_legend_layout(fig, position, mode, orientation="Auto"):
+    """Remember the position/mode/orientation on the figure so a refit can
+    reproduce it."""
     try:
         meta = fig.layout.meta
         meta = dict(meta) if isinstance(meta, dict) else {}
         meta["lytrize_legend_position"] = str(position or "")
         meta["lytrize_legend_mode"] = str(mode or "")
+        meta["lytrize_legend_orientation"] = str(orientation or "Auto")
         fig.update_layout(meta=meta)
     except Exception:
         log.debug("could not record the legend layout on the figure",
                   exc_info=True)
+
+
+def infer_legend_orientation(fig):
+    """The legend orientation the figure was laid out with ("Auto" if unset).
+
+    ``reserve_legend_band`` writes ``orientation="h"`` and a column leaves
+    Plotly's default ``"v"``, so the live anchor alone cannot tell an explicit
+    "Vertical" from an "Auto" that happened to pick a column. The name the
+    layout was built with is recorded in ``layout.meta`` by
+    ``_record_legend_layout`` -- the same authority ``infer_legend_position``
+    uses -- so a refit re-plans with the orientation the user actually chose
+    instead of snapping a horizontal row back into a side column.
+    """
+    try:
+        meta = fig.layout.meta
+        if isinstance(meta, dict):
+            orient = str(meta.get("lytrize_legend_orientation") or "").strip()
+            if orient:
+                return orient
+    except Exception:
+        pass
+    return "Auto"
 
 
 def _restore_legend_reservation(fig):
@@ -801,14 +1510,14 @@ def _restore_legend_reservation(fig):
         except Exception:
             log.debug("could not reset a trace domain", exc_info=True)
     try:
-        if legend_layout_mode(fig) == "band":
-            fig.update_layout(legend=dict(orientation="v"))
+        fig.update_layout(legend=dict(orientation="v"))
     except Exception:
         pass
 
 
 def apply_legend_layout(fig, legend_position, names=None, legend_title="",
-                        width_px=None):
+                        width_px=None, legend_orientation="Auto",
+                        height_px=None):
     """Reserve space for the legend, choosing column or band from the pixels.
 
     The single entry point both ``apply_display_options`` (no view width yet)
@@ -820,6 +1529,16 @@ def apply_legend_layout(fig, legend_position, names=None, legend_title="",
     compact horizontal band when a column would take more than
     ``LEGEND_COLUMN_MAX_SHARE`` of the plot area.
 
+    ``legend_orientation`` ("Auto" / "Vertical" / "Horizontal") lets an
+    explicit user choice win over that pixel heuristic on a corner dock, so a
+    Horizontal legend is given a top/bottom band instead of being squeezed into
+    a side column.  It defaults to "Auto" so every headless caller keeps its
+    current output.
+
+    ``height_px`` is the live view height (responsive preview figures carry no
+    ``layout.height``); it is only consulted by the pie/donut square box and
+    the band fraction, never by a figure that already knows its own height.
+
     Returns the plan dict (or False) so the caller can tell whether the band
     mode was chosen -- the band writes its own x/y/anchors, which the caller's
     column anchors would otherwise fight.
@@ -827,26 +1546,142 @@ def apply_legend_layout(fig, legend_position, names=None, legend_title="",
     if fig is None:
         return False
     _restore_legend_reservation(fig)
+    # Same card type factor the typography pass applies to the legend font, so
+    # a band reserved here matches the (possibly shrunken) text that is drawn
+    # on a compact card -- see ``_type_scale``.
+    _tscale = _type_scale(width_px, height_px)
     plan = plan_legend_layout(fig, legend_position, names=names,
-                              legend_title=legend_title, width_px=width_px)
+                              legend_title=legend_title, width_px=width_px,
+                              legend_orientation=legend_orientation,
+                              type_scale=_tscale)
     if not plan:
         return False
     if plan.get("mode") == "band":
-        ok = reserve_legend_band(fig, legend_position, plan.get("band_px"))
+        ok = reserve_legend_band(fig, legend_position, plan.get("band_px"),
+                                 height_px=height_px)
     else:
         ok = reserve_legend_column(
-            fig, legend_position, names=names, legend_title=legend_title,
+            fig, plan.get("effective_position", legend_position),
+            names=names, legend_title=legend_title,
             width_px=width_px,
             strip=plan.get("strip"),
             axis_px=plan.get("axis_px"),
+            height_px=height_px,
         )
     if ok:
-        _record_legend_layout(fig, legend_position, plan.get("mode"))
+        _record_legend_layout(fig, legend_position, plan.get("mode"),
+                              legend_orientation)
         return plan
     return False
 
 
-def refit_legend_width(fig, width_px):
+def _reapply_type_scale(fig, width_px, height_px=None):
+    """Re-scale the legend + pie-label fonts to the card's current width.
+
+    ``refit_legend_width`` is called on every resize and only re-lays the
+    legend's GEOMETRY; the text stays at whatever size it was generated with.
+    That is the "resize the card small and the legend/label text doesn't
+    adjust" report -- the words keep the large font and spill off the smaller
+    plot.  This re-derives the type factor for the new width and rewrites the
+    legend font and the pie slice-label font to match (see ``_type_scale`` and
+    ``_horizontal_fit_scale``).
+
+    Idempotent: the ORIGINAL (un-scaled) sizes are stashed in ``layout.meta``
+    on the first call and every later call re-scales from that stash, so a
+    resize storm converges instead of compounding shrinks.  A figure that was
+    never typography-styled (``legend.font.size`` missing) is left alone, so
+    this never invents a font the figure did not have.
+    """
+    if fig is None:
+        return False
+    try:
+        w = float(width_px or 0)
+    except Exception:
+        return False
+    if w <= 0:
+        return False
+    try:
+        legend = fig.layout.legend
+        if legend is None or legend.font is None or legend.font.size is None:
+            return False  # no styled legend font to scale
+        meta = fig.layout.meta
+        if not isinstance(meta, dict):
+            meta = {} if meta is None else None
+        if meta is None:
+            return False
+        # Stash the original sizes once so a later resize re-scales from the
+        # user's chosen size, not from an already-shrunk one.
+        if "lytrize_base_legend_font" not in meta:
+            meta["lytrize_base_legend_font"] = int(legend.font.size)
+            try:
+                if legend.title is not None and legend.title.font is not None \
+                        and legend.title.font.size is not None:
+                    meta["lytrize_base_legend_title_font"] = int(legend.title.font.size)
+            except Exception:
+                pass
+        base = int(meta.get("lytrize_base_legend_font") or legend.font.size)
+
+        tscale = _type_scale(w, height_px)
+        lscale = tscale
+        try:
+            orient = infer_legend_orientation(fig)
+        except Exception:
+            orient = "Auto"
+        if str(orient or "Auto").strip().lower() == "horizontal":
+            try:
+                _ltitle = ""
+                try:
+                    if legend.title is not None:
+                        _ltitle = str(getattr(legend.title, "text", "") or "")
+                except Exception:
+                    pass
+                lscale = tscale * _horizontal_fit_scale(_legend_names(fig), fig, w,
+                                                        legend_title=_ltitle)
+            except Exception:
+                lscale = tscale
+
+        f = {"size": _scale_size(base, lscale)}
+        # Preserve the family/colour already on the legend so only the size
+        # changes; a font dict carrying only size resets those to defaults.
+        try:
+            if legend.font.family:
+                f["family"] = legend.font.family
+            if legend.font.color:
+                f["color"] = legend.font.color
+        except Exception:
+            pass
+        fig.update_layout(legend=dict(font=f))
+
+        if "lytrize_base_legend_title_font" in meta:
+            try:
+                tf = {"size": _scale_size(
+                    int(meta["lytrize_base_legend_title_font"]), lscale)}
+                fig.update_layout(legend=dict(title=dict(font=tf)))
+            except Exception:
+                pass
+
+        # Pie/donut slice labels scale with the card too.
+        try:
+            for tr in fig.data:
+                if str(getattr(tr, "type", "")).lower() != "pie":
+                    continue
+                if getattr(tr, "insidetextfont", None) is not None \
+                        and tr.insidetextfont.size is not None:
+                    tr.insidetextfont.size = _scale_size(tr.insidetextfont.size,
+                                                         tscale)
+                if getattr(tr, "outsidetextfont", None) is not None \
+                        and tr.outsidetextfont.size is not None:
+                    tr.outsidetextfont.size = _scale_size(tr.outsidetextfont.size,
+                                                          tscale)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        log.debug("could not re-apply type scale", exc_info=True)
+        return False
+
+
+def refit_legend_width(fig, width_px, height_px=None):
     """Re-lay the legend out against the real view width.
 
     Figures are built on a worker thread with no view, so the first reservation
@@ -855,6 +1690,11 @@ def refit_legend_width(fig, width_px):
     need -- that is what removes the wide gap between the plot and the legend on
     a full-width chart -- and can also switch to the compact band layout when
     the card is too narrow for a column at all.
+
+    ``height_px`` is the live view height, passed on for the pie/donut square
+    box and the band fraction: responsive preview figures carry no
+    ``layout.height`` of their own, so without it those two fall back to the
+    reference constants and the preview pie is not squared to its box.
 
     Idempotent and reversible: the previous reservation is cleared first, so
     repeated calls (a resize storm, a re-gridded dashboard, a full-width
@@ -866,6 +1706,10 @@ def refit_legend_width(fig, width_px):
     """
     if fig is None or not width_px or width_px <= 0:
         return False
+    # Re-scale the legend + pie-label fonts to the new width too, so a resize
+    # shrinks the text with the card (see ``_reapply_type_scale``) instead of
+    # leaving the large font spilling off a smaller plot.
+    _reapply_type_scale(fig, width_px, height_px=height_px)
     pos = infer_legend_position(fig)
     if not pos:
         return False
@@ -874,13 +1718,15 @@ def refit_legend_width(fig, width_px):
         legend = fig.layout.legend
         if legend is not None and legend.title is not None:
             title = str(getattr(legend.title, "text", "") or "")
-        names = [getattr(tr, "name", "") for tr in (fig.data or [])
-                 if getattr(tr, "showlegend", True) is not False]
+        names = _legend_names(fig)
+        orient = infer_legend_orientation(fig)
     except Exception:
         return False
     return bool(apply_legend_layout(fig, pos, names=names,
                                     legend_title=title,
-                                    width_px=width_px))
+                                    width_px=width_px,
+                                    legend_orientation=orient,
+                                    height_px=height_px))
 
 
 # Colours shared by the legend plate and the colour-bar frame when their
@@ -1012,80 +1858,8 @@ def colorbar_json(fig) -> list:
 
 
 def _remap_discrete_map_colours(fig, cs) -> None:
-    """Repaint a DISCRETE map's markers from the chosen colour scale.
-
-    Bug: "Colorscale not working" on a map.
-
-    A ``scattermap`` paints a continuous measure through the shared
-    ``layout.coloraxis``, and ``update_coloraxes(colorscale=...)`` below reaches
-    that.  But when the map's Colour column is binary or categorical, the runner
-    deliberately emits FLAT palette colours instead (``color_discrete_map`` /
-    ``color_discrete_sequence``) and binds nothing to the colour axis -- and
-    ``px`` then splits the map into ONE TRACE PER CATEGORY, each carrying a single
-    flat colour.  There is therefore no colour axis to write to and no per-trace
-    colour array to remap, so the Colorscale dropdown silently did nothing at all:
-    exactly the reported symptom, and the reason the control looked connected while
-    repainting the same colours.
-
-    The fix keeps the discrete ENCODING (one flat colour per category, so the
-    legend stays a legend) but derives those flat colours FROM the selected scale
-    instead of from the app palette.  Categories are matched to scale stops in
-    first-appearance order, which is stable and idempotent, so picking a scale
-    visibly repaints the map and switching back switches back.
-
-    No-ops on continuous traces (their colour is bound to the shared axis, which
-    the block below owns) and on any chart without a discrete map trace, so it can
-    never damage a figure it does not understand.
-    """
-    if not cs:
-        return
-    try:
-        from plotly.colors import sample_colorscale
-
-        map_traces = [tr for tr in (getattr(fig, "data", None) or [])
-                      if str(getattr(tr, "type", "")).lower()
-                      in ("scattermap", "scattermapbox")]
-        if not map_traces:
-            return
-
-        # Distinct flat colours across the whole map, in first-appearance order.
-        # Every discrete map trace px emits is a candidate; a continuous one is
-        # skipped and left entirely to ``layout.coloraxis``.
-        distinct: list = []
-        for tr in map_traces:
-            marker = getattr(tr, "marker", None)
-            if marker is None or getattr(marker, "coloraxis", None):
-                continue  # continuous -> owned by the shared colour axis
-            colors = marker.to_plotly_json().get("color")
-            if isinstance(colors, str):
-                colors = [colors]
-            if not isinstance(colors, (list, tuple)):
-                continue
-            for c in colors:
-                # Only real colours are candidates; a numeric array is not
-                # something a discrete scale can be sampled onto.
-                if isinstance(c, str) and c and c not in distinct:
-                    distinct.append(c)
-        if len(distinct) < 2:
-            # Nothing discrete to restyle (a single category cannot show a scale).
-            return
-
-        mapping = dict(zip(distinct,
-                           sample_colorscale(str(cs), len(distinct))))
-        for tr in map_traces:
-            marker = getattr(tr, "marker", None)
-            if marker is None or getattr(marker, "coloraxis", None):
-                continue
-            colors = marker.to_plotly_json().get("color")
-            if isinstance(colors, str):
-                marker.color = mapping.get(colors, colors)
-            elif isinstance(colors, (list, tuple)):
-                marker.color = [mapping.get(c, c) if isinstance(c, str) else c
-                                for c in colors]
-    except Exception:
-        # A colour remap is cosmetic; never let it take a chart down.
-        pass
-
+    """Retired Plotly hook; map colors are now ChartModel display data."""
+    return None
 
 def _apply_heatmap_options(fig, lo, typo, width_px=None):
     """Apply the heatmap / colour-bar Layout options to *fig* in place.
@@ -1257,7 +2031,15 @@ def _apply_heatmap_options(fig, lo, typo, width_px=None):
         cborient = "horizontal"
     elif cborient == "auto":
         cborient = "vertical"
-    reserve_colorbar_strip(fig, cbpos, traces=traces, width_px=width_px)
+    # Only carve the strip when a colour bar is actually drawn. This ran
+    # unconditionally for every heatmap/map, so a chart whose colour bar is
+    # hidden (showscale/show_colorbar off) still reserved a side strip for a
+    # bar that never appears -- the "big empty gap beside the chart" report.
+    # ``real_colorbars`` is the authoritative "will Plotly draw one" check,
+    # and ``show_colorbar`` (Map Plot) is honoured as an explicit override.
+    _cb_wanted = lo.get("show_colorbar", True)
+    if _cb_wanted is not False and list(real_colorbars(fig)):
+        reserve_colorbar_strip(fig, cbpos, traces=traces, width_px=width_px)
     # Horizontal Top/Bottom bars: flip the Plotly colorbar itself so it
     # renders under/over the plot instead of as a side strip.
     try:
@@ -1416,6 +2198,15 @@ def reserve_colorbar_strip(fig, side, traces=(), width_px=None):
             pass
         return True
     try:
+        # ``dict(fig.layout.margin)`` raises ValueError on some Plotly versions
+        # (see the note in ``reserve_legend_column``); that made the colour-bar
+        # strip overwrite l/r/t/b with bare values and reset the chart's
+        # margins.  Read ONCE, up front: the strip fraction below resolves
+        # against the plot area these margins define.
+        m = fig.layout.margin.to_plotly_json() or {}
+    except Exception:
+        m = {}
+    try:
         thick = COLORBAR_THICKNESS_PX
         for tr in traces or ():
             cb = getattr(tr, "colorbar", None)
@@ -1426,21 +2217,26 @@ def reserve_colorbar_strip(fig, side, traces=(), width_px=None):
         if ca is not None and getattr(ca.colorbar, "thickness", None):
             thick = int(ca.colorbar.thickness)
         need_px = float(thick) + COLORBAR_GAP_PX
+        # The axis furniture on the bar's side -- tick labels AND the rotated
+        # axis title -- is drawn FROM the domain edge outwards, i.e. inside
+        # the very strip being freed.  On a heatmap's Left the labels are the
+        # COLUMN NAMES ("transaction_qty"), so they are long: without leaving
+        # room for them the strip is only wide enough for the bar itself and
+        # the labels (and the title) end up underneath it.  The extra
+        # separating gap matters on the Left only: Right has the plot edge to
+        # sit against, but on Left the labels sit BETWEEN the bar and the
+        # cells, so without a gap the longest label is drawn flush against
+        # the bar.  ``_domain_edge_paper`` skips the same measurement when it
+        # anchors the bar, so sizing and anchoring always agree.
+        need_px += _legend_axis_need_px(fig, side)
         if side == "left":
-            # The y tick labels are drawn immediately left of the axis, i.e.
-            # inside the very strip being freed. On a heatmap they are the
-            # column NAMES ("transaction_qty"), so they are long: without
-            # measuring them the strip is only wide enough for the bar itself
-            # and the labels end up underneath it. Same reasoning as
-            # _legend_need_px adding _LEGEND_AXIS_PX on the left.
-            # The separating gap matters on this side only: Right has the
-            # plot edge to sit against, but on Left the labels sit BETWEEN
-            # the bar and the cells, so without a gap the longest label is
-            # drawn flush against the bar.
-            need_px += _axis_label_need_px(fig, side) + _COLORBAR_LABEL_GAP_PX
-        w = int(width_px or 0)
-        if w > 0:
-            strip = need_px / float(w)
+            need_px += _COLORBAR_LABEL_GAP_PX
+        # A strip is an xaxis.domain fraction, i.e. a share of the PLOT AREA
+        # (card minus the outer margins), not of the whole card -- resolve the
+        # pixel need against that area, exactly like the legend column does.
+        _area = _plot_area_width(m, width_px)
+        if int(width_px or 0) > 0 and _area and float(_area) > 0:
+            strip = need_px / float(_area)
         else:
             # No width to measure against: fall back to a fraction that covers
             # the bar plus a generous axis allowance.
@@ -1450,25 +2246,34 @@ def reserve_colorbar_strip(fig, side, traces=(), width_px=None):
         strip = max(0.05, min(0.30, strip))
     except Exception:
         strip = 0.10
-    try:
-        # ``dict(fig.layout.margin)`` raises ValueError on some Plotly versions
-        # (see the note in ``reserve_legend_column``); that made the colour-bar
-        # strip overwrite l/r/t/b with bare values and reset the chart's margins.
-        m = fig.layout.margin.to_plotly_json() or {}
-    except Exception:
-        m = {}
     if side == "left":
-        m["l"] = max(int(m.get("l") or 0), 60)
+        m["l"] = int(max(_margin_px(m, "l"), 60.0))
         domain = [strip, 1.0]
-        cb_pos, cb_anchor = 0.0, "left"
     else:
-        m["r"] = max(int(m.get("r") or 0), 60)
+        m["r"] = int(max(_margin_px(m, "r"), 60.0))
         domain = [0.0, 1.0 - strip]
-        cb_pos, cb_anchor = 1.0, "right"
     try:
         fig.update_layout(margin=m, xaxis=dict(domain=domain))
     except Exception:
         return False
+    # Anchor the bar clear of the axis furniture.  colorbar.x is a paper
+    # coordinate over the plotting area -- the same ruler the domain fraction
+    # is on -- and the furniture (tick labels + rotated title) is drawn from
+    # the domain edge outwards INSIDE the freed strip, so ``_domain_edge_paper``
+    # places the bar past it.  The old bare ``x=1.0`` (Right) / ``x=0.0``
+    # (Left) parked the bar in the outer margin and left the whole reserved
+    # strip as a dead gap beside the chart -- the same "keep it close to the
+    # chart border" report the legend had.
+    try:
+        cb_pos = _domain_edge_paper(fig, side, strip, width_px)
+    except Exception:
+        cb_pos = None
+    if cb_pos is None:
+        cb_pos = 0.0 if side == "left" else 1.0
+    # The bar grows AWAY from the plot: on the Right it sits left of the plot
+    # edge and extends right (xanchor left); on the Left it sits right of the
+    # plot edge and extends left (xanchor right).
+    cb_anchor = "right" if side == "left" else "left"
     try:
         fig.update_coloraxes(colorbar=dict(x=cb_pos, xanchor=cb_anchor))
     except Exception:
@@ -1486,19 +2291,64 @@ def reserve_colorbar_strip(fig, side, traces=(), width_px=None):
 # so reserving a legend column for one only steals width from the plot.
 _NO_LEGEND_TYPES = ("heatmap",)
 
+# Trace types whose legend entries come from a per-trace ``labels`` ARRAY
+# rather than from one trace per series. A pie / donut / funnel-area is a
+# SINGLE trace carrying every category, and its ``name`` is normally empty --
+# so a name-only test reports "no legend" for the one chart type that always
+# has one. That is why every legend option on the Pie & Donut page was inert.
+# Sunburst / treemap / icicle also carry ``labels`` but have no ``showlegend``
+# property at all (Plotly never gives them a legend box), so they are excluded
+# by the ``showlegend`` check below rather than listed here.
+_LABEL_LEGEND_TYPES = ("pie", "funnelarea")
 
-def _figure_has_legend(fig):
-    """True when at least one trace will actually paint a legend box."""
-    for tr in getattr(fig, "data", []) or []:
+
+def _legend_names(fig):
+    """The legend-entry labels *fig* will actually paint, in order.
+
+    One entry per trace name for the usual cartesian types; one entry per
+    ``labels`` item for a pie / donut / funnel-area, whose single trace holds
+    every category and usually has no name at all.
+
+    The names are what the legend reservation is MEASURED against, so this
+    has to be the real entry list: sizing a pie's column from ``[""]``
+    reserves a strip far too narrow for the swatches it is about to hold and
+    drops the plate back over the marks.
+    """
+    out = []
+    for tr in getattr(fig, "data", None) or []:
         if str(getattr(tr, "type", "")).lower() in _NO_LEGEND_TYPES:
             continue
         if getattr(tr, "showlegend", None) is False:
             continue
-        return True
-    return False
+        if str(getattr(tr, "type", "")).lower() in _LABEL_LEGEND_TYPES:
+            labels = getattr(tr, "labels", None)
+            if labels is not None:
+                out.extend(str(x) for x in labels)
+            continue
+        nm = str(getattr(tr, "name", "") or "").strip()
+        if nm:
+            out.append(nm)
+    return out
 
 
-def _apply_pie_options(fig, lo):
+def _figure_has_legend(fig):
+    """True when at least one trace will actually paint a visible legend entry.
+
+    A heatmap has no legend at all. Just as important, a figure whose only
+    visible traces carry no ``name`` paints an EMPTY legend box -- Plotly
+    draws nothing in it -- so reserving a column/band for it only steals
+    width from the plot and leaves the "big empty gap" beside a single
+    unnamed series. So a legend counts only when some visible, non-heatmap
+    trace names itself, or (for a pie / funnel-area) carries ``labels``.
+
+    Reads through ``_legend_names`` so the entry LIST and the yes/no answer
+    can never disagree: the names are also what the reservation is sized
+    against.
+    """
+    return bool(_legend_names(fig))
+
+
+def _apply_pie_options(fig, lo, type_scale=1.0):
     """Apply the Pie & Donut Layout options to every pie trace on *fig*.
 
     Guarded per trace exactly like the histogram and heatmap blocks: one Layout
@@ -1509,6 +2359,10 @@ def _apply_pie_options(fig, lo):
     donut, but the option defaults to 0, and writing that default is correct --
     it is what turns a donut back into a full pie, which is exactly what the
     control is for.
+
+    ``type_scale`` shrinks the slice-label font on a small card so outside
+    labels don't overflow the shrunken plot (see ``_type_scale``); 1.0 leaves
+    the chosen size untouched.
     """
     for tr in getattr(fig, "data", []) or []:
         if str(getattr(tr, "type", "")).lower() != "pie":
@@ -1522,10 +2376,9 @@ def _apply_pie_options(fig, lo):
         except Exception:
             pass
         try:
-            tr.insidetextfont = _font_kwargs(lo.get("pie_value_size"),
-                                             lo.get("pie_value_color"))
-            tr.outsidetextfont = _font_kwargs(lo.get("pie_value_size"),
-                                              lo.get("pie_value_color"))
+            _vsize = _scale_size(lo.get("pie_value_size"), type_scale)
+            tr.insidetextfont = _font_kwargs(_vsize, lo.get("pie_value_color"))
+            tr.outsidetextfont = _font_kwargs(_vsize, lo.get("pie_value_color"))
         except Exception:
             pass
         try:
@@ -1711,6 +2564,20 @@ def _format_table_number(v, spec):
         return str(f)
 
 
+def _contrast_on(bg):
+    """Readable header text for a band painted *bg*: white on dark, ink on light."""
+    try:
+        s = str(bg).strip().lstrip("#")
+        if len(s) == 3:
+            s = "".join(ch * 2 for ch in s)
+        r, g, b = (int(s[i:i + 2], 16) for i in (0, 2, 4))
+        # Rec.601 luma without gamma -- enough to split a swatch picker's
+        # colours into "needs white text" and "needs dark text".
+        return "#1e293b" if (r * 299 + g * 587 + b * 114) / 1000 > 140 else "#ffffff"
+    except Exception:
+        return "#ffffff"
+
+
 def _apply_table_options(fig, lo, t):
     """Apply the Pivot Table Layout options to every table trace on *fig*.
 
@@ -1727,19 +2594,38 @@ def _apply_table_options(fig, lo, t):
             hdr, cells = tr.header, tr.cells
         except Exception:
             continue
-        for block, size_key, col_key in ((hdr, "table_header_font_size",
-                                          "table_header_color"),
-                                         (cells, "table_font_size",
-                                          "table_font_color")):
-            sz, col = lo.get(size_key), lo.get(col_key)
-            if sz is None and col is None:
-                continue
+        # -- Body font: table_font_color IS a text colour -----------------
+        sz, col = lo.get("table_font_size"), lo.get("table_font_color")
+        if sz is not None or col is not None:
             try:
                 d = _font_kwargs(sz, col)
                 d["family"] = fam
-                block.font = dict(d)
+                cells.font = dict(d)
             except Exception:
                 pass
+        # -- Header band + header text ------------------------------------
+        # ``table_header_color`` is the header BAND colour: the runner reads
+        # the same key as fill, the Layout swatch sits with the stripe
+        # colours, and the old app wrote it to ``header.fill``. Writing it
+        # into ``header.font`` instead painted #6163df text on the #6163df
+        # band -- invisible in BOTH modes, with only the odd palette column
+        # (a pale alternate fill) showing a murky glyph. The band takes the
+        # swatch now; the TEXT colour is re-derived from the band's luminance
+        # so any swatch stays legible.
+        try:
+            hdr_font = dict(hdr.font.to_plotly_json() or {})
+            hsz = lo.get("table_header_font_size")
+            if hsz is not None:
+                hdr_font["size"] = int(hsz)
+            hdr_font["family"] = fam
+            hc = lo.get("table_header_color")
+            n_hdr = len(getattr(hdr, "values", None) or [])
+            if hc and n_hdr:
+                hdr.fill = dict(color=[str(hc)] * n_hdr)
+                hdr_font["color"] = _contrast_on(str(hc))
+            hdr.font = hdr_font
+        except Exception:
+            pass
         for block, key in ((hdr, "table_header_height"), (cells, "table_row_height")):
             val = lo.get(key)
             if val is None:
@@ -1769,13 +2655,28 @@ def _apply_table_options(fig, lo, t):
                 pass
             try:
                 if hdr is not None and hdr.values is not None:
-                    hdr.align = str(ia or "left")
+                    # Mirror the cells: the index header sits over the
+                    # left-aligned index column, each data header over its
+                    # right-aligned numbers. The flat string flattened the
+                    # whole band to one side.
+                    hdr.align = [str(ia or "left")] + [str(da or "right")] * (n - 1)
             except Exception:
                 pass
         ev, od = lo.get("table_stripe_even_color"), lo.get("table_stripe_odd_color")
         if ev or od:
             try:
-                cells.fill = dict(color=[str(od or "#0f172a"), str(ev or "#1e293b")])
+                # Plotly paints cells.fill.color COLUMN-major ([col][row]),
+                # so the old flat two-colour list gave column 0 the odd
+                # stripe and every later column the even one -- a two-tone
+                # column effect with no row stripes at all. Build the
+                # alternation per ROW and repeat it across the columns
+                # (the same shape the old app wrote).
+                cols_vals = list(getattr(cells, "values", None) or [])
+                n_rows = max((len(c) for c in cols_vals), default=0)
+                n_cols = max(len(cols_vals), 1)
+                row_fill = [str(ev or "#1e293b") if i % 2 == 0
+                            else str(od or "#0f172a") for i in range(n_rows)]
+                cells.fill = dict(color=[list(row_fill) for _ in range(n_cols)])
             except Exception:
                 pass
         # -- Number format -------------------------------------------------
@@ -1799,6 +2700,20 @@ def _apply_table_options(fig, lo, t):
                     cells.values = rebuilt
                 except Exception:
                     pass
+
+        # -- Column widths follow the content ------------------------------
+        # Recomputed AFTER the number-format rebuild above so the weights
+        # match the strings now on screen ("72,667.00" is wider than
+        # "72,667"). One owner for the rule: the same helper the runner uses,
+        # so build time and re-style time always agree.
+        try:
+            from modules.analysis.matrix_table import fit_columnwidth
+            cw = fit_columnwidth(list(getattr(cells, "values", None) or []),
+                                 list(getattr(hdr, "values", None) or []))
+            if cw:
+                tr.columnwidth = cw
+        except Exception:
+            pass
 
 
 def _apply_colorbar_border(fig, show_border):
@@ -1831,9 +2746,11 @@ def default_layout_opts():
     # mockups); unchecking it hides the labels again.
     #
     # show_border (Layout tab, right under "Show grid") draws the frame of
-    # the legend AND of the colour bar/colour range.  It defaults to True
-    # because that is what the charts already looked like before the toggle
-    # existed -- it is a control over the current look, not a new style.
+    # the legend AND of the colour bar/colour range.  It defaults to False:
+    # an unframed legend/colorbar is the clean production look, and the
+    # toggle still re-enables the frame per chart. Saved sessions that
+    # inherited the old True default are migrated by
+    # database._migrate_show_border_default.
     # histogram_bins / histogram_opacity (Distribution, Layout tab) control the
     # histogram bars only -- they come from the old app's histogram_bins /
     # histogram_opacity controls (5-200 step 1 default 30; 0.1-1.0 step 0.05
@@ -1881,7 +2798,7 @@ def default_layout_opts():
     # per old _CONTROL_META. map_plot already routes its own colour scale
     # through the shared colorbar_* / heatmap_colorscale keys, which is why they
     # are not repeated here.
-    return {"title": "", "x_label": "", "y_label": "", "legend_title": "", "legend_labels": {}, "show_value_labels": True, "value_label_color": "#ffffff", "label_position": "outside", "bar_mode": "group", "bar_gap": 0.28, "histogram_bins": 30, "histogram_opacity": 0.80, "show_grid": True, "show_border": True, "legend_position": "Top Right", "legend_orientation": "Auto", "legend_order": "Normal", "legend_itemclick": "toggle", "heatmap_show_text": True, "heatmap_colorscale": "RdBu", "heatmap_annotation_size": 10, "heatmap_annotation_precision": 2, "heatmap_annotation_color": "#ffffff", "colorbar_position": "Right", "colorbar_orientation": "Auto", "colorbar_title": "", "colorbar_tick_size": 10, "colorbar_tick_color": "#94a3b8", "colorbar_title_size": 11, "colorbar_title_color": "#cbd5e1", "donut_hole": 0.0, "pie_textinfo": "label+percent", "pull_slices": 0.0, "pie_rotation": 0, "pie_direction": "clockwise", "pie_value_size": 11, "pie_value_color": "#e2e8f0", "line_shape": "linear", "line_fill": "none", "show_markers": True, "marker_opacity": 0.8, "marker_size": 6, "render_mode": "svg", "table_font_size": 11, "table_header_font_size": 12, "table_row_height": 26, "table_header_height": 28, "table_index_align": "left", "table_data_align": "right", "table_number_format": ",.2f", "table_font_color": "#f1f5f9", "table_header_color": "#6163df", "table_stripe_even_color": "#1e293b", "table_stripe_odd_color": "#0f172a", "show_colorbar": True, "size_by_value": False}
+    return {"title": "", "x_label": "", "y_label": "", "legend_title": "", "legend_labels": {}, "show_value_labels": True, "value_label_color": "#ffffff", "label_position": "outside", "bar_mode": "group", "bar_gap": 0.28, "histogram_bins": 30, "histogram_opacity": 0.80, "show_grid": True, "show_border": False, "legend_position": "Top Right", "legend_orientation": "Auto", "legend_order": "Normal", "legend_itemclick": "toggle", "heatmap_show_text": True, "heatmap_colorscale": "RdBu", "heatmap_annotation_size": 10, "heatmap_annotation_precision": 2, "heatmap_annotation_color": "#ffffff", "colorbar_position": "Right", "colorbar_orientation": "Auto", "colorbar_title": "", "colorbar_tick_size": 10, "colorbar_tick_color": "#94a3b8", "colorbar_title_size": 11, "colorbar_title_color": "#cbd5e1", "donut_hole": 0.0, "pie_textinfo": "label+percent", "pull_slices": 0.0, "pie_rotation": 0, "pie_direction": "clockwise", "pie_value_size": 11, "pie_value_color": "#e2e8f0", "line_shape": "linear", "line_fill": "none", "show_markers": True, "marker_opacity": 0.8, "marker_size": 6, "render_mode": "svg", "table_font_size": 11, "table_header_font_size": 12, "table_row_height": 26, "table_header_height": 28, "table_index_align": "left", "table_data_align": "right", "table_number_format": ",.2f", "table_font_color": "#f1f5f9", "table_header_color": "#6163df", "table_stripe_even_color": "#1e293b", "table_stripe_odd_color": "#0f172a", "show_colorbar": True, "size_by_value": False}
 
 def default_typo_opts():
     # Sizes mirror the readouts on the Typography Options tab of
@@ -1889,7 +2806,7 @@ def default_typo_opts():
     # header_align places the header across the full canvas width (see
     # _HEADER_ANCHORS); "left" is the default so existing charts are
     # unchanged, and it auto-adjusts to whatever the chart area is.
-    return {"family": "Inter", "font_style": "Normal", "header_size": 28, "header_color": "#6163df", "header_family": "Inter", "header_font_style": "Normal", "header_align": "left", "axis_title_size": 16, "axis_title_color": "#cbd5e1", "axis_tick_size": 12, "axis_tick_color": "#94a3b8", "legend_title_size": 12, "legend_title_color": "#cbd5e1", "legend_item_size": 11, "legend_item_color": "#e2e8f0"}
+    return {"family": "Inter", "font_style": "Normal", "header_size": 28, "header_color": "#6163df", "header_family": "Inter", "header_font_style": "Normal", "header_align": "left", "axis_title_size": 16, "axis_title_color": "#cbd5e1", "axis_tick_size": 12, "axis_tick_color": "#94a3b8", "legend_title_size": 12, "legend_title_color": "#cbd5e1", "legend_item_size": 11, "legend_item_color": "#e2e8f0", "value_label_size": 11, "value_label_color": "auto", "tooltip_size": 12, "tooltip_color": "auto"}
 
 def _font_stack(name):
     if not name:
@@ -2042,12 +2959,17 @@ def _apply_title_placement(fig, header_size=28, align="left"):
 
 
 def apply_display_options(fig, layout_opts=None, typo_opts=None,
-                           width_px=None):
+                          width_px=None, height_px=None):
     """Apply Layout + Typography options to a copy of *fig*.
 
     Every call re-derives from the figure it is given, so callers should
     always pass their original (pre-display-options) figure -- applying
     new options on top of an already-styled figure would compound.
+
+    ``width_px`` / ``height_px`` are the live view size (the preview widget
+    knows both); they size the reserved legend column/band and the pie/donut
+    square box against the pixels the card really has.  Headless callers pass
+    neither and keep the classic fixed-fraction layout.
     """
     f2 = copy.deepcopy(fig)
     # Plotly's Figure does not deepcopy its custom attributes, so the runners'
@@ -2145,7 +3067,11 @@ def apply_display_options(fig, layout_opts=None, typo_opts=None,
 
     # -- Pie / line / marker / table options (Pie, Time Series, Scatter, Pivot)
     # Same per-trace guarding as the two blocks above, for the same reason.
-    _apply_pie_options(f2, lo)
+    # The card's type scale is computed once here and shared by the pie slice
+    # labels and the legend text below, so everything shrinks together on a
+    # small tile (see ``_type_scale``).
+    _tscale = _type_scale(width_px, height_px)
+    _apply_pie_options(f2, lo, type_scale=_tscale)
     _apply_line_options(f2, lo)
     _apply_table_options(f2, lo, t)
 
@@ -2161,49 +3087,53 @@ def apply_display_options(fig, layout_opts=None, typo_opts=None,
     lp = lo.get("legend_position", "")
     place = legend_anchor(lp)
     # One toggle governs every frame the chart draws around a key: the
-    # legend plate and the colour bar / colour range.  Default True keeps
-    # the look charts already had, so this only changes when unchecked.
-    show_border = bool(lo.get("show_border", True))
+    # legend plate and the colour bar / colour range.  Default False is the
+    # clean production look; this only draws a frame when checked.
+    show_border = bool(lo.get("show_border", False))
     # Only reserve a legend column when a legend is really drawn. A heatmap
     # (correlation) has none, yet ``legend_position`` still carries a default,
     # so this used to reserve a column for a legend that never appears -- and
     # because it writes xaxis.domain it also clobbered the colour-bar strip
     # reserved moments earlier, which is why a left-hand colour bar ended up
     # on top of the y tick labels.
-    if place and _figure_has_legend(f2):
+    if place and (_figure_has_legend(f2) or lo.get("legend_title")):
         # Reserve the column AFTER the xaxis showgrid/title updates above,
         # so this domain is not clobbered by a later update_layout.
-        #
-        # The strip is sized from the labels that will actually be painted:
-        # legend renames already happened above, so the trace names on f2 are
-        # the final ones (no need to thread them in from the caller), and the
-        # legend title comes from the layout options.
         #
         # ``apply_legend_layout`` is the shared entry point (the same one the
         # widget's resize refit calls), so a chart first drawn at an assumed
         # width and then refit to its real width always ends up on the same
-        # rule rather than two different ones. When a width is known it may
-        # also return a horizontal band instead of a column; the band writes
-        # its own x/y/anchors, so those are only written here for a column.
+        # rule rather than two different ones.  It -- via reserve_legend_column
+        # / reserve_legend_band -- is the SINGLE owner of the legend geometry
+        # (x/y/anchors): it converts the reserved domain strip into the paper
+        # coordinate the plate is anchored at, so the plate hugs the plot edge
+        # instead of floating in the card margin or sitting on the marks.  All
+        # that is left here is the plate's own look.
         _plan = apply_legend_layout(
             f2, lp,
-            names=[getattr(tr, "name", "") for tr in f2.data
-                   if getattr(tr, "showlegend", True) is not False],
+            # The entry list, not just trace names: a pie/donut is ONE trace
+            # whose legend rows are its ``labels``, so a name-only list is
+            # ``[""]`` and the column gets sized for nothing at all.
+            names=_legend_names(f2),
             legend_title=lo.get("legend_title", ""),
             width_px=width_px,
+            # The user's Auto/Vertical/Horizontal choice: on a corner dock an
+            # explicit Horizontal needs a top/bottom band, not a side column a
+            # later orientation pass would squeeze a horizontal row into.
+            legend_orientation=lo.get("legend_orientation", "Auto"),
+            # Live view height for the pie/donut square box and the band
+            # fraction (responsive preview figures carry no layout.height).
+            height_px=height_px,
         )
-        _leg = dict(
-            # A translucent plate keeps the legend readable wherever it
-            # lands, without hiding the plot behind an opaque slab.
-            bgcolor="rgba(15, 23, 42, 0.72)",
+        # Transparent by default for any chart: no plate at all, so the card
+        # and grid show through exactly as they do around the plot.  Only the
+        # look is set here; the position is owned by the reservation above.
+        f2.update_layout(legend=dict(
+            bgcolor="rgba(0, 0, 0, 0)",
             bordercolor=(LEGEND_BORDER_COLOR if show_border
                          else "rgba(0, 0, 0, 0)"),
             borderwidth=1 if show_border else 0,
-        )
-        if not _plan or _plan.get("mode") != "band":
-            _leg.update(x=place["x"], y=place["y"],
-                        xanchor=place["xanchor"], yanchor=place["yanchor"])
-        f2.update_layout(legend=_leg)
+        ))
 
     # Colour bars (heatmaps, matrices, choropleths) draw their own frame and
     # are not reached by the legend block above, so the same toggle is applied
@@ -2249,6 +3179,23 @@ def apply_display_options(fig, layout_opts=None, typo_opts=None,
                 # 'none' keeps the trace's text data intact (so switching
                 # back on can restore it) while hiding it from the plot.
                 tr.textposition = "none"
+            except Exception:
+                pass
+
+    # Outside text on a multi-slice pie piles up around small wedges, even
+    # when the legend has its own reserved band. Keep the requested label
+    # content and hover data, but place it inside and let Plotly hide labels
+    # that cannot fit. The legend remains the readable full category key.
+    if (lo.get("show_value_labels")
+            and str(lo.get("label_position", "outside")).lower() == "outside"):
+        for tr in f2.data:
+            if str(getattr(tr, "type", "")).lower() != "pie":
+                continue
+            try:
+                labels = list(getattr(tr, "labels", None) or [])
+                if len(labels) >= 7:
+                    tr.textposition = "inside"
+                    f2.update_layout(uniformtext=dict(minsize=8, mode="hide"))
             except Exception:
                 pass
 
@@ -2307,9 +3254,27 @@ def apply_display_options(fig, layout_opts=None, typo_opts=None,
         except Exception:
             pass
 
-    # Legend items + legend title ("Legend size/color").
-    lf = _font_kwargs(t.get("legend_item_size"), t.get("legend_item_color"))
-    ltf = _font_kwargs(t.get("legend_title_size"), t.get("legend_title_color"))
+    # Legend items + legend title ("Legend size/color").  Both are scaled by the
+    # card's type factor so a small card's legend text doesn't overflow (see
+    # ``_type_scale``).  A HORIZONTAL legend is scaled FURTHER by
+    # ``_horizontal_fit_scale`` -- the point of choosing Horizontal is a single
+    # row, so the font shrinks until the entries fit one row instead of wrapping
+    # and colliding (the "only stays horizontal if I widen the card" report).
+    # A card at/above the full-size anchor with a fitting legend keeps the exact
+    # chosen size, so wide cards and headless export are unchanged.
+    _lorient = str(lo.get("legend_orientation", "Auto") or "Auto").strip().lower()
+    _lscale = _tscale
+    if _lorient == "horizontal" and width_px:
+        try:
+            _lscale = _tscale * _horizontal_fit_scale(
+                _legend_names(f2), f2, width_px,
+                legend_title=lo.get("legend_title", ""))
+        except Exception:
+            _lscale = _tscale
+    lf = _font_kwargs(_scale_size(t.get("legend_item_size"), _lscale),
+                      t.get("legend_item_color"))
+    ltf = _font_kwargs(_scale_size(t.get("legend_title_size"), _lscale),
+                       t.get("legend_title_color"))
     leg = {}
     if lf:
         leg["font"] = lf
@@ -2327,7 +3292,13 @@ def apply_display_options(fig, layout_opts=None, typo_opts=None,
     try:
         _lo2 = dict(lo or {})
         _want_orient = str(_lo2.get("legend_orientation", "Auto") or "Auto").strip().lower()
-        if _want_orient in ("vertical", "horizontal"):
+        _mode = legend_layout_mode(f2)
+        if _mode in ("column", "band"):
+            # The selected geometry is authoritative. In particular, a
+            # horizontal preference can be adapted to a vertical side column
+            # when the available card width cannot hold one readable row.
+            f2.update_layout(legend=dict(orientation="h" if _mode == "band" else "v"))
+        elif _want_orient in ("vertical", "horizontal"):
             f2.update_layout(legend=dict(orientation="v" if _want_orient == "vertical" else "h"))
     except Exception:
         pass
@@ -2384,7 +3355,10 @@ CHART_THEME = {
         "hover_bg": "rgba(18, 26, 45, 0.96)",
         "hover_border": "rgba(133, 102, 252, 0.30)",
         "hover_text": "#f5f7ff",
-        "legend_bg": "rgba(15, 23, 42, 0.72)",
+        # Transparent by default for any chart (the requested look): the
+        # legend draws no plate in either mode -- only the border below is
+        # mode-aware, and only when show_border draws a frame at all.
+        "legend_bg": "rgba(0, 0, 0, 0)",
         "legend_border": "rgba(148, 163, 184, 0.35)",
     },
     "light": {
@@ -2395,7 +3369,7 @@ CHART_THEME = {
         "hover_bg": "rgba(255, 255, 255, 0.97)",
         "hover_border": "rgba(79, 70, 229, 0.35)",
         "hover_text": "#0f172a",
-        "legend_bg": "rgba(255, 255, 255, 0.88)",
+        "legend_bg": "rgba(0, 0, 0, 0)",
         "legend_border": "rgba(100, 116, 139, 0.45)",
     },
 }
@@ -2404,6 +3378,7 @@ CHART_THEME = {
 # case-insensitively on the exact string, so anything not listed here (i.e. a
 # colour chosen from the Typography swatches) survives the switch untouched.
 _LIGHT_TEXT_REMAP = {
+    "#f1f5f9": "#1e293b",   # Pivot Table body text (table_font_color default)
     "#e2e8f0": "#334155",
     "#cbd5e1": "#334155",
     "#94a3b8": "#475569",
@@ -2542,17 +3517,20 @@ def theme_figure(fig, mode=None):
     except Exception:
         pass
 
-    # -- Legend plate + legend text (frame re-tinted only when one is drawn) -
+    # -- Legend background (transparent by default) + legend text ------------
     try:
         leg = dict(f2.layout.legend.to_plotly_json() or {})
+        # Transparent for ANY chart: no plate is drawn, so the card/grid
+        # shows through. The token carries it so both modes say the same
+        # thing -- there is nothing mode-dependent left to paint.
         leg["bgcolor"] = tok["legend_bg"]
         if int(leg.get("borderwidth") or 0) > 0:
             leg["bordercolor"] = tok["legend_border"]
-        # Legend item/legend title text sits ON the plate, so it has to follow
-        # the mode too -- it was the one piece of legend furniture the theme
-        # never touched, which is why light mode showed near-white labels
-        # ("mean"/"min"/"max") on a white plate. Same rule as the axes: a
-        # known dark default is remapped, a user-picked colour is not.
+        # Legend item/legend title text has to follow the mode WITHOUT a
+        # plate to sit on: it lands directly on the card, so a near-white
+        # default would vanish on a light card (and dark ink on a dark one).
+        # Same rule as the axes: a known dark default is remapped, a
+        # user-picked colour is not.
         lf = leg.get("font")
         if isinstance(lf, dict):
             new = _themed_text(lf.get("color"), key)
@@ -2577,6 +3555,23 @@ def theme_figure(fig, mode=None):
 
     # -- Trace text: value labels + colour bars ---------------------------
     for tr in getattr(f2, "data", []) or []:
+        # A pie / donut / funnel-area labels its slices from ``textinfo`` and
+        # picks the font from ``insidetextfont`` / ``outsidetextfont``, NOT
+        # from the generic ``textfont`` -- and the pie Layout options write
+        # the DARK default (``pie_value_color`` = #e2e8f0) into exactly those
+        # two. The generic pass below therefore never saw the colour that is
+        # actually drawn, so a light-mode pie painted near-white labels on a
+        # white canvas: the "values are washed out" report. Same rule as
+        # everywhere else -- a known dark default is remapped, a colour the
+        # user picked from the Typography swatches is not.
+        for attr in ("insidetextfont", "outsidetextfont"):
+            try:
+                tf = getattr(tr, attr, None)
+                new = _themed_text(tf.color if tf is not None else None, key)
+                if tf is not None and new is not None and new != tf.color:
+                    tf.color = new
+            except Exception:
+                pass
         try:
             tf = getattr(tr, "textfont", None)
             new = _themed_text(tf.color if tf is not None else None, key)
@@ -2593,4 +3588,72 @@ def theme_figure(fig, mode=None):
             _theme_one_colorbar(cb, key, tok)
         except Exception:
             pass
+
+    # -- Pivot Table (go.Table) -----------------------------------------
+    # The table runner hard-codes a DARK palette (near-black row stripes
+    # #1e293b/#0f172a, near-white body text #f1f5f9) and never re-reads the
+    # mode, so a light-mode table rendered as a dark slab with washed text --
+    # the "defaults to dark even in light mode / unreadable header" report.
+    # theme_figure is the one render-time hook every other chart type already
+    # flows through, so the table is re-tinted here too: in light mode the
+    # body becomes a white/near-white canvas with dark text, while the indigo
+    # header band keeps its fill (indigo + white header text stays legible on
+    # both modes). A user-picked header/stripe colour is NOT a known dark
+    # default, so it is left untouched, exactly like every other swatch.
+    _theme_table(f2, key)
     return f2
+
+
+# Row-stripe fills the pivot runner writes by default (matrix_table.py), mapped
+# to their light-mode equivalents. Anything else (a colour the user picked from
+# the Layout swatches) is not in this table and survives the switch unchanged.
+_LIGHT_TABLE_FILL_REMAP = {
+    "#1e293b": "#f1f5f9",   # even stripe -> light slate
+    "#0f172a": "#ffffff",   # odd stripe  -> white
+    "#0f2a3a": "#e2e8f0",   # value column even
+    "#0a1e2a": "#f8fafc",   # value column odd
+}
+
+
+def _remap_table_fill(color):
+    """Map a fill colour -- or a nested [col][row] array -- to its light twin."""
+    if isinstance(color, (list, tuple)):
+        return [_remap_table_fill(c) for c in color]
+    return _LIGHT_TABLE_FILL_REMAP.get(str(color).strip().lower(), color)
+
+
+def _theme_table(fig, key):
+    """Re-tint a Pivot Table's body fills/text for the active app mode.
+
+    Only the DARK DEFAULTS are remapped; a colour chosen in the Layout tab is
+    passed through, matching how every axis/legend/colorbar swatch behaves.
+    """
+    if key != "light":
+        return
+    for tr in getattr(fig, "data", []) or []:
+        if str(getattr(tr, "type", "")).lower() != "table":
+            continue
+        # -- Body text: near-white default -> dark on a light canvas -------
+        try:
+            cells = tr.cells
+            cf = dict(cells.font.to_plotly_json() or {})
+            new = _themed_text(cf.get("color"), key)
+            if new and new != cf.get("color"):
+                cf["color"] = new
+                cells.font = cf
+        except Exception:
+            pass
+        # -- Row-stripe fills -> light equivalents -------------------------
+        # The stripe pass writes the fill array COLUMN-major ([col][row]), so
+        # the remap walks nested arrays as well as the old flat form.
+        try:
+            cells = tr.cells
+            fills = cells.fill.to_plotly_json() or {}
+            color = fills.get("color")
+            if isinstance(color, list):
+                mapped = _remap_table_fill(color)
+                if mapped != color:
+                    cells.fill = dict(fills, color=mapped)
+        except Exception:
+            pass
+

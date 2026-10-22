@@ -39,7 +39,7 @@ def apply_lytrize_standard(
         title=title_dict,
         legend=dict(
             title=dict(text=legend or ""),
-            bgcolor="rgba(15,23,42,0.35)",
+            bgcolor="rgba(0,0,0,0)",
             orientation="v"
         )
     )

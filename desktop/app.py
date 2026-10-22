@@ -135,7 +135,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
 
-    # Register the fonts the app ships (app_assets/fonts) with Qt. This must be
+    # Register the fonts the app ships (backend/assets/fonts) with Qt. This must be
     # AFTER the QApplication exists -- QFontDatabase needs one -- unlike the
     # fontconfig guard above, which has to run before it. Without this the
     # settings panel's font preview and the combo boxes cannot see the bundled

@@ -32,6 +32,7 @@ from services.transform_service import (
 )
 from desktop.workers import TransformWorker
 from desktop.widgets.table_index_header import auto_fit_index_header
+from desktop.widgets.resizable_table import apply_table_defaults, fit_columns_to_content
 
 log = logging.getLogger(__name__)
 
@@ -128,7 +129,10 @@ def make_preview_table(headers):
     tbl = QTableWidget()
     tbl.setColumnCount(len(headers))
     tbl.setHorizontalHeaderLabels(list(headers))
-    tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+    # Readable, scrollable columns instead of Stretch (see resizable_table.py):
+    # Stretch force-fit every column to viewport/N, squeezing wide datasets to
+    # ~30px cells with no horizontal scrollbar.
+    apply_table_defaults(tbl)
     tbl.setMinimumHeight(PREVIEW_MIN_HEIGHT)
     return tbl
 
@@ -1123,6 +1127,9 @@ class DataCleanerPanel(QWidget):
                 table.setItem(i, j, item)
         # Row count just changed -> re-measure the index gutter.
         auto_fit_index_header(table)
+        # Content set changed -> fit the columns to their (capped) content
+        # instead of squeezing them. See resizable_table.py.
+        fit_columns_to_content(table)
 
     # -- Worker helpers ------------------------------------------------------
 

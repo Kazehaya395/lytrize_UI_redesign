@@ -77,7 +77,8 @@ def get_user_sessions(user_id: int) -> list:
 
     conn = _db._connect()
     wanted = ["id", "session_name", "file_name", "rows_count",
-              "cols_count", "analysis_types", "created_at"]
+              "cols_count", "analysis_types", "created_at",
+              "dataset_uri", "dataset_hash", "slicers_json"]
     try:
         c = conn.cursor()
         c.execute("PRAGMA table_info(sessions)")
@@ -97,12 +98,19 @@ def get_user_sessions(user_id: int) -> list:
             (user_id,),
         )
         rows = c.fetchall()
-        n_got = len(select_cols.split(","))
-        n_wanted = len(wanted)
-        if n_got < n_wanted:
-            pad_count = n_wanted - n_got
-            rows = [tuple(list(r) + [None] * pad_count) for r in rows]
-        return rows
+        # Pad MISSING columns in position (not just appended at the end):
+        # Home reads dataset_uri at index 7 and slicers_json at index 9,
+        # so a row from an old DB without those columns must carry None
+        # in exactly those slots, or every later field shifts.
+        have = [col for col in wanted if col in available_cols]
+        full = [None] * len(wanted)
+        fixed = []
+        for r in rows:
+            for pos, val in zip([wanted.index(c) for c in have], r):
+                full[pos] = val
+            fixed.append(tuple(full))
+            full = [None] * len(wanted)
+        return fixed
     except Exception as e:
         log.warning("get_user_sessions: %s", e)
         return []

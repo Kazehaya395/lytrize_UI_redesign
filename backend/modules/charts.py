@@ -12,20 +12,13 @@ import logging
 import json
 import re
 import pandas as pd
-import plotly.io as pio
 
 
 # ---------------------------------------------------------------------------
 # JSON-safe key sanitizer
 # ---------------------------------------------------------------------------
 def _json_safe(obj):
-    """Recursively walk obj and convert any non-JSON-safe dict keys to strings.
-
-    Plotly meta attributes can produce tuple keys (e.g. ``{(x, y): val}``),
-    which crash ``json.dumps``.  This helper guarantees every dict key in the
-    output is a ``str``, ``int``, ``float``, or ``bool`` so serialisation
-    always succeeds.
-    """
+    """Recursively normalize data into JSON-safe primitives."""
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
@@ -131,7 +124,7 @@ PALETTES = {
 # Helpers
 # ---------------------------------------------------------------------------
 def chart_layout(height: int | None = None) -> dict:
-    """Return a dict of Plotly layout kwargs used by every chart in Lytrize."""
+    """Return legacy layout defaults for compatibility callers."""
     layout = dict(
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
@@ -154,66 +147,8 @@ def chart_layout(height: int | None = None) -> dict:
 
 
 def apply_hover_format(fig) -> None:
-    """Apply K/M/B-formatted hovertemplates to every trace in a Plotly figure."""
-    for trace in fig.data:
-        existing = getattr(trace, "hovertemplate", None) or ""
-        if "customdata" in existing:
-            continue
-
-        ttype = type(trace).__name__.lower()
-
-        if ttype == "bar":
-            orient = getattr(trace, "orientation", "v") or "v"
-            if orient == "h":
-                trace.hovertemplate = (
-                    "<b>%{y}</b><br>"
-                    "Value: <b>%{x:.3~s}</b>"
-                    "<extra></extra>"
-                )
-            else:
-                trace.hovertemplate = (
-                    "<b>%{x}</b><br>"
-                    "Value: <b>%{y:.3~s}</b>"
-                    "<extra></extra>"
-                )
-
-        elif ttype == "scatter":
-            trace_name = getattr(trace, "name", "") or ""
-            if trace_name:
-                trace.hovertemplate = (
-                    f"<b>{trace_name}</b><br>"
-                    "%{x}<br>"
-                    "Value: <b>%{y:,.2f}</b>"
-                    "<extra></extra>"
-                )
-            else:
-                trace.hovertemplate = (
-                    "<b>%{x}</b><br>"
-                    "Value: <b>%{y:,.2f}</b>"
-                    "<extra></extra>"
-                )
-
-        elif ttype == "histogram":
-            trace.hovertemplate = (
-                "Range: <b>%{x}</b><br>"
-                "Count: <b>%{y:.3~s}</b>"
-                "<extra></extra>"
-            )
-
-        elif ttype in ("pie", "sunburst"):
-            trace.hovertemplate = (
-                "<b>%{label}</b><br>"
-                "Value: <b>%{value:.3~s}</b><br>"
-                "Share: %{percent}"
-                "<extra></extra>"
-            )
-
-        elif ttype == "heatmap":
-            trace.hovertemplate = (
-                "%{x} × %{y}<br>"
-                "r = <b>%{z:.3f}</b>"
-                "<extra></extra>"
-            )
+    """Compatibility no-op; ECharts hover formatters live in the adapter."""
+    return None
 
 
 def num_cols(df: pd.DataFrame) -> list:

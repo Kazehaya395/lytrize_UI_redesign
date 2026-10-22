@@ -14,7 +14,6 @@ from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
-import plotly.io as pio
 
 from modules.charts import (
     PALETTES,
@@ -191,15 +190,19 @@ def serialize_chart(uid: str, title: str, fig: Any, *,
     plotted. This is the ONLY point where that happens: the live figure passed
     in by the caller is never mutated.
     """
-    persist_fig = downsample_fig_for_persist(fig)
-    return {
+    common = {
         "uid":        uid,
         "title":      title,
-        "fig_json":   pio.to_json(persist_fig),
         "desc":       desc,
         "chart_type": chart_type,
         "meta":       _json_safe(meta or {}),
     }
+    if isinstance(fig, dict) and fig.get("schema_version") == 1 \
+            and fig.get("kind") == "chart":
+        from modules.chart_model import chart_model_to_json
+        common["chart_model_json"] = chart_model_to_json(fig)
+        return common
+    raise TypeError("Chart persistence accepts native ECharts ChartModels only")
 
 
 def deserialize_chart(item: dict) -> Optional[tuple]:
@@ -210,7 +213,20 @@ def deserialize_chart(item: dict) -> Optional[tuple]:
         desc       = item.get("desc", "")
         chart_type = item.get("chart_type", "")
         meta       = item.get("meta", {})
-        fig        = pio.from_json(item["fig_json"])
+        if item.get("chart_model_json"):
+            from modules.chart_model import chart_model_from_json
+            fig = chart_model_from_json(item["chart_model_json"])
+        else:
+            # Read historical Plotly JSON as plain data and convert it at the
+            # storage boundary. Plotly is not imported or executed.
+            raw = json.loads(item["fig_json"])
+            from modules.legacy_plotly_adapter import figure_to_chart_model
+            fig = figure_to_chart_model(
+                raw, uid=str(uid), chart_type=str(chart_type),
+                title=str(title), meta=meta)
+            if fig is None:
+                log.warning("Skipping unsupported legacy chart %s", uid)
+                return None
         return (uid, title, fig, desc, chart_type, meta)
     except Exception as exc:
         log.debug("deserialize_chart: %s", exc)
@@ -410,12 +426,77 @@ def run_chart_recipe(recipe: dict, df: pd.DataFrame, *,
     if not chart_type:
         log.debug("run_chart_recipe: recipe has no chart_type")
         return None
+    if chart_type == "descriptive" and recipe.get("engine") == "polars":
+        # Native descriptive tables are regenerated from their semantic recipe
+        # when a dashboard slicer changes. Keep this model path out of the
+        # Plotly runner registry, while retaining the saved canvas uid.
+        from services.polars_engine import PolarsDataset
+        from services.polars_chart_service import build_descriptive_table_chart
+        dataset = PolarsDataset.from_pandas(df, source="slicer-rebuild")
+        model = build_descriptive_table_chart(
+            dataset, layout=recipe.get("layout"),
+            typography=recipe.get("typography"),
+        )
+        if model is None:
+            return None
+        model["uid"] = str(recipe.get("uid") or model["uid"])
+        return model["uid"], model["title"], model
+    if chart_type == "outlier" and recipe.get("engine") == "polars":
+        # Outlier cards are semantic scatter models. Re-run the IQR query
+        # against the filtered frame so dashboard slicers update both points
+        # and fences without entering the legacy Plotly runner/display path.
+        from services.polars_engine import PolarsDataset
+        from services.polars_chart_service import build_outlier_charts
+        model_recipe = dict(recipe.get("chart_model_recipe") or {})
+        config = dict(model_recipe.get("config") or recipe.get("config") or {})
+        column = config.get("column")
+        if not column or column not in df.columns:
+            log.info("run_chart_recipe: outlier column is absent from filtered frame")
+            return None
+        dataset = PolarsDataset.from_pandas(df, source="slicer-rebuild")
+        models = build_outlier_charts(
+            dataset, [column], multiplier=config.get("multiplier", 1.5),
+            typography=recipe.get("typography"),
+        )
+        if not models:
+            return None
+        model = models[0]
+        model["uid"] = str(recipe.get("uid") or model["uid"])
+        return model["uid"], model["title"], model
+    if chart_type == "data_quality" and recipe.get("engine") == "polars":
+        from services.polars_engine import PolarsDataset
+        from services.polars_chart_service import build_data_quality_charts
+        model_recipe = dict(recipe.get("chart_model_recipe") or {})
+        view = dict(model_recipe.get("config") or {}).get("view")
+        dataset = PolarsDataset.from_pandas(df, source="slicer-rebuild")
+        models = build_data_quality_charts(dataset)
+        model = next((item for item in models
+                      if dict((item.get("recipe") or {}).get("config") or {})
+                      .get("view") == view), None)
+        if model is None:
+            return None
+        model["uid"] = str(recipe.get("uid") or model["uid"])
+        return model["uid"], model["title"], model
+    if chart_type == "map_plot":
+        from services.polars_engine import PolarsDataset
+        from services.polars_chart_service import build_map_plot_chart
+        model_recipe = dict(recipe.get("chart_model_recipe") or {})
+        config = dict(model_recipe.get("config") or recipe.get("config") or {})
+        dataset = PolarsDataset.from_pandas(df, source="slicer-rebuild")
+        model = build_map_plot_chart(
+            dataset, config, layout=model_recipe.get("layout") or recipe.get("layout"),
+            typography=model_recipe.get("typography") or recipe.get("typography"),
+        )
+        if model is None:
+            return None
+        model["uid"] = str(recipe.get("uid") or model["uid"])
+        return model["uid"], model["title"], model
     return _rebuild_one(recipe, chart_type, df, roles=roles)
 
 
 def _rebuild_one(recipe: dict, chart_type: str, df: pd.DataFrame, *,
                  roles: Optional[dict] = None) -> Optional[tuple]:
-    """Build one figure from *recipe*, preserving the chart's uid.
+    """Build one semantic model from *recipe*, preserving the chart's uid.
 
     The uid is the whole point. ``run_analysis`` mints a **fresh random uid**
     for every figure it returns (``analysis_service.run_analysis``), which is
@@ -425,10 +506,7 @@ def _rebuild_one(recipe: dict, chart_type: str, df: pd.DataFrame, *,
     board. So the runner is called directly here rather than through
     ``run_analysis``, and the recipe's own uid is carried through.
     """
-    from services.analysis_service import (
-        _accepts_roles, _RUNNERS, build_analysis_config,
-    )
-    from chart_display import apply_display_options
+    from services.analysis_service import build_analysis_config, run_analysis
 
     uid = str(recipe.get("uid") or "")
     if not uid:
@@ -437,11 +515,6 @@ def _rebuild_one(recipe: dict, chart_type: str, df: pd.DataFrame, *,
 
     if df is None:
         log.debug("run_chart_recipe: no dataset to rebuild against")
-        return None
-
-    fn = _RUNNERS.get(chart_type)
-    if fn is None:
-        log.debug("_rebuild_one: no runner for %r", chart_type)
         return None
 
     if getattr(df, "empty", False):
@@ -503,10 +576,11 @@ def _rebuild_one(recipe: dict, chart_type: str, df: pd.DataFrame, *,
             stale.extend(dropped)
 
     try:
-        kwargs = build_analysis_config(chart_type, df, config, roles=roles)
-        if roles is not None and _accepts_roles(fn):
-            kwargs["roles"] = roles
-        raw = fn(df, **kwargs)
+        runner_config = build_analysis_config(chart_type, df, config, roles=roles)
+        raw = run_analysis(
+            chart_type, df, roles=roles, **runner_config,
+            layout=dict(recipe.get("layout") or {}),
+            typography=dict(recipe.get("typography") or {}))
     except Exception as exc:
         log.warning("run_chart_recipe: %s failed for %r: %s",
                     chart_type, uid, exc)
@@ -522,22 +596,15 @@ def _rebuild_one(recipe: dict, chart_type: str, df: pd.DataFrame, *,
     # ``raw`` is [(title, fig), ...]. A multi-select config can yield several;
     # the first is the chart this uid refers to, exactly as
     # ``analysis_page._on_generate_finished`` does when re-generating.
-    title, fig = raw[0]
-
-    layout = recipe.get("layout")
-    typo = recipe.get("typography")
-    if layout is not None or typo is not None:
+    _new_uid, title, fig = raw[0]
+    fig["uid"] = uid
+    if recipe.get("layout") is not None or recipe.get("typography") is not None:
         try:
-            fig = apply_display_options(fig, layout, typo)
+            from services.polars_chart_service import apply_chart_model_display_options
+            fig = apply_chart_model_display_options(
+                fig, recipe.get("layout") or {}, recipe.get("typography") or {})
         except Exception as exc:
-            # Styling is cosmetic. A failure here must not cost the user the
-            # re-rendered chart itself.
-            log.warning("run_chart_recipe: display options failed for %r: %s",
-                        uid, exc)
-    try:
-        apply_hover_format(fig)
-    except Exception as exc:
-        log.debug("run_chart_recipe: hover format failed for %r: %s", uid, exc)
+            log.warning("run_chart_recipe: display options failed for %r: %s", uid, exc)
 
     if stale:
         log.info("run_chart_recipe: %r dropped missing columns: %s",

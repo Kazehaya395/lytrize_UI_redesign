@@ -43,6 +43,7 @@ class SessionBridge(QObject):
 
         # Internal mirror to avoid emitting the same df twice
         self._last_df: Optional[pd.DataFrame] = None
+        self._polars_dataset = None
 
         # Async draft-save queue (latest-wins). save_draft() serialises the
         # whole session (Plotly to_json + SQLite write) which stalls the UI
@@ -63,15 +64,20 @@ class SessionBridge(QObject):
     # -- Python callbacks → Qt signals --
     def _on_df_changed(self, df: pd.DataFrame) -> None:
         self._last_df = df
+        # DataFrame edits still originate in legacy pages. Invalidate the
+        # separate Polars snapshot so the next native operation rebuilds it
+        # from the edited frame instead of silently using stale CSV rows.
+        self._polars_dataset = None
         # A new frame invalidates every cache keyed on the old one's identity:
         # column roles and the slicer's distinct-value lists are memoised per
         # frame (see services.column_roles / services.filter_service), and
         # leaving them alive would answer from the dataset the user just left.
         try:
             from services.column_roles import clear_roles_cache
-            from services.filter_service import clear_distinct_cache
+            from services.filter_service import clear_distinct_cache, clear_mask_cache
             clear_roles_cache()
             clear_distinct_cache()
+            clear_mask_cache()
         except Exception:                 # caching must never break a load
             pass
         self.df_changed.emit(df)
@@ -105,6 +111,25 @@ class SessionBridge(QObject):
 
     def set_df(self, df: pd.DataFrame) -> None:
         self._manager.df = df
+
+    def set_polars_dataset(self, dataset) -> None:
+        """Store the optional native query snapshot associated with this data."""
+        self._polars_dataset = dataset
+
+    def polars_dataset(self, *, create_if_missing: bool = True):
+        """Return the current Polars snapshot, creating a compatibility copy.
+
+        CSV import supplies a direct ``scan_csv`` snapshot. After legacy data
+        edits, this creates a fresh Polars snapshot from the current pandas
+        frame at the boundary instead of reusing stale rows.
+        """
+        if self._polars_dataset is None and create_if_missing and self.df is not None:
+            try:
+                from services.polars_engine import PolarsDataset
+                self._polars_dataset = PolarsDataset.from_pandas(self.df)
+            except Exception as exc:
+                log.debug("Polars compatibility snapshot unavailable: %s", exc)
+        return self._polars_dataset
 
     def add_chart(self, uid: str, title: str, fig: Any, chart_type: str = "",
                   meta: Optional[dict] = None, note: str = "") -> None:
@@ -224,6 +249,10 @@ class SessionBridge(QObject):
             if k.startswith("chart_meta_") and isinstance(v, dict)
         }
         notes = dict(self._manager._notes_shadow)
+        # Free-canvas placement. Without this the draft restores every chart
+        # but re-auto-places it, so a relaunch (autosave fires on every edit)
+        # silently undid every drag -- the "canvas position resets" report.
+        tile_geometry = self._manager.get("tile_geometry", {}) or {}
 
         # charts_to_json only emits chart_type from tuple slot 4, but charts
         # are stored as bare 3-tuples -- the type lives in a separate
@@ -254,6 +283,7 @@ class SessionBridge(QObject):
                 default=str,
             ),
             layout_mode=self._manager.get("layout_mode", "portrait"),
+            tile_geometry_json=json.dumps(tile_geometry, default=str),
         )
         if self._save_sync:
             # Tests only: deterministic, same-thread write.
@@ -398,6 +428,16 @@ class SessionBridge(QObject):
             kpis = []
         if kpis:
             self._manager.set("kpis", kpis)
+
+        # -- Free-canvas placement. Restored AFTER the charts so the geometry
+        #    the user dragged is put back verbatim instead of the dashboard
+        #    re-auto-placing every card on the restored list.
+        try:
+            tile_geometry = json.loads(draft.get("tile_geometry_json") or "{}")
+        except (ValueError, TypeError):
+            tile_geometry = {}
+        if isinstance(tile_geometry, dict) and tile_geometry:
+            self._manager.set("tile_geometry", tile_geometry)
 
         log.info("restore_draft: restored %d chart(s) for user %s",
                  len(charts), user_id)

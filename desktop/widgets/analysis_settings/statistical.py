@@ -3,6 +3,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLineEdit, QCheckBox, QPushButton, QLabel, QSizePolicy
 from .base import (AnalysisSettingsBase, section_label, hint_label, cap_widget, multi_select_combo, slider_with_readout, color_swatch, live_preview_label, apply_preview_font, legend_position_row, legend_orientation_row, colorbar_position_row, COMPACT_W, GEN_W, PAGE_MARGINS, PAGE_SPACING, ROW_SPACING, HINT_GAP, SECTION_GAP, page_root, section_box, grid_row, FlowGrid)
+from desktop.theme import group_label_style
 NONE_SENTINEL = ''
 # The "no grouping" entry renders as a blank field, not the literal word
 # "None". "None" read like an actual selectable value sitting in the combo,
@@ -57,7 +58,7 @@ class StatisticalSettings(AnalysisSettingsBase):
             self._layout_opts = {}
             self._typo_opts = {}
         self._pending = {'x': None, 'y': [], 'palette': None}
-        for attr in ('_as_slider', '_as_spin', '_axs_slider', '_axs_spin', '_cb_bmode', '_cb_fam', '_cb_fstyle', '_cb_halign', '_cb_hfont', '_cb_hfstyle', '_cb_legclick', '_cb_legorder', '_cb_legorient', '_cb_legpos', '_cb_lpos', '_ck_border', '_ck_grid', '_ck_vals', '_combo_groupby', '_combo_metrics', '_combo_palette', '_gap_slider', '_gap_spin', '_hs_slider', '_hs_spin', '_le_leg', '_le_title', '_le_x', '_le_y', '_ls_slider', '_ls_spin', '_prev1', '_prev2', '_sw_acol', '_sw_hcol', '_sw_lcol', '_sw_tcol', '_ts_slider', '_ts_spin'):
+        for attr in ('_as_slider', '_as_spin', '_axs_slider', '_axs_spin', '_cb_bmode', '_cb_fam', '_cb_fstyle', '_cb_halign', '_cb_hfont', '_cb_hfstyle', '_cb_legclick', '_cb_legorder', '_cb_legorient', '_cb_legpos', '_cb_lpos', '_ck_border', '_ck_grid', '_ck_vals', '_combo_groupby', '_combo_metrics', '_combo_palette', '_gap_slider', '_gap_spin', '_hs_slider', '_hs_spin', '_le_leg', '_le_title', '_le_x', '_le_y', '_ls_slider', '_ls_spin', '_prev1', '_prev2', '_sw_acol', '_sw_hcol', '_sw_lcol', '_sw_tcol', '_ts_slider', '_ts_spin', '_vs_spin', '_sw_vcol', '_ck_vauto', '_tips_spin', '_sw_tipcol', '_ck_tipauto'):
             if not hasattr(self, attr):
                 setattr(self, attr, None)
     def prefill(self, values):
@@ -185,7 +186,7 @@ class StatisticalSettings(AnalysisSettingsBase):
                     w.blockSignals(False)
             except Exception:
                 pass
-        for attr, key, dflt in (("_hs_spin", "header_size", 28), ("_ts_spin", "axis_title_size", 16), ("_axs_spin", "axis_tick_size", 12), ("_ls_spin", "legend_item_size", 11)):
+        for attr, key, dflt in (("_hs_spin", "header_size", 28), ("_ts_spin", "axis_title_size", 16), ("_axs_spin", "axis_tick_size", 12), ("_ls_spin", "legend_item_size", 11), ("_vs_spin", "value_label_size", 11), ("_tips_spin", "tooltip_size", 12)):
             try:
                 w = getattr(self, attr, None)
                 if w is not None:
@@ -203,11 +204,24 @@ class StatisticalSettings(AnalysisSettingsBase):
                 w.blockSignals(False)
         except Exception:
             pass
-        for attr, key in (("_sw_hcol", "header_color"), ("_sw_tcol", "axis_title_color"), ("_sw_acol", "axis_tick_color"), ("_sw_lcol", "legend_item_color")):
+        for attr, key in (("_sw_hcol", "header_color"), ("_sw_tcol", "axis_title_color"), ("_sw_acol", "axis_tick_color"), ("_sw_lcol", "legend_item_color"), ("_sw_vcol", "value_label_color"), ("_sw_tipcol", "tooltip_color")):
             try:
                 w = getattr(self, attr, None)
                 if w is not None and hasattr(w, "_retint"):
-                    w._retint(str(self._typo_opts.get(key, "")))
+                    value = str(self._typo_opts.get(key, ""))
+                    w._retint("#111827" if value.lower() == "auto" else value)
+            except Exception:
+                pass
+        for attr, key in (("_ck_vauto", "value_label_color"), ("_ck_tipauto", "tooltip_color")):
+            try:
+                check = getattr(self, attr, None)
+                if check is not None:
+                    check.blockSignals(True)
+                    check.setChecked(str(self._typo_opts.get(key, "auto")).lower() == "auto")
+                    check.blockSignals(False)
+                    swatch = getattr(self, "_sw_vcol" if key == "value_label_color" else "_sw_tipcol", None)
+                    if swatch is not None:
+                        swatch.setEnabled(not check.isChecked())
             except Exception:
                 pass
         try:
@@ -399,7 +413,7 @@ class StatisticalSettings(AnalysisSettingsBase):
         # charts already had, so this is a control over the existing border,
         # not a new decoration.
         self._ck_border = QCheckBox('Show border')
-        self._ck_border.setChecked(bool(self._layout_opts.get('show_border', True)))
+        self._ck_border.setChecked(bool(self._layout_opts.get('show_border', False)))
         self._ck_border.setToolTip(
             'Border around the legend, colour bar / colour range')
         self._ck_border.toggled.connect(lambda v: self._set_layout(show_border=bool(v)))
@@ -460,6 +474,13 @@ class StatisticalSettings(AnalysisSettingsBase):
         bl.addWidget(grid_row('Font style', self._cb_fstyle, label_w))
         self._prev1 = live_preview_label()
         bl.addWidget(self._prev1)
+        value_size = slider_with_readout(8, 32, int(self._typo_opts.get('value_label_size', 11)))
+        self._vs_spin = value_size._as_spin
+        self._vs_spin.valueChanged.connect(lambda v: self._set_typo(value_label_size=int(v)))
+        bl.addWidget(grid_row('Value size', value_size, label_w))
+        value_color_row, self._ck_vauto, self._sw_vcol = self._auto_color_control(
+            'value_label_color', 'Value color')
+        bl.addWidget(value_color_row)
         bl.addStretch()
         # -- Column 2: the header (the chart title) + its live preview ------
         hs = slider_with_readout(10, 60, int(self._typo_opts.get('header_size', 28)))
@@ -538,6 +559,13 @@ class StatisticalSettings(AnalysisSettingsBase):
         al.addWidget(grid_row('Legend size', ls, label_w))
         self._sw_lcol = color_swatch(str(self._typo_opts.get('legend_item_color', '#e2e8f0')), lambda c: self._set_typo(legend_item_color=c, legend_title_color=c))
         al.addWidget(grid_row('Legend color', self._sw_lcol, label_w))
+        tooltip_size = slider_with_readout(8, 32, int(self._typo_opts.get('tooltip_size', 12)))
+        self._tips_spin = tooltip_size._as_spin
+        self._tips_spin.valueChanged.connect(lambda v: self._set_typo(tooltip_size=int(v)))
+        al.addWidget(grid_row('Tooltip size', tooltip_size, label_w))
+        tooltip_color_row, self._ck_tipauto, self._sw_tipcol = self._auto_color_control(
+            'tooltip_color', 'Tooltip color')
+        al.addWidget(tooltip_color_row)
         al.addStretch()
         cl.addWidget(body, stretch=1)
         cl.addWidget(head, stretch=1)
@@ -546,6 +574,30 @@ class StatisticalSettings(AnalysisSettingsBase):
         rl.addStretch()
         self._refresh_previews()
         return root
+    def _auto_color_control(self, key, label):
+        """Color picker with a theme-aware automatic-contrast default."""
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(ROW_SPACING)
+        caption = QLabel(label)
+        caption.setStyleSheet(group_label_style())
+        caption.setProperty('theme_role', 'section')
+        lay.addWidget(caption)
+        lay.addStretch()
+        auto = QCheckBox('Auto')
+        auto.setToolTip('Choose a readable color automatically for the current chart theme')
+        current = str(self._typo_opts.get(key, 'auto'))
+        is_auto = current.lower() == 'auto'
+        swatch = color_swatch('#111827' if is_auto else current,
+                              lambda color: self._set_typo(**{key: color}))
+        swatch.setEnabled(not is_auto)
+        auto.setChecked(is_auto)
+        auto.toggled.connect(lambda checked: (swatch.setEnabled(not checked),
+            self._set_typo(**{key: 'auto' if checked else str(swatch.text() or '#111827')})))
+        lay.addWidget(auto)
+        lay.addWidget(swatch)
+        return row, auto, swatch
     def _set_typo(self, emit=True, discrete=False, **kw):
         """Update typography options and (optionally) notify listeners.
 

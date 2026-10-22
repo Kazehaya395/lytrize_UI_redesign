@@ -24,8 +24,8 @@ from PySide6.QtWidgets import (
 )
 
 from services import transform_service as ts
-from modules.analysis.data_quality import run_data_quality, duplicate_count
-from modules.analysis.outlier import detect_outliers, remove_outlier_rows
+from modules.analysis.data_quality import run_data_quality
+from modules.analysis.outlier import remove_outlier_rows
 
 log = logging.getLogger(__name__)
 
@@ -613,8 +613,6 @@ class DataCleanerTab(_BaseToolTab):
 class DataQualityTab(_BaseToolTab):
     def __init__(self, get_df, parent=None) -> None:
         super().__init__(get_df, parent)
-        from desktop.widgets.plotly_view import PlotlyView
-
         root = QVBoxLayout(self)
         self.btn_run = QPushButton("🔍 Run Data Quality Analysis")
         self.btn_run.setProperty("kind", "primary")
@@ -631,8 +629,6 @@ class DataQualityTab(_BaseToolTab):
         pass
 
     def _run(self) -> None:
-        from desktop.widgets.plotly_view import PlotlyView
-
         for v in self._views:
             v.deleteLater()
         self._views.clear()
@@ -642,8 +638,7 @@ class DataQualityTab(_BaseToolTab):
             self._error("No dataset loaded.")
             return
 
-        run_df = df.sample(100_000, random_state=42) if len(df) > 100_000 else df
-        charts = run_data_quality(run_df)
+        charts = run_data_quality(df)
         if not charts:
             lbl = QLabel("✅ No data quality issues detected.")
             lbl.setStyleSheet("color: #10b981;")
@@ -652,8 +647,11 @@ class DataQualityTab(_BaseToolTab):
             return
 
         for title, fig in charts:
-            view = PlotlyView()
-            view.set_figure(fig)
+            from desktop.widgets.echarts_web_view import EChartsWebView
+            view = EChartsWebView()
+            view.setMinimumHeight(260)
+            view.setMaximumHeight(380)
+            view.set_chart_model(fig)
             self.results_area.addWidget(view)
             self._views.append(view)
 
@@ -697,13 +695,18 @@ class OutlierTab(_BaseToolTab):
         self.btn_delete_all.setProperty("kind", "danger")
         self.btn_delete_all.setEnabled(False)
         root.addWidget(self.btn_delete_all, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.chart_area = QVBoxLayout()
+        self.chart_area.setSpacing(8)
+        root.addLayout(self.chart_area)
         root.addStretch()
 
         self.btn_detect.clicked.connect(self._detect)
         self.btn_delete_all.clicked.connect(self._delete_all)
         self._results = None
+        self._chart_views = []
 
     def refresh(self) -> None:
+        self._clear_outlier_charts()
         df = self.df
         self.col_list.clear()
         self.summary_table.clear()
@@ -733,7 +736,13 @@ class OutlierTab(_BaseToolTab):
         if df is None or not cols:
             self._error("Select at least one numeric column.")
             return
-        results = detect_outliers(df, cols, self.mult.value())
+        self._clear_outlier_charts()
+        from services.polars_engine import PolarsDataset
+        from services.polars_chart_service import (
+            build_outlier_charts, detect_outliers_polars,
+        )
+        dataset = PolarsDataset.from_pandas(df, source="outlier-tool")
+        results = detect_outliers_polars(dataset, cols, self.mult.value())
         results = {c: v for c, v in results.items() if v["out_count"] > 0}
         self._results = results
         if not results:
@@ -751,18 +760,35 @@ class OutlierTab(_BaseToolTab):
             for c, v in results.items()
         ])
         _fill_preview_table(self.summary_table, summary_df)
+        models = build_outlier_charts(dataset, list(results),
+                                      multiplier=self.mult.value())
+        from desktop.widgets.echarts_web_view import EChartsWebView
+        for model in models:
+            view = EChartsWebView()
+            view.setMinimumHeight(260)
+            view.setMaximumHeight(340)
+            view.set_chart_model(model)
+            self.chart_area.addWidget(view)
+            self._chart_views.append(view)
         self.btn_delete_all.setEnabled(True)
+
+    def _clear_outlier_charts(self) -> None:
+        while self.chart_area.count():
+            item = self.chart_area.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._chart_views.clear()
 
     def _delete_all(self) -> None:
         df = self.df
         if df is None or not self._results:
             return
-        all_idx = set()
-        for c, info in self._results.items():
-            mask = (df[c] < info["lo"]) | (df[c] > info["hi"])
-            all_idx.update(df.index[mask].tolist())
-        new_df = remove_outlier_rows(df, list(all_idx))
-        self.apply_requested.emit(new_df, f"Removed {len(all_idx):,} outlier row(s).")
+        row_ids = set()
+        for info in self._results.values():
+            row_ids.update(info.get("row_ids", []))
+        new_df = remove_outlier_rows(df, row_ids=list(row_ids))
+        self.apply_requested.emit(new_df, f"Removed {len(row_ids):,} outlier row(s).")
 
 
 # =========================================================================

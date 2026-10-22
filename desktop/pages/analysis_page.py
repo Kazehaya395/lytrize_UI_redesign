@@ -431,7 +431,7 @@ class AnalysisPage(QWidget):
 
         if target_uid is not None:
             self._settings_target_uid = target_uid
-            meta = self.bridge.get_chart_meta(target_uid)
+            meta = self._chart_settings_meta(target_uid)
             self.config_panel.prefill(prefill if prefill is not None
                                       else (meta.get("config") or {}))
             self.config_panel.prefill_layout(meta.get("layout") or {})
@@ -469,6 +469,7 @@ class AnalysisPage(QWidget):
         if not (0 <= idx < len(self._tab_order)):
             if self._settings_target_uid is not None:
                 self._settings_target_uid = None
+                self._update_config_chart_no()
                 self._update_regen_state()
             return
         uid = self._tab_order[idx]
@@ -486,13 +487,32 @@ class AnalysisPage(QWidget):
             # Same chart already bound -- keep in-progress edits.
             self._update_regen_state()
             return
-        meta = self.bridge.get_chart_meta(uid)
+        meta = self._chart_settings_meta(uid)
         self._settings_target_uid = uid
         self.config_panel.prefill(meta.get("config") or {})
         self.config_panel.prefill_layout(meta.get("layout") or {})
         self.config_panel.prefill_typography(meta.get("typography") or {})
         self.config_panel.reset_dirty()
+        self._update_config_chart_no()
         self._update_regen_state()
+
+    def _chart_settings_meta(self, uid: str) -> dict:
+        """Return saved per-chart settings, including older native sessions.
+
+        The bridge metadata is authoritative when present. A few sessions
+        created during the renderer migration have the settings only inside
+        the ChartModel recipe, so use that recipe to fill any missing blocks.
+        """
+        meta = dict(self.bridge.get_chart_meta(uid) or {})
+        chart = next((item for item in self.bridge.get("charts", [])
+                      if item[0] == uid), None)
+        model = chart[2] if chart and isinstance(chart[2], dict) else None
+        recipe = (model or {}).get("recipe") if (model or {}).get("schema_version") == 1 else None
+        if isinstance(recipe, dict):
+            for key in ("config", "layout", "typography"):
+                if isinstance(recipe.get(key), dict):
+                    meta[key] = dict(recipe[key])
+        return meta
 
     def _update_config_chart_no(self) -> None:
         """Tell the settings header WHICH chart the form is bound to.
@@ -578,7 +598,11 @@ class AnalysisPage(QWidget):
         self._take_descriptive_placeholder()
         if results:
             uid, title, fig = results[0]
-            card = ChartCard(uid, title, fig, "descriptive")
+            chart_model = (fig if isinstance(fig, dict)
+                           and fig.get("schema_version") == 1
+                           and fig.get("kind") == "chart" else None)
+            card = ChartCard(uid, title, fig, "descriptive",
+                             chart_model=chart_model)
             card.set_note("")
             for btn in (card.btn_edit, card.btn_style, card.btn_delete,
                         card.btn_up, card.btn_down, card.btn_fullwidth):
@@ -681,54 +705,38 @@ class AnalysisPage(QWidget):
             return
         layout = self.config_panel.collect_layout()
         typo = self.config_panel.collect_typography()
-        # The live card knows how wide it actually is. Passing that in sizes
-        # the reserved legend column to the pixels the labels need, instead of
-        # a flat fraction of the card -- which is what left a wide gap between
-        # the plot and the legend on a full-width chart.
-        width_px = None
-        try:
-            pv = card.plot_view
-            wv = getattr(pv, "_web_view", None)
-            if wv is not None and wv.width() > 0:
-                width_px = wv.width()
-        except Exception:
-            width_px = None
-        try:
-            from chart_display import apply_display_options
-            new_fig = apply_display_options(card._base_fig, layout, typo,
-                                            width_px=width_px)
-        except Exception:
-            log.exception("live preview failed for %s", uid)
+        if card._chart_model is not None and card._fig is None:
+            # Native chart families update their renderer-neutral display
+            # contract directly; no Plotly figure is created for live preview.
+            try:
+                from services.polars_chart_service import apply_chart_model_display_options
+                new_model = apply_chart_model_display_options(
+                    card._chart_model, layout, typo)
+            except Exception:
+                log.exception("native chart preview failed for %s", uid)
+                return
+            new_title = str(layout.get("title") or "").strip() or new_model["title"]
+            new_model["title"] = new_title
+            self._bridge_write_guard = True
+            try:
+                self.bridge.replace_chart(uid, new_model, new_title)
+                recipe = dict(new_model.get("recipe") or {})
+                self.bridge.set_chart_meta(
+                    uid, config=dict(recipe.get("config") or {}),
+                    layout=dict(recipe.get("layout") or layout),
+                    typography=dict(recipe.get("typography") or typo))
+            finally:
+                self._bridge_write_guard = False
+            card.set_chart_model(new_model)
+            try:
+                idx = self._tab_order.index(uid)
+            except ValueError:
+                return
+            self.charts_tabs.setTabToolTip(idx, new_title)
+            self._update_config_chart_no()
             return
-
-        # Title: an explicit Layout title replaces the chart's own title;
-        # empty falls back to whatever title the chart already has.
-        new_title = str(layout.get("title") or "").strip() or None
-        cur_title = None
-        for c_uid, c_title, _fig in self.bridge.get("charts", []):
-            if c_uid == uid:
-                cur_title = c_title
-                break
-        final_title = new_title or cur_title
-
-        # Write through to the bridge (so save/export/dashboard see the
-        # same figure) WITHOUT letting charts_changed tear down the tabs --
-        # the card is updated in place instead.
-        self._bridge_write_guard = True
-        try:
-            self.bridge.replace_chart(uid, new_fig, final_title)
-            self.bridge.set_chart_meta(uid, layout=dict(layout),
-                                       typography=dict(typo))
-        finally:
-            self._bridge_write_guard = False
-
-        card._fig = new_fig
-        if final_title is not None:
-            # No on-card title label any more; set_title records the title
-            # and refreshes the tile tooltip (the tab label/tooltip below
-            # and the Plotly canvas carry the visible copies).
-            card.set_title(final_title)
-        card.plot_view.set_figure(new_fig)
+        log.error("Chart %s has no native ECharts model; cannot apply preview", uid)
+        return
 
         # Keep the tab's tooltip (and the settings header) in sync when an
         # explicit title was set. The VISIBLE tab label is the stable
@@ -781,6 +789,7 @@ class AnalysisPage(QWidget):
             layout_opts=self._collect_layout,
             typography_opts=self._collect_typo,
             roles=self._roles,
+            polars_dataset=self.bridge.polars_dataset(create_if_missing=False),
         )
         self._gen_worker.finished_ok.connect(self._on_generate_finished)
         self._gen_worker.failed.connect(self._on_generate_failed)
@@ -801,6 +810,20 @@ class AnalysisPage(QWidget):
             "layout": dict(self._collect_layout),
             "typography": dict(self._collect_typo),
         }
+        if new_charts and isinstance(new_charts[0][2], dict):
+            engine = (new_charts[0][2].get("source") or {}).get("engine")
+            if engine:
+                meta["engine"] = engine
+
+        def _meta_for_chart(chart):
+            chart_meta = dict(meta)
+            if isinstance(chart, dict) and chart.get("schema_version") == 1:
+                source = chart.get("source") or {}
+                if source.get("engine"):
+                    chart_meta["engine"] = source["engine"]
+                if chart.get("recipe"):
+                    chart_meta["chart_model_recipe"] = dict(chart["recipe"])
+            return chart_meta
 
         # Second "counted" trigger: the user jumped straight to Analysis from
         # the sidebar and produced a real chart, without ever pressing
@@ -827,13 +850,13 @@ class AnalysisPage(QWidget):
             # extras become brand-new charts rather than being lost).
             target = self._gen_target
             _first_uid, first_title, first_fig = new_charts[0]
-            self.bridge.set_chart_meta(target, **meta)
+            self.bridge.set_chart_meta(target, **_meta_for_chart(new_charts[0][2]))
             self.bridge.replace_chart(target, first_fig,
                                       display_title or first_title)
             for uid, title, fig in new_charts[1:]:
                 self.bridge.add_chart(uid, display_title or title, fig,
                                       chart_type=self._active_analysis,
-                                      meta=dict(meta))
+                                      meta=_meta_for_chart(fig))
             select_uid = target
         else:
             # Always append -- generating the same type again with different
@@ -841,7 +864,7 @@ class AnalysisPage(QWidget):
             for uid, title, fig in new_charts:
                 self.bridge.add_chart(uid, display_title or title, fig,
                                       chart_type=self._active_analysis,
-                                      meta=dict(meta))
+                                      meta=_meta_for_chart(fig))
             select_uid = new_charts[0][0]
 
         self._bulk_bridge_write = False
@@ -978,10 +1001,36 @@ class AnalysisPage(QWidget):
             chart_type = self.bridge.get(f"chart_type_{uid}", "")
             meta = self.bridge.get_chart_meta(uid)
             note = self.bridge.get_note(uid)
-
             card = self._chart_cards.get(uid)
+            # Native ChartModels bypass Plotly entirely. Legacy saved figures
+            # continue through the temporary conversion path while each chart
+            # family is migrated.
+            if (card is not None and card._chart_model is not None
+                    and getattr(card, "_bridge_figure_ref", None) is fig):
+                # A type switch rebuilds the tab strip. Reuse the validated
+                # model when its bridge source is unchanged so large charts
+                # are not repeatedly converted and reloaded.
+                chart_model = card._chart_model
+            elif (isinstance(fig, dict) and fig.get("schema_version") == 1
+                    and fig.get("kind") == "chart"):
+                try:
+                    from modules.chart_model import validate_chart_model
+                    chart_model = validate_chart_model(fig)
+                except Exception as exc:
+                    log.debug("stored ChartModel validation failed: %s", exc)
+                    chart_model = None
+            else:
+                try:
+                    from modules.legacy_plotly_adapter import figure_to_chart_model
+                    chart_model = figure_to_chart_model(
+                        fig, uid=uid, chart_type=chart_type, title=title, meta=meta)
+                except Exception as exc:
+                    log.debug("legacy figure to ChartModel conversion failed: %s", exc)
+                    chart_model = None
+
             if card is None:
-                card = ChartCard(uid, title, fig, chart_type, meta)
+                card = ChartCard(uid, title, fig, chart_type, meta,
+                                 chart_model=chart_model)
                 card.set_note(note)
                 card.delete_requested.connect(self._on_delete_chart)
                 card.edit_requested.connect(self._on_edit_chart)
@@ -999,14 +1048,31 @@ class AnalysisPage(QWidget):
                 # Existing tile: refresh it in place.  The tab keeps the
                 # label/number it was created with (stable under the user's
                 # cursor), so the counter is advanced without renaming it.
-                card.set_title(title)
+                if getattr(card, "_title", None) != title:
+                    card.set_title(title)
                 card.set_note(note)
-                # Only re-push when the bridge actually holds a different
-                # figure than the one on screen (a live preview already left
-                # the same object on the card, and a needless re-push would
-                # cost a full Plotly.react for nothing).
-                if fig is not card._fig:
+                card._legacy_source_fig = (
+                    None if isinstance(fig, dict)
+                    and fig.get("schema_version") == 1 else fig)
+                if chart_model is not None:
+                    if chart_model is not card._chart_model:
+                        old_model = dict(card._chart_model or {})
+                        old_display = dict(old_model.get("display") or {})
+                        old_display.pop("theme_mode", None)
+                        old_model["display"] = old_display
+                        new_model = dict(chart_model)
+                        new_display = dict(new_model.get("display") or {})
+                        new_display.pop("theme_mode", None)
+                        new_model["display"] = new_display
+                        if old_model == new_model:
+                            chart_model = card._chart_model
+                        else:
+                            card.set_chart_model(chart_model, source_figure=fig)
+                elif card._chart_model is not None or fig is not card._fig:
+                    # This chart family is not yet supported by the ECharts
+                    # adapter; return its existing card to the legacy path.
                     card.set_figure(fig)
+            card._bridge_figure_ref = fig
 
             # Compact per-chart tab: keep short stable labels (see
             # _chart_tab_label) so N charts of one analysis can't widen
@@ -1173,12 +1239,16 @@ class AnalysisPage(QWidget):
                 if item.data(Qt.UserRole) == chart_type:
                     self.analysis_list.setCurrentItem(item)
                     break
-            if uid in self._tab_order:
-                self.charts_tabs.setCurrentIndex(self._tab_order.index(uid))
         finally:
             self._suppress_rebuild = False
 
         self._build_config_panel(chart_type, target_uid=uid)
+        # The visible tab list is filtered by the previously active analysis
+        # type. Refresh it only after activating this chart's type, and carry
+        # the exact uid through the refresh so the first chart of that type
+        # cannot accidentally remain selected.
+        self._pending_select_uid = uid
+        self._refresh_charts()
         self.config_panel.tab_bar.setCurrentIndex(0)
         # A collapsed settings pane would swallow the form we just filled in,
         # so edit always re-opens it (the header names the bound chart).

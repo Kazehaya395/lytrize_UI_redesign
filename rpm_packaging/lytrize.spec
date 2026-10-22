@@ -26,7 +26,7 @@ Recommends:     google-noto-sans-fonts dejavu-fonts fira-code-fonts
 %description
 Lytrize is a local-first Linux desktop analytics app.
 
-Analyse CSV and Excel files locally with interactive Plotly charts,
+Analyse CSV and Excel files locally with interactive Apache ECharts charts,
 saved dashboards, KPI cards, and export to PDF/image.
 
 Fully offline — no internet, no cloud account, no telemetry.

@@ -45,10 +45,23 @@ from typing import Iterable, Optional
 MIN_W = 0.12
 MIN_H = 120.0
 
+# Floor for the TITLE band only. The heading card is sized by its own text
+# (see ``title_band_height``), so it must be allowed below the chart floor --
+# clamping it to MIN_H is what turned a one-line heading into a tall mostly-
+# empty box (the "huge fixed gap above the text" report). Keep in sync with
+# the TITLE_MIN_H mirror in ``report_editor``'s clampGeom.
+TITLE_MIN_H = 24.0
+
 # What a card gets when it has never been placed. Half the canvas wide reads as
 # a deliberate two-up board rather than one lonely full-bleed chart.
 DEFAULT_W = 0.5
 DEFAULT_H = 400.0
+
+# A slicer is a control, not a chart, so it starts NARROWER than DEFAULT_W: a
+# dropdown or checkbox list at half the canvas read as a huge empty card
+# spilling over its neighbours (the "too much width" screenshot). Still wide
+# enough for a readable value list. The user can drag/resize it like any card.
+SLICER_DEFAULT_W = 0.24
 
 # The report heading is a CARD on the free canvas, exactly like a chart or a
 # KPI, so it carries its own key in the arrangement rather than living outside
@@ -62,17 +75,24 @@ DEFAULT_TITLE_H = 96.0
 
 
 def title_band_height(title_size, show_meta: bool = True) -> float:
-    """A title band tall enough for *title_size* px and the metadata line.
+    """A title band tall enough for *title_size* px -- heading only.
 
     Not a constant: the heading is a CARD now, and a card with a fixed height
     crops a heading the user has made larger -- the same failure a fixed chart
     height had before the canvas became free.
+
+    ``show_meta`` is kept in the signature for callers, but no longer adds
+    height: the timestamp moved to the extreme bottom edge of the dashboard,
+    so the title card never reserves room for it.
     """
     size = max(8.0, _num(title_size, 28.0))
-    # A heading is roughly 1.35x its point size in line box, plus the padding
-    # the card gives it and, when it is shown, the metadata line beneath.
-    h = size * 1.35 + 40.0 + (26.0 if show_meta else 0.0)
-    return round(max(MIN_H, min(h, 400.0)), 2)
+    # A heading is roughly 1.35x its point size in line box. No card padding
+    # is reserved here either -- the title may touch the card edges, so the
+    # band is the text height only. The floor is the title's own (24px), NOT
+    # the canvas-wide MIN_H (120px): that floor is for charts and KPIs, and
+    # applying it to the heading is exactly the "huge fixed gap" report.
+    h = size * 1.35
+    return round(max(TITLE_MIN_H, min(h, 400.0)), 2)
 
 
 # Spacing used when REBUILDING an arrangement (tidy / first placement). While
@@ -101,7 +121,7 @@ def _num(value, default: float) -> float:
     return f
 
 
-def clamp(g: dict) -> dict:
+def clamp(g: dict, min_h: float = MIN_H) -> dict:
     """Force one placement inside the canvas, as a new dict.
 
     The single choke point for validation. A card can never be dragged partly
@@ -114,7 +134,7 @@ def clamp(g: dict) -> dict:
         "x": round(x, 5),
         "y": round(max(0.0, _num(g.get("y"), 0.0)), 2),
         "w": round(w, 5),
-        "h": round(max(MIN_H, _num(g.get("h"), DEFAULT_H)), 2),
+        "h": round(max(min_h, _num(g.get("h"), DEFAULT_H)), 2),
     }
 
 
@@ -123,7 +143,8 @@ def clamp_all(geom: Optional[dict]) -> dict:
     out: dict = {}
     for uid, g in (geom or {}).items():
         if isinstance(g, dict):
-            out[uid] = clamp(g)
+            # The title band carries its own, smaller floor: see TITLE_MIN_H.
+            out[uid] = clamp(g, min_h=(TITLE_MIN_H if uid == TITLE_UID else MIN_H))
     return out
 
 
@@ -273,9 +294,11 @@ def ensure_title_band(geom: Optional[dict], height: float = DEFAULT_TITLE_H,
     clean = clamp_all(geom)
     existing = clean.get(TITLE_UID)
     if isinstance(existing, dict):
-        return clean, clamp(existing)
+        return clean, clamp(existing, min_h=TITLE_MIN_H)
 
-    band_h = max(MIN_H, _num(height, DEFAULT_TITLE_H))
+    # TITLE_MIN_H, not MIN_H: the band is the heading's line box, and the
+    # canvas-wide chart floor is exactly what made it a mostly-empty box.
+    band_h = max(TITLE_MIN_H, _num(height, DEFAULT_TITLE_H))
     shift = band_h + _num(gap_px, GAP_PX)
     out: dict = {}
     for uid, g in clean.items():

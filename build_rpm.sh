@@ -89,18 +89,7 @@ python3 -m venv "$VENV"
 # ── [4/7] Install Qt dependencies ────────────────────────────────────────────
 echo "[4/7] Installing Qt dependencies..."
 "$VENV/bin/pip" install --upgrade pip setuptools wheel --quiet
-"$VENV/bin/pip" install \
-    "pandas>=2.2.0,<3.0.0" \
-    "plotly>=5.22.0,<6.0.0" \
-    "openpyxl>=3.1.0,<4.0.0" \
-    "scipy>=1.12.0,<2.0.0" \
-    "statsmodels>=0.14.0,<0.15.0" \
-    "pycountry>=23.12.11,<25.0.0" \
-    "PySide6>=6.11.0,<7.0.0" \
-    "PySide6-Addons>=6.11.0,<7.0.0" \
-    "PyWebEngineView>=1.0.0" \
-    --quiet
-"$VENV/bin/pip" install "pyarrow==18.1.0" --quiet --only-binary pyarrow
+"$VENV/bin/pip" install --only-binary=pyarrow -r "$SCRIPT_DIR/requirements.txt" --quiet
 
 # ── [5/7] Patch venv shebangs ─────────────────────────────────────────────────
 echo "[5/7] Patching venv shebangs..."

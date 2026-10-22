@@ -48,7 +48,8 @@ SPEC_VERSION = 1
 # ``date_part`` is deliberately absent: it holds a GRANULARITY ("Month
 # (number)"), not a column, and a slicer cannot filter on it.
 _DIMENSION_KEYS = ("x", "x_cols", "index_col", "columns_col", "lat_col",
-                   "lon_col", "geo_col", "location_col", "color", "x_col")
+                   "lon_col", "geo_col", "location_col", "color", "x_col",
+                   "source_col", "target_col", "path_cols", "date_col")
 _MEASURE_KEYS = ("y", "y_cols", "values_col", "value_col", "color_col",
                  "size_col", "y_col")
 

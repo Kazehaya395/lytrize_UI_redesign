@@ -27,6 +27,7 @@ from desktop.theme import PAGE_MARGINS
 from desktop.session_bridge import SessionBridge
 from desktop.widgets.dataframe_model import DataFrameModel
 from desktop.widgets.table_index_header import auto_fit_index_header
+from desktop.widgets.resizable_table import apply_table_defaults, fit_columns_to_content
 from desktop.workers import ImportWorker
 from desktop.pages.column_classifier_panel import ColumnClassifierPanel
 from desktop.pages.column_manager_panel import ColumnManagerPanel
@@ -165,7 +166,13 @@ class UploadPage(QWidget):
         self.table.setModel(self._model)
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        # Columns are INTERACTIVE and scrollable, not Stretch. Stretch divided
+        # the viewport by the column count and force-fit every column, so a
+        # 23-column dataset squeezed each cell to ~30px with no horizontal
+        # scrollbar -- the "can't read the preview" report. apply_table_defaults
+        # keeps a readable default/minimum width, enables drag-resize, and
+        # turns on pixel scrolling. See desktop/widgets/resizable_table.py.
+        apply_table_defaults(self.table)
         # Compact index gutter: a narrow, digit-driven fixed width. The
         # 149,116-row screenshot overflows a roomy gutter, but a fully
         # hidden header would also remove the only positional row cue.
@@ -296,6 +303,7 @@ class UploadPage(QWidget):
         # Use a background worker to avoid blocking the UI
         self._import_worker = ImportWorker(file_path, self)
         self._import_worker.finished_ok.connect(self._on_import_finished)
+        self._import_worker.polars_ready.connect(self.bridge.set_polars_dataset)
         self._import_worker.failed.connect(self._on_import_failed)
         self._import_worker.start()
 
@@ -374,6 +382,11 @@ class UploadPage(QWidget):
         self._model.set_dataframe(df)
         self._update_preview_label()
         self._build_filter_row(df)
+        # Size the columns to the data once the column set is known, capped
+        # to a head slice (see resizable_table.fit_columns_to_content) so a
+        # 1.3M-row frame never stalls the fit. Done here, not on every
+        # search/filter keystroke, so the user's own resizes are not stomped.
+        self._fit_columns()
         has_data = df is not None and len(df) > 0
         if has_data:
             self.btn_go_analysis.setEnabled(True)
@@ -534,6 +547,16 @@ class UploadPage(QWidget):
         search, per-column filters, transforms -- calls this.
         """
         auto_fit_index_header(self.table)
+
+    def _fit_columns(self) -> None:
+        """Fit the columns to the loaded data, capped to a head slice.
+
+        The complement to ``_auto_fit_index_width``: the gutter follows the
+        row count, this follows the columns. Only called when the data set
+        (not just a filter) changes, so it never fights a user's manual
+        column resize.
+        """
+        fit_columns_to_content(self.table)
 
     def _build_filter_row(self, df: pd.DataFrame) -> None:
         """Build per-column filter inputs based on DataFrame columns."""

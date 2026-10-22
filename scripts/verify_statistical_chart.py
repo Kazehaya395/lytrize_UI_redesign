@@ -171,9 +171,9 @@ def test_apply_display_options(df):
     check("layout: Show border OFF -> legend frame removed",
           int(borderless.layout.legend.borderwidth or 0) == 0,
           str(borderless.layout.legend.borderwidth))
-    check("layout: Show border defaults to ON (keeps the previous look)",
+    check("layout: Show border defaults to OFF (clean production look)",
           int(apply_display_options(base, default_layout_opts(), None)
-              .layout.legend.borderwidth or 0) == 1, "")
+              .layout.legend.borderwidth or 0) == 0, "")
     # The colour bar / colour range is reached by the same toggle.
     heat = go.Figure(go.Heatmap(z=[[1, 2], [3, 4]],
                                 colorbar=dict(borderwidth=1, bordercolor="#123456")))
@@ -217,12 +217,15 @@ def test_apply_display_options(df):
     check("theme: dark mode keeps its tick colour",
           str(dark.layout.xaxis.tickfont.color) == "#94a3b8",
           str(dark.layout.xaxis.tickfont.color))
-    check("theme: light mode gives the legend a light plate",
-          str(light.layout.legend.bgcolor).startswith("rgba(255, 255, 255"),
+    check("theme: legend background is transparent in light mode",
+          str(light.layout.legend.bgcolor).replace(" ", "") == "rgba(0,0,0,0)",
           str(light.layout.legend.bgcolor))
-    # The legend TEXT sits on that plate, so it has to follow the mode too.
-    # It did not: only the plate was re-tinted, so light mode drew the
-    # near-white default (#e2e8f0) labels on a white plate -- invisible.
+    check("theme: legend background is transparent in dark mode",
+          str(dark.layout.legend.bgcolor).replace(" ", "") == "rgba(0,0,0,0)",
+          str(dark.layout.legend.bgcolor))
+    # With no plate the legend TEXT lands directly on the canvas, so it has
+    # to follow the mode too: light mode must re-tint the near-white default
+    # (#e2e8f0) to dark ink or the labels vanish on the white canvas.
     check("theme: light mode re-tints the legend item text",
           str(light.layout.legend.font.color) == "#334155",
           str(light.layout.legend.font.color))
@@ -349,10 +352,13 @@ def test_panel(df):
           not panel.regenerate_button().isEnabled(), "")
 
     _select_analysis(page, "distribution")
-    check("distribution: no builder yet", not panel.has_builder(), "")
-    check("distribution: no option fields yet",
-          panel.findChildren(QComboBox) == []
-          and panel.findChildren(QCheckBox) == [], "")
+    panel = page.config_panel
+    check("distribution: builder registered", panel.has_builder(), "")
+    check("distribution: generate tab has fields",
+          len(panel.findChildren(QComboBox)) >= 1
+          and len(panel.findChildren(QCheckBox)) >= 1,
+          f"{len(panel.findChildren(QComboBox))} combos / "
+          f"{len(panel.findChildren(QCheckBox))} checks")
     check("distribution: action row still present",
           panel.action_button() is not None
           and panel.action_button().parent() is not None
@@ -555,14 +561,22 @@ def test_page_flows(page, b):
           panel.collect_values().get("x") == "region",
           str(panel.collect_values()))
 
-    # -- Tab selection follows the chart's analysis type --------------------
+    # -- The tab strip is SCOPED to the selected analysis type --------------
+    # Selecting another type empties the strip (no charts of that type exist
+    # yet) and switching back re-attaches the same card widgets -- no reload.
+    # The form then follows whichever chart tab is selected.
     _select_analysis(page, "distribution")
+    check("type scope: distribution strip hides the statistical charts",
+          len(page._tab_order) == 0, str(page._tab_order))
+    _select_analysis(page, "statistical")
+    check("type scope: switching back re-attaches the statistical tabs",
+          len(page._tab_order) > 1, str(page._tab_order))
     other_idx = 1 if len(page._tab_order) > 1 else 0
-    if page.charts_tabs.currentIndex() == other_idx:
-        other_idx = 1 - other_idx if len(page._tab_order) > 1 else 0
+    if page.charts_tabs.currentIndex() == other_idx and len(page._tab_order) > 1:
+        other_idx = 1 - other_idx
     page.charts_tabs.setCurrentIndex(other_idx)
     page._on_tab_changed()
-    check("tab select: form follows chart type back to statistical",
+    check("tab select: form follows the tab's chart",
           page._active_analysis == "statistical"
           and page._settings_target_uid == page._tab_order[other_idx],
           f"{page._active_analysis} / {page._settings_target_uid}")
@@ -667,10 +681,13 @@ def test_settings_tabs_fit_design(df):
                   str([s.layout().count() if s.layout() else None for s in stacks]))
             if name == "layout":
                 # chart_designs.pdf puts the title/label fields in the left
-                # column and the display rows in the right one.
+                # column and the display rows in the right one. The legend
+                # arrangement rows (orientation/order + click behaviour) live
+                # with the other legend fields on the left.
                 check("layout: titles in the left column (design)",
                       _rows(stacks[0]) == ["Chart title", "X-axis", "Y-axis",
-                                           "Legend title", "Legend position"],
+                                           "Legend title", "Legend position",
+                                           "Legend layout", "Click"],
                       str(_rows(stacks[0])))
                 check("layout: display rows in the right column (design)",
                       _rows(stacks[1]) == ["Show value labels", "Label pos",
@@ -745,9 +762,15 @@ def test_settings_tabs_fit_design(df):
           int(_live().layout.legend.borderwidth or 0) == 1,
           str(card._fig.layout.legend.borderwidth))
     bldr._cb_legpos.setCurrentText("Bottom Left")
-    check("live: Legend position widget -> legend moved",
-          (float(_live().layout.legend.x), float(_live().layout.legend.y)) == (0.0, 0.0),
-          f"{(card._fig.layout.legend.x, card._fig.layout.legend.y)}")
+    # Anchored at the edge of its RESERVED strip rather than paper 0,0 -- the
+    # reservation converts the column the legend sits in to a paper
+    # coordinate, so the plate hugs the plot edge instead of floating in the
+    # card margin. It must land bottom-left: x on the left half, y at 0.
+    _lx = float(_live().layout.legend.x)
+    _ly = float(_live().layout.legend.y)
+    check("live: Legend position widget -> legend moved (bottom left)",
+          0.0 <= _lx < 0.5 and _ly == 0.0,
+          f"({card._fig.layout.legend.x}, {card._fig.layout.legend.y})")
     panel.tab_bar.setCurrentIndex(2)
     bldr._hs_spin.setValue(44)
     check("live: Header size spin -> title font size",
@@ -882,66 +905,81 @@ def test_incremental_refresh(df):
 
 
 def test_dashboard_reuse(df):
-    """The dashboard grid reuses its tiles the same way (same web-view rules)."""
-    print("== DashboardPage: grid tiles are reused ==")
+    """The board is the report document now -- no per-chart Qt tiles.
+
+    The old checks counted ``PlotlyWebView`` tile construction through
+    ``DashboardPage._chart_cards``; that page was replaced by the report
+    canvas (the board IS the exported document), so the same guarantees are
+    asserted against the document the canvas renders: one chart-card per
+    bridge chart, add/delete reflected in it, the canvas widget itself never
+    rebuilt, and the theme-switch path staying clean.
+    """
+    print("== DashboardPage: the canvas document tracks the chart list ==")
     import plotly.graph_objects as go
     from desktop.session_bridge import SessionBridge
-    import desktop.widgets.chart_card as _cc
     from desktop.pages.dashboard_page import DashboardPage
+    from services.export_service import build_export_charts, build_export_report
 
-    created = []
-
-    class _CountingView(_cc.PlotlyWebView):
-        def __init__(self, *a, **k):
-            super().__init__(*a, **k)
-            created.append(self)
-
-    real_view = _cc.PlotlyWebView
-    _cc.PlotlyWebView = _CountingView
-    try:
-        b = SessionBridge()
-        b.set_df(df)
-        for uid in ("d1", "d2"):
-            b.add_chart(uid, f"Chart {uid}",
-                        go.Figure(go.Bar(x=["a", "b"], y=[1, 2], name=uid)),
-                        chart_type="statistical", meta={})
-        page = DashboardPage(b)
-        check("dashboard: one view per chart on build", len(created) == 2,
-              str(len(created)))
-        before = dict(page._chart_cards)
-        page._refresh_charts()
-        check("dashboard: refresh reuses every tile",
-              all(page._chart_cards.get(k) is v for k, v in before.items())
-              and len(created) == 2, str(len(created)))
-        b.add_chart("d3", "Chart d3",
-                    go.Figure(go.Bar(x=["a"], y=[3], name="d3")),
+    b = SessionBridge()
+    b.set_df(df)
+    for uid in ("d1", "d2"):
+        b.add_chart(uid, f"Chart {uid}",
+                    go.Figure(go.Bar(x=["a", "b"], y=[1, 2], name=uid)),
                     chart_type="statistical", meta={})
-        page._refresh_charts()
-        check("dashboard: a new chart adds one view, keeps the rest",
-              len(created) == 3 and page._chart_cards["d1"] is before["d1"],
-              str(len(created)))
-        b.remove_chart("d2")
-        page._refresh_charts()
-        check("dashboard: delete drops only that tile",
-              "d2" not in page._chart_cards and len(page._chart_cards) == 2,
-              str(sorted(page._chart_cards)))
-        # A theme switch repaints the tiles where they are.
-        pv = page._chart_cards["d1"].plot_view
-        from desktop import theme as _t
-        try:
-            _t.apply_theme(QApplication.instance(), "light")
-            b.theme_changed.emit("light")
-            for _ in range(5):
-                QApplication.processEvents()
-            check("dashboard: theme switch repaints tiles in place",
-                  pv._render_fig.layout.paper_bgcolor == "#ffffff"
-                  and len(created) == 3,
-                  str(pv._render_fig.layout.paper_bgcolor))
-        finally:
-            _t.apply_theme(QApplication.instance(), "dark")
-            b.theme_changed.emit("dark")
+    page = DashboardPage(b)
+    canvas = page.report_canvas
+    check("dashboard: report canvas built", canvas is not None, "")
+
+    def _doc() -> str:
+        snap = page._snapshot_inputs()
+        export_charts = build_export_charts(
+            snap["charts"], meta_map=snap["meta_map"], notes=snap["notes"])
+        html, _ = build_export_report(
+            export_charts, snap["session_name"], snap["state"],
+            orientation=snap["orientation"], kpis=snap["kpis"],
+            dashboard_title=snap["dashboard_title"],
+            grid_cols_n=snap["grid_cols_n"],
+            tile_geometry=snap["tile_geometry"],
+            kpi_geometry=snap["kpi_geometry"],
+            slicers=snap["slicers"], slicer_geometry=snap["slicer_geometry"],
+            slicer_values={}, geometry_mode=snap["geometry_mode"],
+            inline_plotly=False, editor=True)
+        return html
+
+    html = _doc()
+    check("dashboard: one chart-card per chart in the document",
+          'data-uid="d1"' in html and 'data-uid="d2"' in html, "")
+    page._refresh_charts()
+    check("dashboard: refresh reuses the same canvas widget",
+          page.report_canvas is canvas, "")
+    b.add_chart("d3", "Chart d3",
+                go.Figure(go.Bar(x=["a"], y=[3], name="d3")),
+                chart_type="statistical", meta={})
+    page._refresh_charts()
+    html = _doc()
+    check("dashboard: a new chart joins the document, others stay",
+          all(f'data-uid="{u}"' in html for u in ("d1", "d2", "d3")), "")
+    b.remove_chart("d2")
+    page._refresh_charts()
+    html = _doc()
+    check("dashboard: delete drops only that chart's card",
+          'data-uid="d2"' not in html
+          and 'data-uid="d1"' in html and 'data-uid="d3"' in html, "")
+    # A theme switch routes through the page handler; it must not raise and
+    # must leave the canvas in place.
+    from desktop import theme as _t
+    try:
+        _t.apply_theme(QApplication.instance(), "light")
+        b.theme_changed.emit("light")
+        for _ in range(5):
+            QApplication.processEvents()
+        check("dashboard: theme switch keeps the canvas alive",
+              page.report_canvas is canvas, "")
     finally:
-        _cc.PlotlyWebView = real_view
+        _t.apply_theme(QApplication.instance(), "dark")
+        b.theme_changed.emit("dark")
+    page._regen_fast.stop()
+    page._regen_slow.stop()
 
 
 def main() -> int:

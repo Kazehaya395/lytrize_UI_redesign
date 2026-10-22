@@ -1,9 +1,4 @@
-"""services/export_service.py -- Headless export service.
-
-Re-exports the pure HTML report generator from ``modules.export`` and
-adds convenience helpers for building export charts and themes
-(de-duplicated from the Streamlit dashboard page).
-"""
+"""Headless dashboard assembly and ECharts HTML export service."""
 
 from __future__ import annotations
 
@@ -15,16 +10,9 @@ from typing import Any, Optional
 
 import pandas as pd
 
-from modules.export import generate_html_report, DEFAULT_THEME, _merge_theme
-from modules.charts import apply_hover_format
 from services.chart_service import safe_filename
 
 log = logging.getLogger(__name__)
-
-
-# -- Re-exports -----------------------------------------------------------
-
-generate_html_report = generate_html_report
 
 
 # -- Export chart builder (headless, no session state) ----------------------
@@ -69,20 +57,6 @@ def build_export_charts(
     return out
 
 
-def _apply_axes(fig, x_lbl: str, y_lbl: str, text_style: Optional[dict] = None,
-                *, _inplace: bool = False):
-    """Apply axis titles and styling to a chart (mirrors dashboard helper)."""
-    from modules.export import _apply_axes as _export_apply_axes
-    return _export_apply_axes(fig, x_lbl, y_lbl, text_style)
-
-
-def _apply_legend_names(fig, legend_names: dict, legend_title: str = "",
-                        text_style: Optional[dict] = None, *, _inplace: bool = False):
-    """Rename traces and style the legend (mirrors dashboard helper)."""
-    from modules.export import _apply_legend_names as _export_apply_legend_names
-    return _export_apply_legend_names(fig, legend_names, legend_title, text_style)
-
-
 # -- Theme builder (headless, no session state) -------------------------------
 
 # Default export theme values (same as the dashboard's _EX_DEFAULTS)
@@ -102,17 +76,31 @@ EXPORT_DEFAULTS = {
     # before these existed -- so a report without slicer colours is unchanged.
     "ex_slicer_bg": "", "ex_slicer_bd": "", "ex_slicer_text": "",
     "ex_slicer_accent": "",
+    # Slicer typography (the "label & value font size/colour options" the
+    # dashboard slicer section was missing). Empty colour = inherit the
+    # existing slicer text colour, so a report that never set these is
+    # pixel-identical to before. label = the slicer card title, value =
+    # the option/list text inside the body.
+    "ex_slicer_label_size": 13, "ex_slicer_label_color": "",
+    "ex_slicer_value_size": 13, "ex_slicer_value_color": "",
     # Background image. The picker stores a DATA URI here (see
     # ``desktop.pages.dashboard_page._image_to_data_uri``) rather than a path,
     # so the saved HTML is self-contained and the same document renders on a
     # machine that has never seen the file the user chose.
     "ex_bg_image": "", "ex_bg_image_opacity": 35, "ex_bg_blend": "normal",
-    # Per-CARD background image, same data-URI contract as ``ex_bg_image``:
-    # the picker embeds the file so the exported HTML carries the picture
-    # rather than a path to it. ``ex_card_image_groups`` is the comma-separated
-    # list of card kinds it applies to -- "charts", "kpi", "title" -- so one
-    # picture can go behind only the charts, or only the KPI strip, instead of
-    # every card at once.
+    # Per-kind card imagery. Each value is an embedded data URI so exports
+    # travel without local paths. The legacy shared image remains readable for
+    # sessions saved by earlier versions.
+    "ex_chart_image": "", "ex_chart_image_opacity": 35,
+    "ex_chart_blend": "normal",
+    "ex_chart_image_fit": "cover", "ex_chart_image_position": "center",
+    "ex_chart_image_overrides": {},
+    "ex_kpi_image": "", "ex_kpi_image_opacity": 35,
+    "ex_kpi_blend": "normal",
+    "ex_kpi_image_fit": "cover", "ex_kpi_image_position": "center",
+    "ex_title_image": "", "ex_title_image_opacity": 35,
+    "ex_title_blend": "normal",
+    "ex_title_image_fit": "cover", "ex_title_image_position": "center",
     "ex_card_image": "", "ex_card_image_opacity": 35, "ex_card_blend": "normal",
     "ex_card_image_groups": "charts,kpi,title",
     "ex_title_font": "Inter", "ex_title_style": "Normal",
@@ -292,6 +280,10 @@ def build_export_theme(state: dict) -> dict:
         "slicer_bd":      g("ex_slicer_bd"),
         "slicer_text":    g("ex_slicer_text"),
         "slicer_accent":  g("ex_slicer_accent"),
+        "slicer_label_size": g("ex_slicer_label_size"),
+        "slicer_label_color": g("ex_slicer_label_color"),
+        "slicer_value_size": g("ex_slicer_value_size"),
+        "slicer_value_color": g("ex_slicer_value_color"),
         "bg_image":       g("ex_bg_image"),
         "bg_image_opacity": g("ex_bg_image_opacity"),
         "bg_blend":       g("ex_bg_blend"),
@@ -299,6 +291,23 @@ def build_export_theme(state: dict) -> dict:
         "card_image_opacity": g("ex_card_image_opacity"),
         "card_blend":       g("ex_card_blend"),
         "card_image_groups": g("ex_card_image_groups"),
+        "card_images": {
+            "charts": {"image": g("ex_chart_image"),
+                       "opacity": g("ex_chart_image_opacity"),
+                       "blend": g("ex_chart_blend"),
+                       "fit": g("ex_chart_image_fit"),
+                       "position": g("ex_chart_image_position")},
+            "kpi": {"image": g("ex_kpi_image"),
+                    "opacity": g("ex_kpi_image_opacity"),
+                    "blend": g("ex_kpi_blend"),
+                    "fit": g("ex_kpi_image_fit"),
+                    "position": g("ex_kpi_image_position")},
+            "title": {"image": g("ex_title_image"),
+                      "opacity": g("ex_title_image_opacity"),
+                      "blend": g("ex_title_blend"),
+                      "fit": g("ex_title_image_fit"),
+                      "position": g("ex_title_image_position")},
+        },
         "title_font":     g("ex_title_font"),
         "title_style":    g("ex_title_style"),
         "title_size":     g("ex_title_size"),
@@ -325,7 +334,6 @@ def build_export_report(
     slicer_geometry: Optional[dict] = None,
     slicer_values: Optional[dict] = None,
     geometry_mode: str = "free",
-    inline_plotly: bool = True,
     extra_css: str = "",
     editor: bool = False,
     report_specs: Optional[dict] = None,
@@ -336,7 +344,7 @@ def build_export_report(
     Parameters
     ----------
     charts : list
-        List of ``(uid, title, fig)`` tuples (3-tuples).
+        List of ``(uid, title, ChartModel)`` tuples.
     session_name : str
         Session name used as the report title fallback.
     state : dict
@@ -373,11 +381,6 @@ def build_export_report(
         ``"free"`` (default) for the absolutely-positioned canvas the app edits
         in; ``"grid"`` for the older cell-based placement, used only to render a
         session saved before the free canvas existed.
-    inline_plotly : bool
-        Embed the plotly bundle in the file (default, so the saved report is
-        standalone) or emit a ``<script src="lytrize_plotly.js">`` reference.
-        The live in-app canvas passes ``False`` and writes the shared bundle
-        itself -- re-embedding ~4.5 MB on every settings tweak is not viable.
     extra_css : str
         Extra CSS injected before ``</style>``. The canvas uses it to offer the
         app's bundled fonts to Chromium, which cannot see Qt's font database.
@@ -389,10 +392,10 @@ def build_export_report(
         aggregation. When omitted and the chart tuples carry meta (6-tuples),
         ``generate_html_report`` derives them itself.
     report_payload : dict, optional
-        The column-pruned dataset from ``modules.report_data.build_report_payload``,
-        emitted as ``window.LYTRIZE_DATA`` alongside the slicers. A payload over
-        ``report_data.MAX_INLINE_BYTES`` is dropped here rather than embedded:
-        the file still opens and reads, it just does not re-aggregate.
+        The FULL column-pruned dataset from ``modules.report_data`` (no row cap),
+        embedded as ``lytrize-data`` JSON alongside the slicers. Slicers then
+        filter charts and recompute KPIs fully offline via LytrizeLiveFilter.
+        Omitted (or empty) means a static file: snapshots render, slicers do not.
 
     Returns
     -------
@@ -401,37 +404,181 @@ def build_export_report(
     dash_title = dashboard_title or session_name
     safe_file = safe_filename(dash_title)
 
-    export_theme = build_export_theme(state)
+    # New dashboards are exported from the same semantic models shown by the
+    # desktop ECharts canvas. This avoids rebuilding Plotly figures just to
+    # serialize a report and keeps charts, KPIs and slicers in one document.
+    native = all(isinstance(chart[2], dict)
+                 and chart[2].get("schema_version") == 1
+                 and chart[2].get("kind") == "chart" for chart in charts)
+    if native:
+        from modules.board_model import make_board
+        from modules.echarts_export import board_to_html
 
-    if report_payload is not None:
+        # The QWebEngine dashboard preview and the exported HTML both use the
+        # same family selections. Embed only the selected font families so the
+        # portable file stays small and does not depend on repo-local paths.
+        families = {"Inter"}
+        for chart in charts:
+            model = chart[2]
+            typo = ((model.get("recipe") or {}).get("typography") or {})
+            for key in ("family", "header_family"):
+                if typo.get(key):
+                    families.add(str(typo[key]))
+        for key in ("ex_title_font", "ex_notes_font"):
+            if (state or {}).get(key):
+                families.add(str(state[key]))
         try:
-            from modules.report_data import MAX_INLINE_BYTES, payload_json_size
-            size = payload_json_size(report_payload)
-            if size > MAX_INLINE_BYTES:
-                log.warning(
-                    "export payload %d bytes > MAX_INLINE_BYTES %d; "
-                    "static export without live slicers", size, MAX_INLINE_BYTES)
-                report_payload = None
+            from font_bundle import font_face_css
+            extra_css = font_face_css(embed=True, families=families)
         except Exception:
-            log.debug("payload size check failed", exc_info=True)
+            log.debug("selected chart fonts could not be embedded", exc_info=True)
+            extra_css = ""
 
-    html = generate_html_report(
-        charts, session_name,
-        orientation=orientation,
-        kpis=kpis,
-        dashboard_title=dash_title,
-        grid_cols_n=grid_cols_n,
-        theme=export_theme,
-        tile_geometry=tile_geometry,
-        kpi_geometry=kpi_geometry,
-        slicers=slicers,
-        slicer_geometry=slicer_geometry,
-        slicer_values=slicer_values,
-        geometry_mode=geometry_mode,
-        inline_plotly=inline_plotly,
-        extra_css=extra_css,
-        editor=editor,
-        report_specs=report_specs,
-        report_payload=report_payload,
-    )
-    return html, safe_file
+        board_w, board_h = 1600.0, 900.0
+
+        def geometry(raw, fallback):
+            raw = dict(raw or {})
+            x = float(raw.get("x", fallback[0]) or 0)
+            y = float(raw.get("y", fallback[1]) or 0)
+            w = float(raw.get("w", fallback[2]) or fallback[2])
+            h = float(raw.get("h", fallback[3]) or fallback[3])
+            # Dashboard free-layout stores horizontal positions and widths as
+            # fractions of its canvas; vertical values are logical pixels.
+            if abs(x) <= 1 and abs(w) <= 1:
+                x, w = x * board_w, w * board_w
+            return {"x": x, "y": y, "w": max(1, w), "h": max(1, h)}
+
+        theme = dict(state or {})
+        objects = []
+        tile_geometry = tile_geometry or {}
+        objects.append({"id": "__title__", "kind": "text",
+                        "geometry": {"x": 0, "y": 0,
+                                     "w": board_w, "h": 64},
+                        "properties": {"text": dash_title, "role": "title",
+                                       "font_size": int((state or {}).get("ex_title_size", 28)),
+                                       "color": (state or {}).get("ex_title_color", "#6163df"),
+                                       "visible": True}})
+        for index, chart in enumerate(charts):
+            uid, title, model = chart[:3]
+            props = {"chart_model": model, "visible": True, "z_index": index}
+            chart_image_overrides = theme.get("ex_chart_image_overrides") or {}
+            if isinstance(chart_image_overrides, dict):
+                image_override = chart_image_overrides.get(str(uid))
+                if isinstance(image_override, dict):
+                    props["card_image_override"] = image_override
+            note = chart[3] if len(chart) > 3 else ""
+            if note:
+                props["notes"] = str(note)
+            objects.append({"id": str(uid), "kind": "chart",
+                            "geometry": geometry(tile_geometry.get(uid),
+                                (0, 0, board_w / max(1, grid_cols_n), 420)),
+                            "properties": props})
+
+        for index, kpi in enumerate(kpis or []):
+            if not isinstance(kpi, dict):
+                continue
+            label = str(kpi.get("label", kpi.get("name", "KPI")))
+            objects.append({"id": f"kpi-{index}", "kind": "kpi",
+                            "geometry": geometry((kpi_geometry or {}).get(str(index)),
+                                (0, 0, 240, 120)),
+                            "properties": {**kpi, "index": index, "label": label,
+                                           "visible": True}})
+
+        for index, slicer in enumerate(slicers or []):
+            if not isinstance(slicer, dict):
+                continue
+            props = dict(slicer)
+            props["index"] = index
+            props["values"] = [str(value) for value in
+                                (slicer_values or {}).get(str(index), [])]
+            spec = props.get("spec") if isinstance(props.get("spec"), dict) else {}
+            selected = props.get(
+                "selected", props.get("value", spec.get("values", [])))
+            props["selected"] = ([str(value) for value in selected]
+                                 if isinstance(selected, list) else
+                                 [str(selected)] if selected not in (None, "") else [])
+            objects.append({"id": f"slicer-{index}", "kind": "slicer",
+                            "geometry": geometry((slicer_geometry or {}).get(str(index)),
+                                (0, 0, 240, 100)),
+                            "properties": props})
+
+        board_h = max([900.0] + [obj["geometry"]["y"] + obj["geometry"]["h"]
+                                 for obj in objects]) + 32.0
+        board = make_board(objects,
+            style={"background": theme.get("ex_bg", "#121a2e"),
+                   "card": theme.get("ex_card", "#1b2245"),
+                   "border": theme.get("ex_border", "#2c3564"),
+                   "text": theme.get("ex_text", "#f5f7ff"),
+                   "accent": theme.get("ex_accent", "#6163df"),
+                   "card_image": theme.get("ex_card_image", ""),
+                   "card_image_opacity": theme.get("ex_card_image_opacity", 35),
+                   "card_image_groups": theme.get("ex_card_image_groups", "charts,kpi,title"),
+                   # Dashboard style state uses one explicit family of keys
+                   # per card type. The HTML board model uses a compact
+                   # ``card_images`` mapping. Passing only an unrelated
+                   # legacy ``card_images`` key here silently dropped every
+                   # newly selected card image on first render and restore.
+                   "card_images": {
+                       "charts": {
+                           "image": theme.get("ex_chart_image", ""),
+                           "opacity": theme.get("ex_chart_image_opacity", 35),
+                           "blend": theme.get("ex_chart_blend", "normal"),
+                           "fit": theme.get("ex_chart_image_fit", "cover"),
+                           "position": theme.get("ex_chart_image_position", "center"),
+                       },
+                       "kpi": {
+                           "image": theme.get("ex_kpi_image", ""),
+                           "opacity": theme.get("ex_kpi_image_opacity", 35),
+                           "blend": theme.get("ex_kpi_blend", "normal"),
+                           "fit": theme.get("ex_kpi_image_fit", "cover"),
+                           "position": theme.get("ex_kpi_image_position", "center"),
+                       },
+                       "title": {
+                           "image": theme.get("ex_title_image", ""),
+                           "opacity": theme.get("ex_title_image_opacity", 35),
+                           "blend": theme.get("ex_title_blend", "normal"),
+                           "fit": theme.get("ex_title_image_fit", "cover"),
+                           "position": theme.get("ex_title_image_position", "center"),
+                       },
+                   },
+                   "card_blend": theme.get("ex_card_blend", "normal")},
+            background={"color": theme.get("ex_bg", "#121a2e"),
+                        "image_data_uri": theme.get("ex_bg_image") or ""},
+            metadata={"width": board_w, "height": board_h,
+                      "title": dash_title, "orientation": orientation})
+        specs = dict(report_specs or {})
+        if not specs:
+            try:
+                from modules.chartspec import chart_spec
+                for chart in charts:
+                    uid = chart[0]
+                    meta = chart[5] if len(chart) > 5 else {}
+                    recipe = dict(meta or {})
+                    recipe.setdefault('uid', uid)
+                    specs[str(uid)] = chart_spec(recipe)
+            except Exception:
+                log.debug("export specs not derived", exc_info=True)
+        kpi_defs = list(kpis or [])
+        slicer_defs = [dict(s) for s in (slicers or []) if isinstance(s, dict)]
+        for pos, s in enumerate(slicer_defs):
+            s.setdefault('index', pos)
+            if not s.get('uid'):
+                s['uid'] = 'slicer-' + str(pos)
+        return board_to_html(board, editor=editor,
+                             grid_cols_n=grid_cols_n,
+                             extra_css=extra_css,
+                             report_payload=report_payload,
+                             report_slicers=slicer_defs,
+                             report_kpis=kpi_defs,
+                             report_specs=specs,
+                             report_style=theme), safe_file
+
+    raise ValueError("Dashboard export requires ECharts ChartModels")
+
+
+def generate_html_report(charts, session_name: str, state: Optional[dict] = None,
+                         **kwargs) -> str:
+    """Compatibility API that exports only native ECharts dashboard models."""
+    html, _safe_name = build_export_report(
+        charts, session_name, state or {}, **kwargs)
+    return html

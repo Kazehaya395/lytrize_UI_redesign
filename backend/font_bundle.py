@@ -2,12 +2,10 @@
 
 Why this exists
 ---------------
-The chart UI offers a list of font families for the chart heading/body, and
-the machine running Lytrize usually has almost none of them. Asking Plotly
-(the charts render in a QWebEngineView) for a family that is not installed
-makes it silently substitute a default, so most of the picker appeared to do
-nothing -- the "many fonts are not even working" report. On the box this was
-reported from, 5 of 33 offered families existed.
+The chart UI offers font families for chart headings and body text. The
+machine running Lytrize may not have those families installed. Chromium in
+QWebEngineView does not use Qt's registered font database, so it can silently
+substitute a default unless the font files are also provided through CSS.
 
 Shipping the font files with the app removes the whole class of problem: the
 picker can only offer a family the app itself provides, so every option
@@ -24,23 +22,23 @@ Two consumers, and both need registering:
 
 Licensing
 ---------
-Every bundled file is SIL Open Font License 1.1 (or a metric-compatible
-substitute under the same terms); each family keeps its own ``LICENSE-*.txt``
-next to the font. Proprietary families cannot be shipped, so names like
-Georgia / Times New Roman / Arial / Courier New are not included -- see
-``SUBSTITUTES`` for the metric-compatible open replacements.
+Open font packs keep their ``LICENSE-*.txt`` files beside the fonts.
+``SUBSTITUTES`` maps familiar font picker names to bundled alternatives when
+the requested family itself is unavailable.
 """
 
 from __future__ import annotations
 
+import base64
 import logging
 from pathlib import Path
 from typing import Dict, List
 
 log = logging.getLogger(__name__)
 
-# app_assets/fonts/ next to the repo root (backend/ is a sibling of it).
-FONT_DIR = Path(__file__).resolve().parent.parent / "app_assets" / "fonts"
+# Keep fonts beside the other shipped assets so source and package layouts
+# resolve to the same location.
+FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
 
 # Open, metric-compatible stand-ins for the proprietary families the picker
 # used to offer. Keyed by the name the user sees -> the family we ship.
@@ -94,7 +92,9 @@ def font_files() -> List[Path]:
     """Every bundled font file, in a stable order."""
     if not FONT_DIR.is_dir():
         return []
-    return sorted(p for p in FONT_DIR.iterdir()
+    # Keep supporting the original flat font bundle and discover newer
+    # family packs stored in named subdirectories under assets/fonts.
+    return sorted(p for p in FONT_DIR.rglob("*")
                   if p.suffix.lower() in (".ttf", ".otf") and p.is_file())
 
 
@@ -161,7 +161,7 @@ def bundled_families() -> List[str]:
     """Family names the app ships, ordered by preference then alphabetically.
 
     Derived from the files themselves rather than a hard-coded list, so adding
-    a font to app_assets/fonts/ is enough to make it selectable.
+    a font to backend/assets/fonts/ is enough to make it selectable.
     """
     fams = {family_of(p) for p in font_files()}
     ordered = [f for f in PREFERRED_ORDER if f in fams]
@@ -184,36 +184,55 @@ def resolve(name: str) -> str:
     have = {f.lower(): f for f in bundled_families()}
     if key.lower() in have:
         return have[key.lower()]
-    sub = SUBSTITUTES.get(key)
+    substitutes = {name.lower(): value for name, value in SUBSTITUTES.items()}
+    sub = substitutes.get(key.lower())
     if sub and sub.lower() in have:
         return have[sub.lower()]
     return key
 
 
-def font_face_css() -> str:
+def font_face_css(*, embed: bool = False, families=None) -> str:
     """CSS ``@font-face`` rules so Chromium can use the bundled files.
 
     The charts render in a QWebEngineView, which has its own font stack and
     cannot see fonts registered with Qt -- so they must be handed to the page
-    explicitly. Paths are ``file://`` URLs, which is how the shell itself is
-    already loaded.
+    explicitly. Use local paths for the Qt chart shell and embedded data URLs
+    for self-contained dashboard HTML.
     """
     if not FONT_DIR.is_dir():
         return ""
+    wanted = None
+    if families is not None:
+        requested = {str(name).strip() for name in families if str(name).strip()}
+        wanted = {name.lower() for name in requested}
+        wanted.update(resolve(name).lower() for name in requested)
     rules: List[str] = []
     for path in font_files():
+        family = family_of(path)
+        if wanted is not None and family.lower() not in wanted:
+            continue
         try:
-            url = path.as_uri()
+            if embed:
+                encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+                url = f"data:font/ttf;base64,{encoded}"
+            else:
+                url = path.as_uri()
         except Exception:
             continue
         # One rule per file, all sharing the family name: the browser picks
         # the closest weight it has. The variable fonts cover the full range;
         # the static Lato/Carlito/Caladea files add plain Regular/Bold/Italic.
-        rules.append(
-            "@font-face{font-family:'%s';src:url('%s') format('truetype');"
-            "font-weight:100 900;font-style:normal;font-display:swap;}"
-            % (family_of(path), url)
-        )
+        stem = path.stem.lower()
+        variable = "variable" in stem
+        weight = ("100 900" if variable else
+                  "700" if "bold" in stem else
+                  "600" if "semibold" in stem else
+                  "500" if "medium" in stem else
+                  "300" if "light" in stem else "400")
+        style = "italic" if "italic" in stem else "normal"
+        rules.append("@font-face{font-family:'%s';src:url('%s') format('truetype');"
+                     "font-weight:%s;font-style:%s;font-display:swap;}"
+                     % (family, url, weight, style))
     if not rules:
         return ""
     return "\n".join(rules) + "\n"

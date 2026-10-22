@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 from services.transform_service import preview_dtype_conversion, apply_dtype_conversion
 from desktop.workers import TransformWorker
 from desktop.widgets.table_index_header import auto_fit_index_header
+from desktop.widgets.resizable_table import apply_table_defaults, fit_columns_to_content
 
 log = logging.getLogger(__name__)
 
@@ -150,7 +151,8 @@ class DtypeTransformerPanel(QWidget):
         self.table_preview = QTableWidget()
         self.table_preview.setColumnCount(2)
         self.table_preview.setHorizontalHeaderLabels(["Before", "After"])
-        self.table_preview.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        # Readable, scrollable columns instead of Stretch (see resizable_table.py).
+        apply_table_defaults(self.table_preview)
         # Explicit min AND max so the preview can never balloon the whole
         # pane -- it scrolls internally instead of forcing the transform
         # controls to shrink out of usability.
@@ -337,6 +339,9 @@ class DtypeTransformerPanel(QWidget):
                     self.table_preview.setItem(i, j, item)
             self.table_preview.setVisible(True)
             self.btn_clear_preview.setVisible(True)
+            # Preview content changed -> fit the columns to their (capped)
+            # content instead of squeezing them. See resizable_table.py.
+            fit_columns_to_content(self.table_preview)
 
             # Allow applying after ANY successful preview -- even a lossy one
             # (pct < 100). Previously Apply was gated on pct > 0, which left

@@ -7,7 +7,7 @@ Recommends: chromium-browser | google-chrome-stable | firefox,
   fonts-noto, fonts-source-sans-pro, fonts-lato, fonts-oswald, fonts-barlow,
   fonts-ebgaramond, fonts-firacode, fonts-jetbrains-mono, fonts-dejavu
 Description: Lytrize — Offline Desktop Analytics
- Analyse CSV and Excel files locally with interactive Plotly charts,
+ Analyse CSV and Excel files locally with interactive Apache ECharts charts,
  saved dashboards, KPI cards, and export to PDF/image.
  .
  Features: distribution analysis, time series, correlation, outlier

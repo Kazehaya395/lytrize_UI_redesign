@@ -29,6 +29,7 @@ class DataFrameModel(QAbstractTableModel):
     def __init__(self, df: Optional[pd.DataFrame] = None, parent=None) -> None:
         super().__init__(parent)
         self._df = df if df is not None else pd.DataFrame()
+        self._row_limit: Optional[int] = None
         self._colors_cache: dict = {}
         self._colors_cache_mode: str = ""
         from desktop.theme import current_mode as _cm
@@ -40,6 +41,24 @@ class DataFrameModel(QAbstractTableModel):
         """Replace the underlying DataFrame and notify views."""
         self.beginResetModel()
         self._df = df if df is not None else pd.DataFrame()
+        self._row_limit = None
+        self.endResetModel()
+
+    # -- Row limit --------------------------------------------------------
+    # A transient cap on the model's visible row count, used by the column
+    # content-fit pass so resizeColumnsToContents() measures a head slice
+    # instead of walking a million-row frame on the UI thread. Cleared back
+    # to None afterwards; rowCount honours it, everything else is unchanged.
+    def set_row_limit(self, limit: Optional[int]) -> None:
+        """Temporarily cap the reported row count (None = no limit)."""
+        try:
+            limit = int(limit) if limit is not None else None
+        except (TypeError, ValueError):
+            limit = None
+        if limit is not None and limit < 0:
+            limit = None
+        self.beginResetModel()
+        self._row_limit = limit
         self.endResetModel()
 
     def on_theme_changed(self) -> None:
@@ -61,7 +80,10 @@ class DataFrameModel(QAbstractTableModel):
     def rowCount(self, parent=QModelIndex()) -> int:  # noqa: N802
         if parent.isValid():
             return 0
-        return len(self._df)
+        n = len(self._df)
+        if self._row_limit is not None and self._row_limit < n:
+            return self._row_limit
+        return n
 
     def columnCount(self, parent=QModelIndex()) -> int:  # noqa: N802
         if parent.isValid():

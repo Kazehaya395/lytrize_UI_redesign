@@ -124,7 +124,8 @@ class SlicerDialog(QDialog):
         self.cb_scope = QComboBox()
         self.cb_scope.addItems(["Whole report", "One chart"])
         self.cb_scope.setToolTip(
-            "\"Whole report\" filters every chart that plots the column.\n"
+            "\"Whole report\" filters every chart -- a report slicer applies\n"
+            "to the whole board, even charts that never plot the column.\n"
             "\"One chart\" filters only the chart picked below.")
         root.addWidget(_field_row("Affects", self.cb_scope))
 
@@ -319,9 +320,9 @@ class SlicerDialog(QDialog):
                               if u == draft["target"]), draft["target"])
                 text = f"Filters 1 chart: {title}"
         else:
-            total = len(self._charts)
-            text = (f"Affects {len(hits)} of {total} charts "
-                    f"(those that plot {column}).")
+            text = (f"Filters all {len(hits)} charts "
+                    f"(a whole-report slicer applies to every chart, "
+                    f"not just those plotting {column}).")
         lbl.setText(text)
         lbl.setVisible(True)
     def _load_existing(self) -> None:

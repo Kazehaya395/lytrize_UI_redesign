@@ -33,6 +33,7 @@ from services.transform_service import (
 )
 from desktop.workers import TransformWorker
 from desktop.widgets.table_index_header import auto_fit_index_header
+from desktop.widgets.resizable_table import apply_table_defaults, fit_columns_to_content
 
 log = logging.getLogger(__name__)
 
@@ -145,11 +146,15 @@ class ColumnManagerPanel(QWidget):
         self.table_preview = QTableWidget()
         self.table_preview.setColumnCount(0)
         self.table_preview.setRowCount(0)
-        self.table_preview.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table_preview.setAlternatingRowColors(True)
         self.table_preview.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table_preview.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.table_preview.verticalHeader().setDefaultSectionSize(28)
+        # Readable, scrollable columns instead of Stretch. Stretch divided the
+        # viewport by the column count and force-fit every column, squeezing a
+        # 23-column dataset to ~30px cells with no horizontal scrollbar -- the
+        # "can't read the preview" report. See desktop/widgets/resizable_table.py.
+        apply_table_defaults(self.table_preview)
         # Table styling handled by global _tables_qss
         # Centered row-index gutter sized to the rows actually shown (the
         # old fixed 36px was arbitrary). See table_index_header.py.
@@ -530,6 +535,9 @@ class ColumnManagerPanel(QWidget):
                 self.table_preview.setItem(r, c, item)
         # Row count just changed -> re-measure the index gutter.
         auto_fit_index_header(self.table_preview)
+        # Column set just changed -> fit the columns to their (capped) content
+        # instead of squeezing them. See resizable_table.py.
+        fit_columns_to_content(self.table_preview, max_rows=n)
 
     def _validate_formula(self, formula: str) -> Optional[str]:
         """Return a user-friendly error message if *formula* is invalid, or

@@ -1,57 +1,20 @@
-"""modules/analysis/descriptive.py -- Descriptive statistics table runner."""
+"""Descriptive statistics builder backed by Polars and native table models."""
 
-import plotly.graph_objects as go
+from __future__ import annotations
 
-from modules.charts import chart_layout, COLORS
-from services.column_roles import role_pools
+def run_descriptive(df, roles=None, layout=None, typography=None, **kwargs):
+    """Build a semantic Descriptive Statistics table.
 
-
-def run_descriptive(df, roles=None, **kwargs):
-    """Return a descriptive statistics table for all numeric columns in *df*.
-
-    Pure function: takes the DataFrame explicitly and returns a Plotly
-    table figure so it fits the same ``(title, fig)`` contract as every
-    other analysis runner and renders through the existing
-    PlotlyView/ChartCard pipeline. No Streamlit, no session state.
+    ``df`` is accepted for the analysis-service compatibility API. New callers
+    should pass ``polars_dataset`` and avoid crossing the pandas boundary.
+    The return shape remains a list of ``(title, chart model)`` pairs, but no
+    Plotly figure is created.
     """
-    num = role_pools(df, roles=roles)["num"]
-    if not num:
-        return []
-
-    # For very large files, describe() on a 100K sample is representative
-    # enough for the summary table and avoids scanning 300 MB of data.
-    if len(df) > 100_000:
-        desc = df[num].sample(min(100_000, len(df)), random_state=42).describe().T.reset_index()
-    else:
-        desc = df[num].describe().T.reset_index()
-
-    desc.columns = [c.title() if c != "index" else "Column" for c in desc.columns]
-
-    # Round the statistic columns, leaving the leading "Column" label alone.
-    # Named rather than discovered by dtype: every column of ``describe().T``
-    # except "Column" is a number by construction, and re-selecting by dtype
-    # here would be exactly the chart-specific detection this codebase
-    # forbids (see services/column_roles).
-    for _stat_col in desc.columns:
-        if _stat_col == "Column":
-            continue
-        try:
-            desc[_stat_col] = desc[_stat_col].round(4)
-        except Exception:
-            pass
-
-    fig = go.Figure(data=[go.Table(
-        header=dict(
-            values=[f"<b>{c}</b>" for c in desc.columns],
-            fill_color=COLORS[0],
-            font=dict(color="white", size=12),
-            align="left",
-        ),
-        cells=dict(
-            values=[desc[c] for c in desc.columns],
-            align="left",
-        ),
-    )])
-    fig.update_layout(**chart_layout(), title="Descriptive Statistics")
-
-    return [("Descriptive Statistics", fig)]
+    dataset = kwargs.get("polars_dataset")
+    if dataset is None:
+        from services.polars_engine import PolarsDataset
+        dataset = PolarsDataset.from_pandas(df)
+    from services.polars_chart_service import build_descriptive_table_chart
+    model = build_descriptive_table_chart(
+        dataset, roles=roles, layout=layout, typography=typography)
+    return [(model["title"], model)] if model else []

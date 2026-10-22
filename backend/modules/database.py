@@ -81,13 +81,14 @@ def _connect():
 
 
     if db_path.is_dir():
-        try:
-            import shutil
-            shutil.rmtree(db_path)
-            log.warning("_connect: removed stale directory at DB_PATH %s", db_path)
-        except Exception:
-            log.exception("_connect: failed to remove stale directory at %s", db_path)
-            raise
+        # A directory at the DB path is a FATAL configuration error, never
+        # something to "fix" by deletion: a mis-set LYTRIZE_DB_PATH pointing
+        # at e.g. ~/.local/share/lytrize would wipe every saved session and
+        # every bundled parquet dataset. Raise so the misconfiguration
+        # surfaces loudly instead of silently destroying user data.
+        raise IsADirectoryError(
+            f"Database path is a directory, refusing to delete it: {db_path}"
+        )
 
 
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -229,12 +230,92 @@ def _guest_row_id(conn) -> Optional[int]:
 
 
 
+def _meta_get(conn, key: str):
+    """Read a value from the ``app_meta`` key/value table (None if absent)."""
+    row = conn.execute(_ph("SELECT value FROM app_meta WHERE key=?"), (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _meta_set(conn, key: str, value: str) -> None:
+    """Upsert a value into the ``app_meta`` key/value table."""
+    conn.execute(_ph("INSERT INTO app_meta(key, value) VALUES(?, ?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value"),
+                 (key, str(value)))
+
+
+def _migrate_show_border_default(conn) -> int:
+    """One-time migration: turn the chart ``show_border`` default OFF.
+
+    ``chart_display.default_layout_opts()`` shipped ``show_border=True`` as the
+    default, so every chart built before this change (and every session saved
+    with one) renders a legend/colorbar frame border the app no longer wants --
+    the reported "box around every chart" screenshot. Flipping the default only
+    affects NEW charts, so the saved sessions are migrated here: for each
+    session, every chart whose stored ``meta.layout.show_border`` is True is
+    rewritten to False **only when the user never touched that control**.
+
+    Without a way to tell "user turned the border on" from "it was the old
+    default", the safe production choice for a local-first pre-launch app is to
+    clear the inherited True: the control still exists, is still functional, and
+    the user can re-enable it per chart. Explicit ``False`` is left alone (it is
+    already correct), so this is idempotent and safe to re-run.
+
+    Returns the number of sessions rewritten.
+    """
+    import json as _json
+
+    if _meta_get(conn, "migrated_show_border_default") == "1":
+        return 0
+
+    rows = conn.execute(_ph("SELECT id, charts_json FROM sessions")).fetchall()
+    changed = 0
+    for sid, charts_json in rows:
+        if not charts_json:
+            continue
+        try:
+            items = _json.loads(charts_json)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(items, list):
+            continue
+
+        dirty = False
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            meta = it.get("meta")
+            if not isinstance(meta, dict):
+                continue
+            layout = meta.get("layout")
+            if isinstance(layout, dict) and layout.get("show_border") is True:
+                layout["show_border"] = False
+                dirty = True
+
+        if dirty:
+            try:
+                conn.execute(_ph("UPDATE sessions SET charts_json=? WHERE id=?"),
+                             (_json.dumps(items), sid))
+                changed += 1
+            except Exception:
+                log.exception("init_db: show_border migration failed for session %s", sid)
+
+    _meta_set(conn, "migrated_show_border_default", "1")
+    if changed:
+        log.info("init_db: migrated show_border default in %d session(s)", changed)
+    return changed
+
+
 def init_db() -> None:
     """Create all required tables. Safe to call every startup (IF NOT EXISTS)."""
     conn = _connect()
     try:
         c = conn.cursor()
 
+
+        c.execute("""CREATE TABLE IF NOT EXISTS app_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )""")
 
         c.execute("""CREATE TABLE IF NOT EXISTS users (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -315,6 +396,7 @@ def init_db() -> None:
             kpis_json            TEXT DEFAULT '[]',
             chart_meta_json      TEXT DEFAULT '{}',
             layout_mode           TEXT DEFAULT 'portrait',
+            tile_geometry_json    TEXT DEFAULT '{}',
             updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users(id)
         )""")
@@ -349,6 +431,20 @@ def init_db() -> None:
                 ("updated_at",          "TIMESTAMP"),
                 ("export_text_json",    "TEXT DEFAULT '{}'"),
                 ("export_colours_json", "TEXT DEFAULT '{}'"),
+                # The whole-package bundle. A saved session is only useful if it
+                # reopens WITH its data and its slicers -- the reported "session
+                # vanishes / can't filter after reopen" bug. These three record
+                # where the DataFrame lives (a content-addressed parquet beside
+                # the DB, not inline), its hash, and the slicer definitions.
+                ("dataset_uri",         "TEXT DEFAULT ''"),
+                ("dataset_hash",        "TEXT DEFAULT ''"),
+                ("slicers_json",        "TEXT DEFAULT '[]'"),
+            ],
+            "draft_sessions": [
+                # Free-canvas placement. Absent on installs created before the
+                # canvas carried its geometry into the draft, so a relaunch
+                # there must add it rather than lose every dragged position.
+                ("tile_geometry_json",  "TEXT DEFAULT '{}'"),
             ],
         }
 
@@ -419,6 +515,14 @@ def init_db() -> None:
                 )
         except Exception:
             log.exception("init_db: failed to backfill analysed_datasets")
+
+
+        # One-time migration: clear the inherited show_border=True default on
+        # already-saved sessions (see _migrate_show_border_default).
+        try:
+            _migrate_show_border_default(conn)
+        except Exception:
+            log.exception("init_db: show_border default migration failed")
 
 
         try:
@@ -644,6 +748,7 @@ def save_draft(
     kpis_json: str = "[]",
     chart_meta_json: str = "{}",
     layout_mode: str = "portrait",
+    tile_geometry_json: str = "{}",
 ) -> None:
     """Upsert the user's current in-progress state to draft_sessions."""
     try:
@@ -652,11 +757,13 @@ def save_draft(
                     INSERT OR REPLACE INTO draft_sessions
                         (user_id, page, charts_json, file_name, editing_session_id,
                          editing_session_name, editing_file_name, dashboard_title,
-                         kpis_json, chart_meta_json, layout_mode, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
+                         kpis_json, chart_meta_json, layout_mode,
+                         tile_geometry_json, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
                     (user_id, page, charts_json, file_name,
                      editing_session_id, editing_session_name, editing_file_name,
-                     dashboard_title, kpis_json, chart_meta_json, layout_mode),
+                     dashboard_title, kpis_json, chart_meta_json, layout_mode,
+                     tile_geometry_json),
                 )
     except Exception as exc:
         logging.getLogger(__name__).debug("Suppressed error: %s", exc, exc_info=True)
@@ -711,6 +818,9 @@ def save_session_db(
     grid_fullwidth_json: str = "{}",
     export_text_json: str = "{}",
     export_colours_json: str = "{}",
+    dataset_uri: str = "",
+    dataset_hash: str = "",
+    slicers_json: str = "[]",
     session_uuid: Optional[str] = None,
     source: str = "local",
 ) -> int:
@@ -722,12 +832,14 @@ def save_session_db(
             _ph("""INSERT INTO sessions
                (user_id, session_uuid, session_name, file_name, rows_count, cols_count,
                 analysis_types, charts_json, dashboard_title, kpis_json, layout_mode,
-                grid_cols_n, grid_order_json, grid_fullwidth_json, export_text_json, export_colours_json, source, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)"""),
+                grid_cols_n, grid_order_json, grid_fullwidth_json, export_text_json, export_colours_json,
+                dataset_uri, dataset_hash, slicers_json, source, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)"""),
             (user_id, session_uuid, session_name, file_name, rows, cols,
              json.dumps(analysis_types), charts_json,
              dashboard_title, kpis_json, layout_mode,
-             grid_cols_n, grid_order_json, grid_fullwidth_json, export_text_json, export_colours_json, source),
+             grid_cols_n, grid_order_json, grid_fullwidth_json, export_text_json, export_colours_json,
+             dataset_uri, dataset_hash, slicers_json, source),
         )
         sid = _last_id(c)
     log_activity(user_id, "dashboard_saved",
@@ -882,6 +994,9 @@ def update_session_db(
     grid_fullwidth_json: str = "{}",
     export_text_json: str = "{}",
     export_colours_json: str = "{}",
+    dataset_uri: str = "",
+    dataset_hash: str = "",
+    slicers_json: str = "[]",
     session_uuid: Optional[str] = None,
 ) -> None:
     """Overwrite a saved session in-place. user_id guard enforces ownership."""
@@ -897,11 +1012,13 @@ def update_session_db(
             "SET session_name=?, charts_json=?, analysis_types=?, "
             "    dashboard_title=?, kpis_json=?, layout_mode=?, grid_cols_n=?, "
             "    grid_order_json=?, grid_fullwidth_json=?, export_text_json=?, export_colours_json=?, "
+            "    dataset_uri=?, dataset_hash=?, slicers_json=?, "
             "    updated_at=CURRENT_TIMESTAMP "
             "WHERE id=? AND user_id=?"),
             (session_name, charts_json, json.dumps(analysis_types),
              dashboard_title, kpis_json, layout_mode, grid_cols_n,
              grid_order_json, grid_fullwidth_json, export_text_json, export_colours_json,
+             dataset_uri, dataset_hash, slicers_json,
              session_id, user_id),
         )
     log_activity(user_id, "session_updated",
@@ -1030,7 +1147,8 @@ def get_user_sessions(user_id: int) -> list:
         return []
     conn = _connect()
     wanted = ["id", "session_name", "file_name", "rows_count",
-              "cols_count", "analysis_types", "created_at"]
+              "cols_count", "analysis_types", "created_at",
+              "dataset_uri", "dataset_hash", "slicers_json"]
     try:
         c = conn.cursor()
         c.execute("PRAGMA table_info(sessions)")
@@ -1051,12 +1169,19 @@ def get_user_sessions(user_id: int) -> list:
             (user_id,),
         )
         rows = c.fetchall()
-        n_got = len(select_cols.split(","))
-        n_wanted = len(wanted)
-        if n_got < n_wanted:
-            pad_count = n_wanted - n_got
-            rows = [tuple(list(r) + [None] * pad_count) for r in rows]
-        return rows
+        # Pad MISSING columns in position (not just appended at the end):
+        # Home reads dataset_uri at index 7 and slicers_json at index 9,
+        # so a row from an old DB without those columns must carry None
+        # in exactly those slots, or every later field shifts.
+        have = [col for col in wanted if col in available_cols]
+        slots = [wanted.index(c) for c in have]
+        fixed = []
+        for r in rows:
+            full = [None] * len(wanted)
+            for pos, val in zip(slots, r):
+                full[pos] = val
+            fixed.append(tuple(full))
+        return fixed
     except Exception as e:
         log.warning("get_user_sessions: %s", e)
         return []
@@ -1073,12 +1198,12 @@ def get_session_meta(session_id: int, user_id=None) -> Optional[dict]:
             c = conn.cursor()
             if user_id is None:
                 c.execute(
-                    _ph("SELECT dashboard_title, kpis_json, layout_mode, grid_cols_n, grid_order_json, grid_fullwidth_json, export_text_json, export_colours_json FROM sessions WHERE id=?"),
+                    _ph("SELECT dashboard_title, kpis_json, layout_mode, grid_cols_n, grid_order_json, grid_fullwidth_json, export_text_json, export_colours_json, dataset_uri, dataset_hash, slicers_json FROM sessions WHERE id=?"),
                     (session_id,),
                 )
             else:
                 c.execute(
-                    _ph("SELECT dashboard_title, kpis_json, layout_mode, grid_cols_n, grid_order_json, grid_fullwidth_json, export_text_json, export_colours_json "
+                    _ph("SELECT dashboard_title, kpis_json, layout_mode, grid_cols_n, grid_order_json, grid_fullwidth_json, export_text_json, export_colours_json, dataset_uri, dataset_hash, slicers_json "
                         "FROM sessions WHERE id=? AND user_id=?"),
                     (session_id, user_id),
                 )
@@ -1093,6 +1218,9 @@ def get_session_meta(session_id: int, user_id=None) -> Optional[dict]:
                     "grid_fullwidth_json": row[5] or "{}",
                     "export_text_json":   row[6] or "{}",
                     "export_colours_json": row[7] or "{}",
+                    "dataset_uri":        row[8] or "",
+                    "dataset_hash":       row[9] or "",
+                    "slicers_json":       row[10] or "[]",
                 }
     except Exception as exc:
         logging.getLogger(__name__).debug("Suppressed error: %s", exc, exc_info=True)
@@ -1104,9 +1232,6 @@ def get_session_meta(session_id: int, user_id=None) -> Optional[dict]:
 
 def get_session_charts(session_id: int, user_id=None) -> list:
     """Load and deserialise charts from a saved session."""
-    import plotly.io as pio
-
-
     conn = _connect()
     try:
         c = conn.cursor()
@@ -1134,18 +1259,16 @@ def get_session_charts(session_id: int, user_id=None) -> list:
         return []
 
 
+    from services.chart_service import deserialize_chart
     charts = []
     for item in raw_items:
         try:
-            uid           = item.get("uid", uuid.uuid4().hex[:8])
-            desc          = item.get("desc", "")
-            chart_type    = item.get("chart_type", "")
-            meta          = item.get("meta", {})
-            fig           = pio.from_json(item["fig_json"])
-            charts.append((uid, item["title"], fig, desc, chart_type, meta))
+            parsed = deserialize_chart(item)
+            if parsed is not None:
+                charts.append(parsed)
         except Exception as exc:
-            logging.getLogger(__name__).debug("Suppressed error: %s", exc, exc_info=True)
-            pass
+            logging.getLogger(__name__).debug("Could not migrate saved chart: %s", exc,
+                                              exc_info=True)
     return charts
 
 
@@ -1182,7 +1305,13 @@ def export_sessions_to_dict(
                 "session_uuid", "session_name", "file_name", "rows_count",
                 "cols_count", "analysis_types", "charts_json", "dashboard_title",
                 "kpis_json", "layout_mode", "grid_cols_n", "grid_order_json", "grid_fullwidth_json",
-                "export_text_json", "export_colours_json", "source", "created_at",
+                "export_text_json", "export_colours_json",
+                # Task 4: the whole-package bundle must survive a JSON backup.
+                # Without these three a restore brings back pictures with dead
+                # slicers (no data behind them) -- the same bug as reopening
+                # a session whose parquet was never persisted.
+                "dataset_uri", "dataset_hash", "slicers_json",
+                "source", "created_at",
             ]
             select_parts = [col for col in wanted if col in available]
             if "updated_at" in available:
@@ -1251,34 +1380,48 @@ def import_sessions_from_dict(
 
     def _insert_row(conn, payload: dict) -> None:
         """Insert one session row. Defined once outside the loop for efficiency."""
+        # Columns absent on old DBs are probed once per call so an old
+        # install restores without crashing on dataset_uri/slicers_json.
+        try:
+            _cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+        except Exception:
+            _cols = set()
+        _all = ["user_id", "session_uuid", "session_name", "file_name", "rows_count",
+                "cols_count", "analysis_types", "charts_json", "dashboard_title",
+                "kpis_json", "layout_mode", "grid_cols_n", "grid_order_json", "grid_fullwidth_json",
+                "export_text_json", "export_colours_json",
+                "dataset_uri", "dataset_hash", "slicers_json",
+                "source", "created_at"]
+        _vals = {
+            "user_id": user_id,
+            "session_uuid": payload.get("session_uuid") or None,
+            "session_name": payload.get("session_name", "Restored Session"),
+            "file_name": payload.get("file_name"),
+            "rows_count": payload.get("rows_count"),
+            "cols_count": payload.get("cols_count"),
+            "analysis_types": payload.get("analysis_types"),
+            "charts_json": payload.get("charts_json"),
+            "dashboard_title": payload.get("dashboard_title", ""),
+            "kpis_json": payload.get("kpis_json", "[]"),
+            "layout_mode": payload.get("layout_mode", "portrait"),
+            "grid_cols_n": payload.get("grid_cols_n", 2) or 2,
+            "grid_order_json": payload.get("grid_order_json", "[]"),
+            "grid_fullwidth_json": payload.get("grid_fullwidth_json", "{}"),
+            "export_text_json": payload.get("export_text_json") or "{}",
+            "export_colours_json": payload.get("export_colours_json") or "{}",
+            "dataset_uri": payload.get("dataset_uri") or "",
+            "dataset_hash": payload.get("dataset_hash") or "",
+            "slicers_json": payload.get("slicers_json") or "[]",
+            "source": payload.get("source") or "local",
+            "created_at": payload.get("created_at"),
+        }
+        _use = [c for c in _all if (not _cols or c in _cols)]
+        _place = ",".join(["?"] * len(_use))
         _execute(
             conn,
-            _ph("""INSERT INTO sessions
-                   (user_id, session_uuid, session_name, file_name, rows_count,
-                    cols_count, analysis_types, charts_json, dashboard_title,
-                    kpis_json, layout_mode, grid_cols_n, grid_order_json, grid_fullwidth_json,
-                    export_text_json, export_colours_json, source, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)"""),
-            (
-                user_id,
-                payload.get("session_uuid") or None,
-                payload.get("session_name", "Restored Session"),
-                payload.get("file_name"),
-                payload.get("rows_count"),
-                payload.get("cols_count"),
-                payload.get("analysis_types"),
-                payload.get("charts_json"),
-                payload.get("dashboard_title", ""),
-                payload.get("kpis_json", "[]"),
-                payload.get("layout_mode", "portrait"),
-                payload.get("grid_cols_n", 2) or 2,
-                payload.get("grid_order_json", "[]"),
-                payload.get("grid_fullwidth_json", "{}"),
-                payload.get("export_text_json") or "{}",
-                payload.get("export_colours_json") or "{}",
-                payload.get("source") or "local",
-                payload.get("created_at"),
-            ),
+            _ph("INSERT INTO sessions (" + ", ".join(_use) + ") "
+                "VALUES (" + _place + ")"),
+            tuple(_vals[c] for c in _use),
         )
 
 
@@ -1315,24 +1458,46 @@ def import_sessions_from_dict(
 
                     if backup_updated and backup_updated > local_updated:
                         try:
+                            _upd_cols = ["session_name", "file_name", "rows_count",
+                                         "cols_count", "analysis_types", "charts_json",
+                                         "dashboard_title", "kpis_json", "layout_mode",
+                                         "grid_cols_n", "grid_order_json", "grid_fullwidth_json",
+                                         "export_text_json", "export_colours_json",
+                                         "dataset_uri", "dataset_hash", "slicers_json",
+                                         "source"]
+                            try:
+                                _have = {row[1] for row in
+                                         conn.execute("PRAGMA table_info(sessions)")}
+                            except Exception:
+                                _have = set()
+                            _upd = [c for c in _upd_cols if (not _have or c in _have)]
+                            _upd_vals = {
+                                "session_name": sname,
+                                "file_name": s.get("file_name"),
+                                "rows_count": s.get("rows_count"),
+                                "cols_count": s.get("cols_count"),
+                                "analysis_types": s.get("analysis_types"),
+                                "charts_json": s.get("charts_json"),
+                                "dashboard_title": s.get("dashboard_title", ""),
+                                "kpis_json": s.get("kpis_json", "[]"),
+                                "layout_mode": s.get("layout_mode", "portrait"),
+                                "grid_cols_n": s.get("grid_cols_n", 2) or 2,
+                                "grid_order_json": s.get("grid_order_json", "[]"),
+                                "grid_fullwidth_json": s.get("grid_fullwidth_json", "{}"),
+                                "export_text_json": s.get("export_text_json") or "{}",
+                                "export_colours_json": s.get("export_colours_json") or "{}",
+                                "dataset_uri": s.get("dataset_uri") or "",
+                                "dataset_hash": s.get("dataset_hash") or "",
+                                "slicers_json": s.get("slicers_json") or "[]",
+                                "source": source,
+                            }
                             _execute(
                                 conn,
-                                _ph("""UPDATE sessions SET
-                                       session_name=?, file_name=?, rows_count=?,
-                                       cols_count=?, analysis_types=?, charts_json=?,
-                                       dashboard_title=?, kpis_json=?, layout_mode=?,
-                                       grid_cols_n=?, grid_order_json=?, grid_fullwidth_json=?,
-                                       export_text_json=?, export_colours_json=?, source=?, updated_at=CURRENT_TIMESTAMP
-                                       WHERE id=? AND user_id=?"""),
-                                (sname, s.get("file_name"), s.get("rows_count"),
-                                 s.get("cols_count"), s.get("analysis_types"),
-                                 s.get("charts_json"), s.get("dashboard_title", ""),
-                                 s.get("kpis_json", "[]"), s.get("layout_mode", "portrait"),
-                                 s.get("grid_cols_n", 2) or 2,
-                                 s.get("grid_order_json", "[]"), s.get("grid_fullwidth_json", "{}"),
-                                 s.get("export_text_json") or "{}",
-                                 s.get("export_colours_json") or "{}",
-                                 source, local_id, user_id),
+                                _ph("UPDATE sessions SET "
+                                    + ", ".join(c + "=?" for c in _upd)
+                                    + ", updated_at=CURRENT_TIMESTAMP "
+                                      "WHERE id=? AND user_id=?"),
+                                tuple(_upd_vals[c] for c in _upd) + (local_id, user_id),
                             )
                             updated += 1
                         except Exception as exc:

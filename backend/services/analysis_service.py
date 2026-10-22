@@ -1,8 +1,11 @@
 """services/analysis_service.py — Headless analysis API.
 
 Replaces the analysis registry and configuration layer in
-``modules/analysis/__init__.py`` with pure-Python functions that accept
-a DataFrame and a config dict, and return ``(uid, title, fig)`` tuples.
+``modules/analysis/__init__.py`` with service functions that accept the active
+dataset and a config dict, and return ``(uid, title, chart)`` tuples. Every
+supported chart family is dispatched to the Polars builders and returns a
+semantic ChartModel. Historical Plotly JSON is handled only by a separate
+read-only migration adapter at the persistence boundary.
 
 The ``_WIDGET_SPEC`` schema is extracted here so that the Qt UI can
 build its form widgets from the same declarative specification as the
@@ -11,7 +14,6 @@ Streamlit UI.
 
 from __future__ import annotations
 
-import inspect
 import uuid
 from typing import Any, Optional
 
@@ -20,20 +22,7 @@ import pandas as pd
 from services.column_roles import (
     dimension_columns, metric_columns, resolve_roles,
 )
-from modules.analysis.descriptive import run_descriptive
-from modules.analysis.statistical import run_statistical
-from modules.analysis.distribution import run_distribution
-from modules.analysis.correlation import run_correlation
-from modules.analysis.categorical import run_categorical
-from modules.analysis.pie_chart import run_pie_chart
-from modules.analysis.time_series import run_time_series
-from modules.analysis.outlier import run_outlier, OUTLIER_HELP
-from modules.analysis.scatter_plot import run_scatter_plot
-from modules.analysis.matrix_table import run_matrix_heatmap, run_matrix_table
-from modules.analysis.map_plot import run_map_plot
-from modules.analysis.data_quality import run_data_quality
-
-from modules.charts import PALETTES, chart_layout
+from modules.charts import PALETTES
 
 
 # ── Analysis options (same as ANALYSIS_OPTIONS in modules/analysis/__init__) ──
@@ -49,28 +38,40 @@ ANALYSIS_OPTIONS = [
     {"id": "scatter_plot", "icon": "📉",  "name": "Scatter Plot",      "desc": "Variable relationships"},
     {"id": "matrix_heatmap", "icon": "🔲", "name": "Matrix Heatmap",   "desc": "Cross-tab heatmap"},
     {"id": "matrix_table",   "icon": "📋", "name": "Pivot Table",      "desc": "Cross-tab table"},
-    {"id": "map_plot",     "icon": "🗺️", "name": "Map Plot",          "desc": "Geographic scatter"},
+    {"id": "map_plot",     "icon": "🗺️", "name": "Map Plot",          "desc": "Offline maps and choropleths"},
+    {"id": "nightingale_rose", "icon": "🌹", "name": "Nightingale Rose", "desc": "Polar area comparisons"},
+    {"id": "sankey", "icon": "🔀", "name": "Sankey Diagram", "desc": "Flow between categories"},
+    {"id": "sunburst", "icon": "☀️", "name": "Sunburst Chart", "desc": "Hierarchical proportions"},
+    {"id": "calendar_heatmap", "icon": "🗓️", "name": "Calendar Heatmap", "desc": "Daily activity patterns"},
+    {"id": "waterfall", "icon": "🌊", "name": "Waterfall", "desc": "Cumulative changes"},
+    {"id": "funnel", "icon": "🔻", "name": "Funnel", "desc": "Stage conversion"},
+    {"id": "globe_extruded_map", "icon": "🌐", "name": "3D Globe & Extruded Map", "desc": "Geographic visualization"},
 ]
 
-_RUNNERS = {
-    "descriptive":  run_descriptive,
-    "statistical":  run_statistical,
-    "distribution": run_distribution,
-    "correlation":  run_correlation,
-    "categorical":  run_categorical,
-    "pie_chart":    run_pie_chart,
-    "time_series":  run_time_series,
-    "outlier":      run_outlier,
-    "scatter_plot": run_scatter_plot,
-    "matrix_heatmap": run_matrix_heatmap,
-    "matrix_table":   run_matrix_table,
-    "map_plot":     run_map_plot,
-    "data_quality": run_data_quality,
+_NATIVE_BUILDERS = {
+    "statistical": "build_statistical_charts",
+    "distribution": "build_distribution_charts",
+    "correlation": "build_correlation_chart",
+    "categorical": "build_categorical_charts",
+    "pie_chart": "build_pie_chart",
+    "time_series": "build_time_series_chart",
+    "outlier": "build_outlier_charts",
+    "scatter_plot": "build_scatter_chart",
+    "matrix_heatmap": "build_matrix_heatmap_chart",
+    "matrix_table": "build_matrix_table_chart",
+    "data_quality": "build_data_quality_charts",
+    "nightingale_rose": "build_nightingale_rose_chart",
+    "sankey": "build_advanced_chart",
+    "sunburst": "build_advanced_chart",
+    "calendar_heatmap": "build_advanced_chart",
+    "waterfall": "build_advanced_chart",
+    "funnel": "build_advanced_chart",
+    "globe_extruded_map": "build_advanced_chart",
 }
 
 _NEEDS_AXES = {"statistical", "distribution", "correlation", "categorical",
                "pie_chart", "time_series", "scatter_plot", "matrix_heatmap",
-               "matrix_table", "map_plot"}
+               "matrix_table"}
 
 AGG_FUNCS = {
     "Avg": "mean",
@@ -147,6 +148,9 @@ WIDGET_SPEC = {
         ("palette", "palette", "palette"),
         ("render_mode", "render_mode", "scalar"),
     ],
+    "outlier": [
+        ("column", "column", "scalar"),
+    ],
     "matrix_heatmap": [
         ("index_col", "index_col", "scalar"),
         ("columns_col", "columns_col", "scalar"),
@@ -190,6 +194,32 @@ WIDGET_SPEC = {
         ("hover_val1_agg", "hover_val1_agg", "scalar"),
         ("hover_val2", "hover_val2", "scalar"),
         ("hover_val2_agg", "hover_val2_agg", "scalar"),
+    ],
+    "nightingale_rose": [
+        ("x", "x_cols", "scalar"), ("y", "y_cols", "scalar"),
+        ("agg", "agg", "scalar"), ("sort", "sort_by", "scalar_map"),
+        ("top_n", "top_n", "number"), ("palette", "palette", "palette"),
+    ],
+    "sankey": [
+        ("source_col", "source_col", "scalar"), ("target_col", "target_col", "scalar"),
+        ("value_col", "value_col", "scalar"), ("agg", "agg", "scalar"),
+        ("palette", "palette", "palette"),
+    ],
+    "sunburst": [
+        ("path_cols", "path_cols", "list"), ("value_col", "value_col", "scalar"),
+        ("agg", "agg", "scalar"), ("palette", "palette", "palette"),
+    ],
+    "calendar_heatmap": [
+        ("date_col", "date_col", "scalar"), ("value_col", "value_col", "scalar"),
+        ("agg", "agg", "scalar"), ("palette", "palette", "palette"),
+    ],
+    "waterfall": [("x", "x_cols", "scalar"), ("y", "y_cols", "scalar"),
+                  ("agg", "agg", "scalar"), ("palette", "palette", "palette")],
+    "funnel": [("x", "x_cols", "scalar"), ("y", "y_cols", "scalar"),
+               ("agg", "agg", "scalar"), ("palette", "palette", "palette")],
+    "globe_extruded_map": [
+        ("location_col", "location_col", "scalar"), ("value_col", "value_col", "scalar"),
+        ("map_style", "map_style", "scalar"), ("palette", "palette", "palette"),
     ],
 }
 
@@ -354,6 +384,32 @@ def build_analysis_config(aid: str, df: pd.DataFrame,
                       y_cols=None if y in (NONE, None, "") else [y],
                       agg=agg, sort_by=sort_by, top_n=top_n)
 
+    elif aid in {"nightingale_rose", "waterfall", "funnel"}:
+        x = _single_choice_value(g("x", cat[0] if cat else NONE), cat[0] if cat else NONE)
+        y = _single_choice_value(g("y", num[0] if num else NONE), num[0] if num else NONE)
+        kwargs.update(x=x, y=y, agg=AGG_FUNCS.get(g("agg", "Sum"), "sum"),
+                      sort=g("sort", "Value ↓"),
+                      sort_by=_sort_map.get(g("sort", "Value ↓"), "value_desc"),
+                      top_n=int(g("top_n", 0) or 0) or None)
+    elif aid == "sankey":
+        kwargs.update(source_col=g("source_col", cat[0] if cat else None),
+                      target_col=g("target_col", cat[1] if len(cat) > 1 else None),
+                      value_col=_single_choice_value(g("value_col", NONE), NONE),
+                      agg=AGG_FUNCS.get(g("agg", "Sum"), "sum"))
+    elif aid == "sunburst":
+        path_cols = g("path_cols", cat[:3]) or cat[:3]
+        kwargs.update(path_cols=list(path_cols) if not isinstance(path_cols, str) else [path_cols],
+                      value_col=_single_choice_value(g("value_col", NONE), NONE),
+                      agg=AGG_FUNCS.get(g("agg", "Sum"), "sum"))
+    elif aid == "calendar_heatmap":
+        kwargs.update(date_col=g("date_col", dt[0] if dt else None),
+                      value_col=_single_choice_value(g("value_col", NONE), NONE),
+                      agg=AGG_FUNCS.get(g("agg", "Sum"), "sum"))
+    elif aid == "globe_extruded_map":
+        kwargs.update(location_col=g("location_col", cat[0] if cat else None),
+                      value_col=_single_choice_value(g("value_col", NONE), NONE),
+                      map_style=g("map_style", "Local boundaries (Light)"))
+
     elif aid == "scatter_plot":
         def _sp_resolve(key):
             v = g(key, NONE)
@@ -364,9 +420,8 @@ def build_analysis_config(aid: str, df: pd.DataFrame,
             color_col=_sp_resolve("color_col"),
             size_col=_sp_resolve("size_col"),
             trendline=g("trendline", "None"),
-            # Render mode is a Plotly EXPRESS choice fixed at BUILD time, so it
-            # is read here from the widget values rather than applied later by
-            # apply_display_options like every other Layout option. It is
+            # Render mode is a builder-time choice, so it is read here from
+            # widget values rather than applied later as a display option. It is
             # deliberately NOT in WIDGET_SPEC: that schema drives the generic
             # fallback panel, and this control lives on the scatter builder's
             # own Layout tab, where it would otherwise be rendered twice.
@@ -449,19 +504,24 @@ def build_analysis_config(aid: str, df: pd.DataFrame,
             _borders = bool(g("show_borders",
                               g("choropleth_show_borders", True)))
             kwargs.update(
+                map_mode=_mp_mode,
                 geo_col=_geo,
+                location_col=_geo,
                 value_col=_mp_resolve("value_col"),
                 color_col=_mp_resolve("color_col"),
                 agg_func=AGG_FUNCS.get(g("agg_func", "Sum"), "sum"),
                 invert_colorscale=bool(g("invert_colorscale", False)),
+                map_style=g("map_style", "Local boundaries (Light)"),
                 choropleth_colorscale=g("choropleth_colorscale", "Blues"),
                 choropleth_projection=g("choropleth_projection", "natural earth"),
                 choropleth_scope=g("choropleth_scope", "world"),
                 choropleth_show_borders=_borders,
+                show_borders=_borders,
             )
             _apply_hover_extras(kwargs)
         else:
             kwargs.update(
+                map_mode=_mp_mode,
                 lat_col=_mp_resolve("lat_col"),
                 lon_col=_mp_resolve("lon_col"),
                 location_col=_mp_resolve("location_col"),
@@ -470,7 +530,7 @@ def build_analysis_config(aid: str, df: pd.DataFrame,
                 color_col=_mp_resolve("color_col"),
                 agg_func=AGG_FUNCS.get(g("agg_func", "Avg"), "mean"),
                 invert_colorscale=bool(g("invert_colorscale", False)),
-                map_style=g("map_style", "OpenStreetMap (Light)"),
+                map_style=g("map_style", "Local boundaries (Light)"),
                 marker_opacity=float(g("marker_opacity", 0.82)),
                 # Density by default: sampling must be an explicit choice,
                 # never a silent cap that hides locations from the analysis.
@@ -517,7 +577,7 @@ def _single_choice_value(value, default=None):
 
 def run_analysis(aid: str, df: pd.DataFrame, roles: Optional[dict] = None,
                  **kwargs) -> list[tuple[str, str, Any]]:
-    """Run an analysis and return a list of ``(uid, title, fig)`` tuples.
+    """Run an analysis and return ``(uid, title, chart_model)`` tuples.
 
     This is the headless equivalent of the ``_run()`` function in
     ``modules/analysis/__init__.py``, but without any Streamlit dependency.
@@ -533,57 +593,79 @@ def run_analysis(aid: str, df: pd.DataFrame, roles: Optional[dict] = None,
         into every runner so a chart's default column list is the same pool
         the form offered the user, instead of each runner re-deriving it from
         raw dtypes (which is how a user who reclassified a numeric column as
-        a dimension still saw it as a metric in some chart types). Runners
-        that do not accept ``roles`` are called without it.
+        a dimension still saw it as a metric in some chart types).
     **kwargs
         Runner-specific keyword arguments (see ``build_analysis_config``).
 
     Returns
     -------
-    list of (uid, title, fig)
-        Each tuple contains a unique ID, a display title, and a Plotly figure.
+    list of (uid, title, chart)
+        Each tuple contains a stable chart ID, display title, and a semantic
+        ChartModel rendered by the bundled ECharts adapter.
     """
-    fn = _RUNNERS.get(aid)
-    if not fn:
-        return []
-
     try:
-        if roles is not None and _accepts_roles(fn):
-            kwargs = dict(kwargs)
-            kwargs["roles"] = roles
+        from services.polars_engine import PolarsDataset
+        import services.polars_chart_service as builders
 
-        raw = fn(df, **kwargs)
-
+        dataset = (df if isinstance(df, PolarsDataset) else
+                   PolarsDataset.from_pandas(df, source=f"analysis-{aid}"))
+        config = dict(kwargs)
+        layout = dict(config.pop("layout", {}) or {})
+        typography = dict(config.pop("typography", {}) or {})
+        try:
+            from font_bundle import resolve
+            for key in ("family", "header_family"):
+                if typography.get(key):
+                    typography[key] = resolve(typography[key])
+        except Exception:
+            pass
+        if aid == "descriptive":
+            models = [builders.build_descriptive_table_chart(
+                dataset, roles=roles, layout=layout, typography=typography)]
+        elif aid == "data_quality":
+            models = builders.build_data_quality_charts(dataset)
+        elif aid == "outlier":
+            columns = config.get("columns") or config.get("column") or []
+            if isinstance(columns, str):
+                columns = [columns]
+            models = builders.build_outlier_charts(
+                dataset, columns, multiplier=float(config.get("multiplier", 1.5)),
+                typography=typography)
+        elif aid == "map_plot":
+            model = builders.build_map_plot_chart(
+                dataset, config, layout=layout, typography=typography)
+            models = [model] if model else []
+        else:
+            builder_name = _NATIVE_BUILDERS.get(aid)
+            if not builder_name:
+                return []
+            if aid == "pie_chart":
+                if "x" not in config:
+                    raw_x = config.get("x_cols") or []
+                    config["x"] = raw_x[0] if isinstance(raw_x, list) and raw_x else raw_x
+                if "y" not in config:
+                    raw_y = config.get("y_cols") or []
+                    config["y"] = raw_y[0] if isinstance(raw_y, list) and raw_y else raw_y
+                if "sort" not in config and "sort_by" in config:
+                    config["sort"] = config["sort_by"]
+            if aid in {"sankey", "sunburst", "calendar_heatmap", "waterfall", "funnel", "globe_extruded_map"}:
+                config["chart_type"] = aid
+            builder = getattr(builders, builder_name)
+            built = builder(dataset, config, roles=roles, layout=layout,
+                            typography=typography)
+            models = built if isinstance(built, list) else [built]
         results = []
-        for title, fig in raw:
-            uid = str(uuid.uuid4())[:8]
-            results.append((uid, title, fig))
-
+        for model in models:
+            if not model:
+                continue
+            uid = str(model.get("uid") or uuid.uuid4())
+            model["uid"] = uid
+            results.append((uid, str(model.get("title") or aid), model))
         return results
-
     except Exception as e:
-        # Return empty list with error info — caller decides how to surface it
         import logging
-        logging.getLogger(__name__).error("Analysis error (%s): %s", aid, e)
+        logging.getLogger(__name__).exception("Native analysis error (%s): %s", aid, e)
         return []
-
-
-def _accepts_roles(fn) -> bool:
-    """True when *fn* can take a ``roles`` keyword.
-
-    Every runner now declares ``roles`` explicitly, but the two paths that do
-    not take normal runner kwargs (``descriptive``, ``data_quality``) and any
-    future helper must keep working, so the argument is only passed when the
-    signature actually has it rather than relying on a blanket ``**kwargs``.
-    """
-    try:
-        params = inspect.signature(fn).parameters
-    except (TypeError, ValueError):
-        return False
-    if "roles" in params:
-        return True
-    return any(p.kind is inspect.Parameter.VAR_KEYWORD
-               for p in params.values())
 
 
 def run_analysis_with_config(aid: str, df: pd.DataFrame,

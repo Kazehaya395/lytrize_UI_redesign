@@ -8,7 +8,9 @@ A slicer is a small, self-describing object::
 
 Scope
 -----
-``report``   every chart that plots the slicer's column is filtered
+``report``   UNIVERSAL -- once any report-scoped slicer is active, every chart
+             is re-run against the filtered rows (Power BI's model-filter
+             behaviour), even charts that never plot the slicer's column.
 ``chart``    only ``target`` (one chart's uid) is filtered
 
 That single field is the whole of the feature request's points 1 and 3 --
@@ -17,9 +19,12 @@ code paths.
 
 Propagation
 -----------
-:func:`affected_charts` is the piece that keeps a slicer click cheap. A chart
-only needs re-running when it plots a column the slicer filters on, so the
-answer is an intersection against ``chartspec`` -- never "re-run everything".
+:func:`affected_charts` answers WHICH charts to re-run. A report-scoped slicer
+is universal, so it returns every chart; a chart-scoped slicer returns only
+its target. Because report slicers filter the whole row set, each chart is
+rebuilt against only the slicers that actually constrain it --
+:func:`slicers_for_chart` / :func:`filter_frames_by_chart` -- so a
+chart-scoped slicer never leaks its filter into a chart it does not target.
 
 Nothing here imports Qt or Plotly, so it is testable without a display.
 """
@@ -32,7 +37,6 @@ from typing import Any, Optional
 
 import pandas as pd
 
-from modules.chartspec import chart_spec, spec_filter_columns
 from services.filter_service import apply_specs, describe_spec
 
 log = logging.getLogger(__name__)
@@ -126,8 +130,6 @@ def available_widgets(df, column: str, roles: Optional[dict] = None) -> list:
     built on ``select_dtypes("object")`` would offer no widget kinds at all
     for exactly the columns users most want to filter on.
     """
-    from services.filter_service import numeric_bounds
-
     if df is None or column not in list(df.columns):
         return []
     try:
@@ -146,7 +148,14 @@ def available_widgets(df, column: str, roles: Optional[dict] = None) -> list:
     # like any other dimension) but it is also ranged, so it gets the measure
     # widgets AND the slider. Decided on the dtype rather than on pool
     # membership, because "is this a dimension?" is the wrong question here.
-    is_datetime = bool(pd.api.types.is_datetime64_any_dtype(df[column]))
+    #
+    # ``_series_is_datetime_text`` extends that to a date stored as TEXT (a
+    # CSV's "2019-04-22 16:02:01" before the Dtype Transformer runs): it is a
+    # dimension by dtype but has a real temporal range, so it must also offer
+    # the slider -- the "slicer missing slider for continuous & date" report.
+    from services.filter_service import numeric_bounds, _series_is_datetime_text
+    is_datetime = (bool(pd.api.types.is_datetime64_any_dtype(df[column]))
+                   or _series_is_datetime_text(df[column]))
     is_measure = str(column) in measures or is_datetime
 
     kinds = list(_WIDGETS_FOR_MEASURE if is_measure
@@ -264,47 +273,83 @@ def affected_charts(recipes: dict, slicers: Optional[list],
                     report_only: bool = False) -> list:
     """Chart uids a set of slicers requires to be re-run.
 
-    *recipes* maps ``{uid: recipe}``. A chart is affected when it plots a
-    column one of the slicers filters on -- the intersection that keeps a
-    click from re-executing all thirteen analysis types.
+    *recipes* maps ``{uid: recipe}``. Scope decides reach, and the two are
+    mutually exclusive:
 
-    ``report_only`` restricts the answer to report-scoped slicers, which the
-    dashboard's left-panel controls use to decide what they changed.
+    * A ``report``-scoped slicer is UNIVERSAL -- once one is active, every
+      chart is re-run against the filtered rows, even charts that never plot
+      the slicer's column. This is Power BI's model-filter behaviour: a
+      ``store_location`` selection must also narrow a chart of Mean qty by
+      product_category, because the rows behind it changed.
+    * A ``chart``-scoped slicer reaches only its ``target``.
+
+    ``report_only`` restricts the answer to report-scoped slicers; the
+    dashboard's left-panel controls use it to decide what *they* changed.
     """
+    recipes = recipes or {}
     slicers = active_slicers(slicers)
     if not slicers:
         return []
 
-    targets, columns = set(), set()
+    universal = False
+    targets: set = set()
     for slicer in slicers:
         scope = str(slicer.get("scope") or "report").lower()
         if report_only and scope != "report":
             continue
-        # Scope decides WHICH test applies -- and the two are mutually
-        # exclusive here on purpose. Adding the column for a chart-scoped
-        # slicer as well let the column test below match every chart plotting
-        # it, so a "one chart" slicer quietly filtered the whole board. The
-        # target IS the whole of a chart-scoped slicer's reach.
-        if scope == "chart":
-            if slicer.get("target"):
-                targets.add(str(slicer["target"]))
-            # No target means a malformed definition; adding nothing is the
-            # right answer, because "some chart, unspecified" is not a filter
-            # anyone can reason about.
+        if scope == "report":
+            universal = True
+            # No column test any more: a report slicer constrains the whole
+            # row set, so it reaches every chart regardless of what it plots.
             continue
-        column = slicer.get("column")
-        if column:
-            columns.add(str(column))
+        # chart scope: the target IS the whole of its reach. A malformed
+        # definition (no target) adds nothing -- "some chart, unspecified" is
+        # not a filter anyone can reason about.
+        if slicer.get("target"):
+            targets.add(str(slicer["target"]))
 
     out = []
-    for uid, recipe in (recipes or {}).items():
+    for uid, recipe in recipes.items():
         if not isinstance(recipe, dict):
             continue
-        # A chart-scoped slicer names its chart outright, so it wins over the
-        # column test; otherwise a report slicer reaches every chart that
-        # plots its column.
-        if uid in targets or (columns & spec_filter_columns(chart_spec(recipe))):
+        if universal or uid in targets:
             out.append(uid)
+    return out
+
+
+def slicers_for_chart(slicers: Optional[list], uid: str) -> list:
+    """The active slicers that constrain one chart.
+
+    Report-scope slicers apply to every chart; a chart-scope slicer applies
+    only to the chart named by its ``target``. This is what keeps a
+    chart-scoped slicer from leaking its filter into a chart it does not
+    target -- now that report slicers re-run the whole board, applying every
+    active spec to one shared frame would wrongly constrain untargeted charts.
+    """
+    out = []
+    for s in active_slicers(slicers):
+        scope = str(s.get("scope") or "report").lower()
+        if scope == "report" or str(s.get("target") or "") == str(uid):
+            out.append(s)
+    return out
+
+
+def filter_frames_by_chart(df, slicers: Optional[list], uids) -> dict:
+    """``{uid: filtered_df}`` computing each distinct filter set only once.
+
+    Charts whose applicable slicer set is identical share a single filtered
+    frame, so the common board (report slicers only, no chart slicers) filters
+    the data one time no matter how many charts it has -- the property that
+    keeps universal report slicers from multiplying the filtering cost.
+    """
+    cache: dict = {}
+    out: dict = {}
+    for uid in uids:
+        applicable = slicers_for_chart(slicers, uid)
+        key = tuple(sorted(str(s.get("uid") or "") for s in applicable))
+        if key not in cache:
+            cache[key] = filter_frame(df, applicable)
+        out[uid] = cache[key]
     return out
 
 

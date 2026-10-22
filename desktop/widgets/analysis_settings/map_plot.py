@@ -1,39 +1,8 @@
-"""Map Plot settings -- the Correlation (colour-scale) page plus the map controls.
+"""Controls for offline Natural Earth choropleths and coordinate maps.
 
-Feature reference (old codebase, ``chart_settings.py`` ``CHART_TYPE_SETTINGS``
-and ``_CONTROL_META``)::
-
-    "map_plot": has_axes=False, has_legend=False,
-    controls = [title, show_colorbar, size_by_value, colorbar_title,
-        colorbar_tick_size, colorbar_tick_color, colorbar_title_size,
-        colorbar_title_color, heatmap_colorscale, marker_opacity, marker_size];
-    typography = [family, font_style, header, axis_tick].
-
-``CONTROLS_ADVANCED`` put [marker_opacity, marker_size, colorbar_tick_size,
-colorbar_tick_color, colorbar_title_size, colorbar_title_color] behind the old
-popover; the colour bar / size-by-value toggles and the colour scale were in the
-main view.
-
-Why it subclasses ``CorrelationSettings``
------------------------------------------
-A map's colour key IS a colour bar, so the six ``colorbar_*`` controls and the
-colour scale are the same controls the correlation page already owns, and the
-colour-bar BORDER toggle (the "Show border" the user asked for) comes with them.
-Inheriting that page gives the right rows without re-listing nine near-identical
-ones, and the annotations are inherited too -- ``_apply_heatmap_options`` guards
-on the trace type, so they reach a ``scattermap``/``choropleth`` colour bar and
-leave the markers alone.
-
-What is masked
---------------
-The rows a map has no use for. A map has no Cartesian axes, so there are no axis
-labels; a geo trace has no in-cell text, so the heatmap annotation rows go; and
-"Show value labels" would write a ``textposition`` that a geo trace does not
-have.
-
-The Generate tab is written out rather than inherited, because a map is
-generated from a mode plus geo columns, which the correlation page (a numeric
-column list) cannot express.
+The Layout and Typography sections reuse the correlation panel's generic
+color-scale/colorbar controls. Generation is custom: it selects a map mode,
+coordinates or location dimension, optional values, and local boundary style.
 """
 from __future__ import annotations
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QComboBox,
@@ -48,70 +17,36 @@ from .categorical import AGGS
 # branch compares against.
 MAP_MODES = ["Scatter (Lat/Lon)", "Choropleth (Location Names)"]
 
-# Which Generate sections each mode's runner call actually receives.
-#
-# This split is read off ``services.analysis_service``'s map branch, which is
-# what really decides -- the runner never sees a field the service did not
-# pass to it:
-#
-# * the choropleth branch passes geo/value/color/agg/projection/scope/borders
-#   and NOT lat/lon/style/opacity/render, so those five are scatter-only;
-# * the scatter branch passes lat/lon/location/value/color/agg/style/opacity/
-#   render/borders and NOT projection/scope, so those two are choropleth-only.
-#
-# Location, Colour, Value, Aggregation and the six hover fields are passed by
-# BOTH branches (a scatter groups by location when a Location + Value are
-# chosen; the choropleth's Borders is the same checkbox), so they stay visible
-# in both modes. Hiding them would remove a capability the runner honours,
-# which is a different bug from the one being fixed: the report was that the
-# page shows fields the SELECTED mode ignores.
-SCATTER_ONLY_SECTIONS = ("Latitude", "Longitude", "Style", "Opacity", "Render")
+# Keep irrelevant controls hidden as the mode changes. Location, Value, Colour,
+# Aggregation, Borders, and tooltip fields apply to both chart modes.
+SCATTER_ONLY_SECTIONS = ("Latitude", "Longitude", "Opacity", "Render")
 CHOROPLETH_ONLY_SECTIONS = ("Projection", "Scope")
 
-# Basemaps: the two "OpenStreetMap" entries are CARTO's key-free VECTOR
-# styles from the runner's own map (modules.analysis.map_plot._MAP_STYLE_SPECS
-# -> carto-positron / carto-darkmatter) -- vector tiles are sharp at any zoom
-# and on any HiDPI screen, which is what fixed the "blurry map" report.
-# Satellite has no free key-less vector imagery, so it stays the one raster
-# basemap (Esri World Imagery) and is the softer of the three.
-# ``stamen-terrain`` and friends are dead registry names that blanked the
-# canvas; the runner normalises any legacy value onto these three.
-# Kept as a literal (not imported) so the settings panel does not drag the
-# whole backend runner into the Qt import path.
-MAP_STYLES = ["OpenStreetMap (Light)", "OpenStreetMap (Dark)", "Satellite (Earth)"]
+# These are local vector boundaries styled by ECharts. No online tiles or
+# third-party basemap services are used by the migrated map route.
+MAP_STYLES = ["Local boundaries (Light)", "Local boundaries (Dark)",
+              "Satellite imagery (online)"]
 
 # Density is the default: a map that silently drops points misstates the
 # spatial analysis, so sampling is only ever an explicit choice.
 RENDER_MODES = ["Density (all points)", "Sample 5,000"]
 
-# Choropleth-only projection / scope, from the runner
-# (modules.analysis.map_plot._PROJECTIONS / _SCOPES).  Both were in the old
-# panel's row and both are honoured by ``px.choropleth``, so they belong here;
-# a chart that is a scatter simply ignores them.  Kept as literals for the same
-# reason as MAP_STYLES: the panel must not import the backend runner.
-PROJECTIONS = ["natural earth", "mercator", "equirectangular",
-               "orthographic", "kavrayskiy7", "robinson"]
+# Choropleth-only projection / scope. ECharts implements these projections in
+# the local adapter; legacy Plotly-only projections are intentionally omitted.
+PROJECTIONS = ["natural earth", "mercator", "equirectangular"]
 
 SCOPES = ["world", "usa", "europe", "asia", "africa",
           "north america", "south america"]
 
 
 def _normalize_style_name(value) -> str:
-    """Snap any legacy/Plotly style name onto one of the three basemaps.
-
-    Mirrors ``_normalize_map_style`` in the runner so the combo, the form and
-    the figure never disagree about which basemap is selected.
-
-    Only names that really mean aerial imagery reach the Satellite basemap: it
-    is the one raster (and so the one soft) basemap of the three, and a dead
-    landscape style such as ``stamen-terrain`` must not select it.
-    """
+    """Normalize historic style names while preserving online imagery choice."""
     s = str(value or "").lower()
+    if "satellite" in s or "imagery" in s:
+        return "Satellite imagery (online)"
     if any(k in s for k in ("dark", "matter", "night", "moon")):
-        return "OpenStreetMap (Dark)"
-    if any(k in s for k in ("satellite", "earth", "imagery", "esri", "aerial")):
-        return "Satellite (Earth)"
-    return "OpenStreetMap (Light)"
+        return "Local boundaries (Dark)"
+    return "Local boundaries (Light)"
 
 
 class MapPlotSettings(CorrelationSettings):
@@ -216,7 +151,8 @@ class MapPlotSettings(CorrelationSettings):
         add('Aggregation', box)
 
         box, self._combo_style = self._combo_section(
-            'Style', 'Base map tiles (scatter mode)',
+            'Style', ('Offline boundary colors or optional Esri satellite imagery. '
+                      'Online imagery sends the visible map area to Esri; your data stays local.'),
             MAP_STYLES, MAP_STYLES[0], self._on_style)
         add('Style', box)
 
@@ -301,7 +237,7 @@ class MapPlotSettings(CorrelationSettings):
             tl.addWidget(cell)
         add('Options', section_box(
             'Options', toggles,
-            'Invert flips the colour scale; Borders adds a boundaries overlay'))
+            'Invert flips the colour scale; Borders toggles local boundary lines'))
 
         rl.addWidget(flow)
         rl.addStretch()
@@ -418,11 +354,9 @@ class MapPlotSettings(CorrelationSettings):
     def prefill(self, values):
         """Restore a saved map config, snapping names to options that exist.
 
-        A saved style from an older build may name a Plotly style the runner no
-        longer offers (``stamen-terrain``, ``carto-positron``, ...).  Those are
-        normalised onto one of the three current basemaps here as well as in
-        the runner, so the panel shows what the chart will actually draw
-        instead of leaving a stale value in the form that no combo displays.
+        A saved style from an older build may name an online tile style.
+        Normalize it to a local light/dark boundary theme so restoring an old
+        config cannot re-enable remote tile requests.
         """
         v = dict(values or {})
         if 'map_style' in v:

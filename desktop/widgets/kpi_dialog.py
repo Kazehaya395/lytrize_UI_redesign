@@ -24,7 +24,7 @@ import logging
 from typing import Optional
 
 import pandas as pd
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QObject, QRunnable, QThreadPool, QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QLabel,
     QLineEdit, QVBoxLayout, QWidget,
@@ -33,6 +33,31 @@ from PySide6.QtWidgets import (
 from services import kpi_service as kpi_svc
 
 log = logging.getLogger(__name__)
+
+
+class _KpiPreviewSignals(QObject):
+    ready = Signal(int, object)
+
+
+class _KpiPreviewTask(QRunnable):
+    """Calculate one debounced KPI preview without blocking the dialog."""
+
+    def __init__(self, revision: int, data, kpi_type: str, args: dict) -> None:
+        super().__init__()
+        self.revision = revision
+        self.data = data
+        self.kpi_type = kpi_type
+        self.args = dict(args)
+        self.signals = _KpiPreviewSignals()
+
+    def run(self) -> None:
+        try:
+            value = kpi_svc.calc_kpi(self.data, self.kpi_type, **self.args)
+        except Exception:
+            log.debug("KPI preview worker failed", exc_info=True)
+            value = {"icon": "", "label": "", "value": "Err: calculation failed",
+                     "prefix": "", "suffix": ""}
+        self.signals.ready.emit(self.revision, value)
 
 
 def _field_row(label: str, widget: QWidget, tip: str = "") -> QWidget:
@@ -66,13 +91,24 @@ class KpiDialog(QDialog):
     """
 
     def __init__(self, df: pd.DataFrame, parent=None,
-                 existing: Optional[dict] = None) -> None:
+                 existing: Optional[dict] = None,
+                 calculation_data=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Edit KPI" if existing else "Add KPI")
         self.setMinimumWidth(520)
         self._df = df
+        self._calculation_data = (calculation_data
+                                  if calculation_data is not None else df)
         self._existing = dict(existing or {})
         self._recipe = dict(self._existing.get("_recipe") or {})
+        self._preview_revision = 0
+        self._preview_active = False
+        self._pending_preview = None
+        self._last_preview = None
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(120)
+        self._preview_timer.timeout.connect(self._start_preview)
 
         self._num = kpi_svc.numeric_columns(df)
         self._cat = kpi_svc.category_columns(df)
@@ -132,6 +168,8 @@ class KpiDialog(QDialog):
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         ok = buttons.button(QDialogButtonBox.Ok)
+        self._ok_button = ok
+        ok.setEnabled(False)
         ok.setText("Update KPI" if existing else "Add KPI")
         ok.setProperty("kind", "primary")
         buttons.accepted.connect(self.accept)
@@ -320,28 +358,51 @@ class KpiDialog(QDialog):
         }
 
     def _refresh(self) -> None:
-        """Recompute and show the preview. Never raises."""
-        try:
-            kpi = kpi_svc.calc_kpi(self._df, self.cb_type.currentText(),
-                                   **self._current_args())
-        except Exception:
-            log.debug("KPI preview failed", exc_info=True)
-            kpi = {"icon": "", "label": "", "value": "--", "prefix": "",
-                   "suffix": ""}
-        self.lbl_preview_icon.setText(str(kpi.get("icon", "")))
-        self.lbl_preview_value.setText("%s%s%s" % (
-            kpi.get("prefix", ""), kpi.get("value", "--"),
-            kpi.get("suffix", "")))
-        self.lbl_preview_label.setText(str(kpi.get("label", "")))
-        # An "Err:" value means the inputs cannot work as combined. Saying so in
-        # the preview is more useful than a card that silently reads "--".
-        bad = str(kpi.get("value", "")).startswith("Err:")
-        self.lbl_preview_value.setStyleSheet(
-            "font-size: 26px; font-weight: 700; color: %s;"
-            % ("#ef4444" if bad else ""))
+        """Queue a debounced preview and leave the Qt event loop free."""
+        self._preview_revision += 1
+        self._pending_preview = (
+            self._preview_revision, self.cb_type.currentText(),
+            self._current_args())
+        self._last_preview = None
+        self._ok_button.setEnabled(False)
+        self.lbl_preview_value.setText("Calculating…")
+        self._preview_timer.start()
+
+    def _start_preview(self) -> None:
+        if self._preview_active or self._pending_preview is None:
+            return
+        revision, kpi_type, args = self._pending_preview
+        self._pending_preview = None
+        self._preview_active = True
+        task = _KpiPreviewTask(revision, self._calculation_data, kpi_type, args)
+        task.signals.ready.connect(self._on_preview_ready)
+        # Keep a reference until QRunnable finishes; QThreadPool owns execution
+        # and the signal's QObject safely disconnects if the dialog is closed.
+        self._preview_task = task
+        QThreadPool.globalInstance().start(task)
+
+    def _on_preview_ready(self, revision: int, kpi: dict) -> None:
+        self._preview_active = False
+        self._preview_task = None
+        if revision == self._preview_revision:
+            self._last_preview = (revision, kpi)
+            self.lbl_preview_icon.setText(str(kpi.get("icon", "")))
+            self.lbl_preview_value.setText("%s%s%s" % (
+                kpi.get("prefix", ""), kpi.get("value", "--"),
+                kpi.get("suffix", "")))
+            self.lbl_preview_label.setText(str(kpi.get("label", "")))
+            bad = str(kpi.get("value", "")).startswith("Err:")
+            self.lbl_preview_value.setStyleSheet(
+                "font-size: 26px; font-weight: 700; color: %s;"
+                % ("#ef4444" if bad else ""))
+            self._ok_button.setEnabled(True)
+        if self._pending_preview is not None:
+            self._preview_timer.start(0)
 
     def result_kpi(self) -> dict:
         """The finished card, ready to store. Includes its ``_recipe``."""
-        return kpi_svc.calc_kpi(self._df, self.cb_type.currentText(),
-                                **self._current_args())
+        if self._last_preview and self._last_preview[0] == self._preview_revision:
+            return dict(self._last_preview[1])
+        return kpi_svc.calc_kpi(self._calculation_data,
+                                self.cb_type.currentText(), **self._current_args())
 

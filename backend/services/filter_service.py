@@ -103,6 +103,40 @@ def _to_datetime_safe(value: Any) -> Any:
         return value
 
 
+def _series_is_datetime_text(s: pd.Series) -> bool:
+    """True when *s* is a TEXT column that still parses as datetimes.
+
+    A ``trans_date_trans_time`` column imported from CSV is often ``object``
+    dtype (``"2019-04-22 16:02:01"``) rather than ``datetime64`` -- the Dtype
+    Transformer has not run yet. ``numeric_bounds`` only recognises true
+    ``datetime64``, so such a column reports no range and the Add-Slicer dialog
+    never offers the slider the user asked for (the "slicer missing slider for
+    continuous & date" report). This samples the column and tries a strict
+    datetime parse so a genuinely date-shaped text column is treated as ranged.
+
+    Deliberately conservative: a numeric-looking or arbitrary-text column must
+    NOT be classified as temporal, so a plain ``to_datetime`` (which happily
+    parses bare integers as epochs) is rejected -- the sample must contain a
+    date separator to qualify.
+    """
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return True
+    if s.empty:
+        return False
+    try:
+        sample = s.dropna().astype(str).head(200)
+        if sample.empty:
+            return False
+        # Require a date separator in most samples, so "1234" or "abc" is out.
+        sep = sample.str.contains(r"\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4}|T\d{2}:", regex=True)
+        if sep.mean() < 0.8:
+            return False
+        parsed = pd.to_datetime(sample, errors="coerce")
+        return bool(parsed.notna().mean() >= 0.8)
+    except Exception:
+        return False
+
+
 def _numeric_or_datetime_series(s: pd.Series) -> pd.Series:
     """Coerce *s* to something comparable for a range test.
 
@@ -138,6 +172,13 @@ def _mask_range(s: pd.Series, spec: dict) -> pd.Series:
     if is_dt:
         low, high = _to_datetime_safe(low), _to_datetime_safe(high)
         comparable = s
+    elif _series_is_datetime_text(s):
+        # Date-as-TEXT column: coerce both the series and the bounds to
+        # timestamps so a range slicer over it actually filters (rather than
+        # falling through to to_numeric, which would coerce every date string
+        # to NaN and keep every row).
+        comparable = pd.to_datetime(s, errors="coerce")
+        low, high = _to_datetime_safe(low), _to_datetime_safe(high)
     else:
         comparable = _numeric_or_datetime_series(s)
 
@@ -249,11 +290,33 @@ def apply_specs(df: pd.DataFrame, specs: Optional[Sequence[dict]]) -> pd.DataFra
     inclusion was about to drop, and "include NA, exclude Europe" quietly
     keeps Europe back.
     """
-    if df is None or df.empty:
+    if df is None:
+        return df
+    # Keep the product-level slicer algebra shared while allowing the staged
+    # Polars path to remain lazy. Import locally to avoid making the pandas
+    # application require Polars before its dependency migration is complete.
+    try:
+        from services.polars_engine import PolarsDataset
+    except Exception:  # pragma: no cover - optional migration dependency
+        PolarsDataset = ()
+    if isinstance(df, PolarsDataset):
+        return df.apply_filter_specs(specs)
+    if df.empty:
         return df
     specs = [s for s in (specs or []) if s]
     if not specs:
         return df
+
+    # Memoise the filtered frame per (frame, spec-signature). The universal
+    # whole-report slicer re-aggregates EVERY chart, and a geometry drag or a
+    # preview+export pair re-runs the SAME filter set again -- recomputing the
+    # boolean masks, the ``df[mask]`` copy and the category prune each time is
+    # pure repetition. Bounded + frame-held like the distinct cache below.
+    sig = _specs_signature(specs)
+    if sig is not None:
+        cached = _mask_cache_get(df, sig)
+        if cached is not None:
+            return cached
 
     inclusions = [s for s in specs
                   if str(s.get("kind") or "").lower() != "not_in"]
@@ -271,7 +334,10 @@ def apply_specs(df: pd.DataFrame, specs: Optional[Sequence[dict]]) -> pd.DataFra
         mask &= apply_spec(df, spec)
 
     out = df[mask]
-    return _drop_unused_categories(out, df)
+    out = _drop_unused_categories(out, df)
+    if sig is not None:
+        _mask_cache_put(df, sig, out)
+    return out
 
 
 def _drop_unused_categories(out: pd.DataFrame, full: pd.DataFrame) -> pd.DataFrame:
@@ -454,6 +520,85 @@ def _distinct_cache_put(df, column, limit, values) -> None:
     _DISTINCT_CACHE[key] = (df, list(values))
 
 
+# -- Filtered-frame memo -----------------------------------------------------
+# The universal whole-report slicer re-aggregates every chart, and the SAME
+# filter set is recomputed on every report rebuild (canvas preview, geometry
+# drag, PNG export, HTML export). Each recompute redoes the boolean masks, the
+# ``df[mask]`` materialisation and the category prune. This memo returns the
+# already-filtered frame for an identical (frame, spec-signature) so a board
+# with many charts filters its data ONCE, not once per render.
+#
+# The returned frame is shared and MUST be treated read-only by callers (the
+# chart runners only group/aggregate). The frame is held STRONGLY so ``id()``
+# cannot be recycled onto a different DataFrame while an entry is live.
+_MASK_CACHE: Dict[tuple, tuple] = {}       # key -> (df, filtered_df)
+
+
+def clear_mask_cache() -> None:
+    """Drop every memoised filtered frame (called when the DataFrame changes)."""
+    _MASK_CACHE.clear()
+
+
+def _specs_signature(specs) -> Optional[str]:
+    """A stable, order-independent signature for a list of filter specs.
+
+    ``in``/``not_in`` value lists are sorted so the same selection asked in a
+    different order hits the same entry; every other field is taken verbatim.
+    Returns None when the specs cannot be serialised, which disables the cache
+    for that call rather than risking a wrong hit.
+    """
+    import json
+
+    def _norm(s: dict) -> dict:
+        kind = str(s.get("kind") or "").lower()
+        out = {"kind": kind, "column": s.get("column")}
+        if kind in ("in", "not_in"):
+            out["values"] = sorted(str(v) for v in (s.get("values") or []))
+        elif kind == "range":
+            out["low"] = s.get("low")
+            out["high"] = s.get("high")
+        elif kind == "search":
+            out["value"] = s.get("value")
+        elif kind == "top_n":
+            out["n"] = s.get("n")
+        return out
+
+    try:
+        return json.dumps([_norm(s) for s in specs],
+                          sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return None
+
+
+def _mask_cache_key(df: pd.DataFrame, sig: str):
+    try:
+        shape = df.shape
+    except Exception:
+        return None
+    if shape[1] > 10_000:
+        return None
+    return (id(df), shape, sig)
+
+
+def _mask_cache_get(df, sig):
+    key = _mask_cache_key(df, sig)
+    if key is None:
+        return None
+    hit = _MASK_CACHE.get(key)
+    if hit is not None and hit[0] is df:
+        return hit[1]
+    return None
+
+
+def _mask_cache_put(df, sig, out) -> None:
+    key = _mask_cache_key(df, sig)
+    if key is None:
+        return
+    if len(_MASK_CACHE) >= 8:               # bounded; the live frame dominates
+        _MASK_CACHE.clear()
+    _MASK_CACHE[key] = (df, out)
+
+
 def filterable_columns(df: pd.DataFrame, roles: Optional[dict] = None) -> list:
     """Columns a slicer may be built on, dimensions first.
 
@@ -502,6 +647,18 @@ def numeric_bounds(df: pd.DataFrame, column: str) -> dict:
             return {"min": clean.min().isoformat(), "max": clean.max().isoformat(),
                     "kind": "datetime"}
         if not pd.api.types.is_numeric_dtype(s.dtype):
+            # A date-as-TEXT column (e.g. a CSV's "2019-04-22 16:02:01") is not
+            # numeric, but it still has a real temporal range a slider can
+            # travel. Without this the Add-Slicer dialog offered no slider for
+            # exactly the columns the user most wanted one on. Parse it and
+            # report ISO bounds with kind=datetime so the range filter and the
+            # slider bounds agree downstream.
+            if _series_is_datetime_text(s):
+                parsed = pd.to_datetime(s, errors="coerce").dropna()
+                if not parsed.empty:
+                    return {"min": parsed.min().isoformat(),
+                            "max": parsed.max().isoformat(),
+                            "kind": "datetime"}
             return {}
         clean = pd.to_numeric(s, errors="coerce").dropna()
         if clean.empty:

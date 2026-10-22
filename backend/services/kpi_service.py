@@ -224,6 +224,21 @@ def calc_kpi(df: pd.DataFrame, kpi_type: str, col: Optional[str] = None,
     A failure never raises: the card shows the error text. A dashboard with one
     bad KPI should still render the other nine.
     """
+    # Staged engine dispatch: the established pandas path remains the default,
+    # while callers holding the new lazy Polars dataset use the parallel
+    # implementation and receive this same result/recipe shape.
+    try:
+        from services.polars_engine import PolarsDataset, calc_polars_kpi
+        if isinstance(df, PolarsDataset):
+            return calc_polars_kpi(
+                df, kpi_type, col=col, group_col=group_col,
+                metric_col=metric_col, filter_col=filter_col,
+                filter_val=filter_val, label=label, formula=formula,
+                baseline_period=baseline_period,
+            )
+    except ImportError:
+        pass
+
     spec = kpi_spec(kpi_type)
     key = spec["key"]
     out_label = label or spec["label"]

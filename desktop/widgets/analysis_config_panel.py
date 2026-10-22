@@ -411,16 +411,34 @@ class AnalysisConfigPanel(QFrame):
         gen_lay = self.body_generate.layout()
 
         if builder is not None:
+            # Build ALL THREE tabs BEFORE attaching any of them.
+            #
+            # The three pages are separate widgets, so attaching them one by
+            # time made a failure in the last tab leave the first two on
+            # screen: the user saw real Generate fields AND the "options go
+            # here" placeholders at the same time, and -- worse -- the
+            # half-built builder was still assigned, so collect_values() read
+            # a form whose Layout/Typography tabs had been thrown away.
+            #
+            # Building first and attaching second makes the swap atomic: on
+            # failure NOTHING is attached, the builder is dropped, and the
+            # pages show the placeholders consistently instead of a mix.
             try:
                 builder.values_changed.connect(self._on_builder_values)
                 builder.generate_requested.connect(self.generate_requested.emit)
-                gen_lay.addWidget(builder.build_generate())
-                self.body_layout.layout().addWidget(builder.build_layout())
-                self.body_typo.layout().addWidget(builder.build_typography())
-                self._builder = builder
+                gen_widget = builder.build_generate()
+                layout_widget = builder.build_layout()
+                typo_widget = builder.build_typography()
             except Exception:
                 log.exception("settings builder build failed for %s", self._active_aid)
                 builder = None
+                gen_widget = layout_widget = typo_widget = None
+
+            if builder is not None:
+                gen_lay.addWidget(gen_widget)
+                self.body_layout.layout().addWidget(layout_widget)
+                self.body_typo.layout().addWidget(typo_widget)
+                self._builder = builder
 
         if self._builder is None:
             # Placeholder pages for types whose builder hasn't been ported

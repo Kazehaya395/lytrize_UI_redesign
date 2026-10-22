@@ -20,6 +20,7 @@ class ImportWorker(QThread):
     """Load a CSV/XLSX file in a background thread."""
 
     finished_ok = Signal(object)      # emits pd.DataFrame
+    polars_ready = Signal(object)     # emits optional PolarsDataset snapshot
     failed = Signal(str)              # emits error message
 
     def __init__(self, file_path: str, parent=None) -> None:
@@ -34,16 +35,34 @@ class ImportWorker(QThread):
             path = Path(self._file_path)
             if path.suffix.lower() == ".csv":
                 df = read_csv_fast(path)
+                # Build the native query snapshot from the original CSV. This
+                # avoids making the first Polars chart slice depend on a
+                # pandas conversion. The pandas frame remains temporarily for
+                # legacy table/cleaning pages during the staged migration.
+                try:
+                    from services.polars_engine import open_csv
+                    polars_data = open_csv(path)
+                except Exception as exc:
+                    log.info("Polars CSV path unavailable; using compatibility boundary: %s", exc)
+                    polars_data = None
             else:
                 df = pd.read_excel(path)
+                try:
+                    from services.polars_engine import PolarsDataset
+                    polars_data = PolarsDataset.from_pandas(
+                        df, source=str(path))
+                except Exception as exc:
+                    log.info("Polars Excel compatibility conversion unavailable: %s", exc)
+                    polars_data = None
             self.finished_ok.emit(df)
+            self.polars_ready.emit(polars_data)
         except Exception as exc:
             log.error("ImportWorker failed: %s", exc)
             self.failed.emit(str(exc))
 
 
 class ChartGenerationWorker(QThread):
-    """Generate charts in a background thread.
+    """Generate charts or native ChartModels in a background thread.
 
     ``layout_opts`` / ``typography_opts`` (from the Layout Options and
     Typography Options settings tabs) are applied to every produced
@@ -51,30 +70,244 @@ class ChartGenerationWorker(QThread):
     the user's display settings -- see ``chart_display.apply_display_options``.
     """
 
-    finished_ok = Signal(object)      # emits list of (uid, title, fig)
+    finished_ok = Signal(object)      # list of (uid, title, legacy figure/model)
     failed = Signal(str)              # emits error message
 
     def __init__(self, aid: str, df: pd.DataFrame, widget_values: dict,
                  parent=None, *, layout_opts: Optional[dict] = None,
                  typography_opts: Optional[dict] = None,
-                 roles: Optional[dict] = None) -> None:
+                 roles: Optional[dict] = None, polars_dataset=None) -> None:
         super().__init__(parent)
         self._aid = aid
         self._df = df
         self._widget_values = widget_values
         self._layout_opts = dict(layout_opts) if layout_opts else None
         self._typo_opts = dict(typography_opts) if typography_opts else None
+        if self._typo_opts:
+            try:
+                from font_bundle import resolve
+                for key in ("family", "header_family"):
+                    if self._typo_opts.get(key):
+                        self._typo_opts[key] = resolve(self._typo_opts[key])
+            except Exception:
+                log.debug("font family resolution unavailable", exc_info=True)
         # Resolved column families from the page. Passing them keeps the
         # service-side defaults (e.g. "first four metrics") consistent with
         # the drop-downs the user actually saw, so the user's Column
         # Classification governs generation as well as the form.
         self._roles = roles
+        self._polars_dataset = polars_dataset
+
+    def _with_display_options(self, models):
+        """Apply the selected ECharts display contract to every built model."""
+        from services.polars_chart_service import apply_chart_model_display_options
+        result = []
+        for model in models or []:
+            if not model:
+                continue
+            result.append(apply_chart_model_display_options(
+                model, self._layout_opts or {}, self._typo_opts or {}))
+        return result
 
     def run(self) -> None:
         try:
+            if self._aid == "descriptive":
+                from services.polars_engine import PolarsDataset
+                from services.polars_chart_service import build_descriptive_table_chart
+                dataset = (self._polars_dataset or
+                           PolarsDataset.from_pandas(self._df))
+                model = build_descriptive_table_chart(
+                    dataset, roles=self._roles, layout=self._layout_opts,
+                    typography=self._typo_opts,
+                )
+                self.finished_ok.emit(
+                    [(item["uid"], item["title"], item)
+                     for item in self._with_display_options([model])])
+                return
+
+            if self._aid == "pie_chart":
+                # First native vertical slice: Polars performs the group and
+                # aggregation, ChartModel carries the result, and the Analysis
+                # page displays it with ECharts. This path does not construct
+                # a Plotly figure or pass through the legacy chart runner.
+                from services.polars_engine import PolarsDataset
+                from services.polars_chart_service import build_pie_chart
+                dataset = (self._polars_dataset or
+                           PolarsDataset.from_pandas(self._df))
+                model = build_pie_chart(
+                    dataset, self._widget_values, roles=self._roles,
+                    layout=self._layout_opts, typography=self._typo_opts,
+                )
+                self.finished_ok.emit(
+                    [(item["uid"], item["title"], item)
+                     for item in self._with_display_options([model])])
+                return
+
+            if self._aid == "categorical":
+                from services.polars_engine import PolarsDataset
+                from services.polars_chart_service import build_categorical_charts
+                dataset = (self._polars_dataset or
+                           PolarsDataset.from_pandas(self._df))
+                models = build_categorical_charts(
+                    dataset, self._widget_values, roles=self._roles,
+                    layout=self._layout_opts, typography=self._typo_opts,
+                )
+                self.finished_ok.emit([
+                    (model["uid"], model["title"], model)
+                    for model in self._with_display_options(models)
+                ])
+                return
+
+            if self._aid == "statistical":
+                from services.polars_engine import PolarsDataset
+                from services.polars_chart_service import build_statistical_charts
+                dataset = (self._polars_dataset or
+                           PolarsDataset.from_pandas(self._df))
+                models = build_statistical_charts(
+                    dataset, self._widget_values, roles=self._roles,
+                    layout=self._layout_opts, typography=self._typo_opts,
+                )
+                self.finished_ok.emit([
+                    (model["uid"], model["title"], model)
+                    for model in self._with_display_options(models)
+                ])
+                return
+
+            if self._aid == "correlation":
+                from services.polars_engine import PolarsDataset
+                from services.polars_chart_service import build_correlation_chart
+                dataset = (self._polars_dataset or
+                           PolarsDataset.from_pandas(self._df))
+                model = build_correlation_chart(
+                    dataset, self._widget_values, roles=self._roles,
+                    layout=self._layout_opts, typography=self._typo_opts,
+                )
+                self.finished_ok.emit(
+                    [(item["uid"], item["title"], item)
+                     for item in self._with_display_options([model])])
+                return
+
+            if self._aid == "matrix_heatmap":
+                from services.polars_engine import PolarsDataset
+                from services.polars_chart_service import build_matrix_heatmap_chart
+                dataset = (self._polars_dataset or
+                           PolarsDataset.from_pandas(self._df))
+                model = build_matrix_heatmap_chart(
+                    dataset, self._widget_values, roles=self._roles,
+                    layout=self._layout_opts, typography=self._typo_opts,
+                )
+                self.finished_ok.emit(
+                    [(item["uid"], item["title"], item)
+                     for item in self._with_display_options([model])])
+                return
+
+            if self._aid == "matrix_table":
+                from services.polars_engine import PolarsDataset
+                from services.polars_chart_service import build_matrix_table_chart
+                dataset = (self._polars_dataset or
+                           PolarsDataset.from_pandas(self._df))
+                model = build_matrix_table_chart(
+                    dataset, self._widget_values, roles=self._roles,
+                    layout=self._layout_opts, typography=self._typo_opts,
+                )
+                self.finished_ok.emit(
+                    [(item["uid"], item["title"], item)
+                     for item in self._with_display_options([model])])
+                return
+
+            if self._aid == "time_series":
+                from services.polars_engine import PolarsDataset
+                from services.polars_chart_service import build_time_series_chart
+                dataset = (self._polars_dataset or
+                           PolarsDataset.from_pandas(self._df))
+                model = build_time_series_chart(
+                    dataset, self._widget_values, roles=self._roles,
+                    layout=self._layout_opts, typography=self._typo_opts,
+                )
+                self.finished_ok.emit(
+                    [(item["uid"], item["title"], item)
+                     for item in self._with_display_options([model])])
+                return
+
+            if self._aid == "distribution":
+                from services.polars_engine import PolarsDataset
+                from services.polars_chart_service import build_distribution_charts
+                dataset = (self._polars_dataset or
+                           PolarsDataset.from_pandas(self._df))
+                models = build_distribution_charts(
+                    dataset, self._widget_values, roles=self._roles,
+                    layout=self._layout_opts, typography=self._typo_opts,
+                )
+                self.finished_ok.emit([
+                    (model["uid"], model["title"], model)
+                    for model in self._with_display_options(models)
+                ])
+                return
+
+            if self._aid == "scatter_plot":
+                from services.polars_engine import PolarsDataset
+                from services.polars_chart_service import build_scatter_chart
+                dataset = (self._polars_dataset or
+                           PolarsDataset.from_pandas(self._df))
+                model = build_scatter_chart(
+                    dataset, self._widget_values, roles=self._roles,
+                    layout=self._layout_opts, typography=self._typo_opts,
+                )
+                self.finished_ok.emit(
+                    [(item["uid"], item["title"], item)
+                     for item in self._with_display_options([model])])
+                return
+
+            if self._aid == "outlier":
+                from services.polars_engine import PolarsDataset
+                from services.polars_chart_service import build_outlier_charts
+                dataset = (self._polars_dataset or
+                           PolarsDataset.from_pandas(self._df))
+                columns = (self._widget_values.get("x_cols")
+                           or self._widget_values.get("columns")
+                           or (self._roles or {}).get("numeric")
+                           or dataset.roles().get("numeric", [])[:6])
+                models = build_outlier_charts(
+                    dataset, columns,
+                    multiplier=self._widget_values.get("multiplier", 1.5),
+                    typography=self._typo_opts,
+                )
+                self.finished_ok.emit([
+                    (model["uid"], model["title"], model)
+                    for model in self._with_display_options(models)
+                ])
+                return
+
+            if self._aid == "data_quality":
+                from services.polars_engine import PolarsDataset
+                from services.polars_chart_service import build_data_quality_charts
+                dataset = (self._polars_dataset or
+                           PolarsDataset.from_pandas(self._df))
+                models = build_data_quality_charts(dataset)
+                self.finished_ok.emit([
+                    (model["uid"], model["title"], model)
+                    for model in self._with_display_options(models)
+                ])
+                return
+
+            if self._aid == "map_plot":
+                from services.polars_engine import PolarsDataset
+                from services.polars_chart_service import build_map_plot_chart
+                dataset = (self._polars_dataset or
+                           PolarsDataset.from_pandas(self._df))
+                model = build_map_plot_chart(
+                    dataset, self._widget_values, layout=self._layout_opts,
+                    typography=self._typo_opts,
+                )
+                # Map Plot is an offline native route. Unsupported or empty
+                # spatial input reports no chart instead of silently calling
+                # the old network-backed Plotly basemap runner.
+                self.finished_ok.emit(
+                    [(item["uid"], item["title"], item)
+                     for item in self._with_display_options([model])])
+                return
+
             from services.analysis_service import run_analysis_with_config
-            from services.chart_service import apply_hover_format
-            from chart_display import apply_display_options
 
             results = run_analysis_with_config(self._aid, self._df,
                                                 self._widget_values,
@@ -84,10 +317,10 @@ class ChartGenerationWorker(QThread):
             out = []
             for uid, title, fig in results:
                 if apply_display:
-                    # apply_display_options returns a NEW figure.
-                    fig = apply_display_options(fig, self._layout_opts,
-                                                self._typo_opts)
-                apply_hover_format(fig)
+                    from services.polars_chart_service import apply_chart_model_display_options
+                    fig = apply_chart_model_display_options(
+                        fig, self._layout_opts or {}, self._typo_opts or {})
+                    fig["uid"] = uid
                 out.append((uid, title, fig))
             self.finished_ok.emit(out)
         except Exception as exc:
@@ -196,7 +429,8 @@ class ReportPreviewWorker(QThread):
                  slicer_geometry: Optional[dict] = None,
                  slicer_values: Optional[dict] = None,
                  geometry_mode: str = "free",
-                 extra_css: str = "", parent=None) -> None:
+                 extra_css: str = "", report_payload: Optional[dict] = None,
+                 report_specs: Optional[dict] = None, parent=None) -> None:
         super().__init__(parent)
         # ALREADY-BUILT export tuples, exactly as ExportWorker takes them, so
         # the canvas and the saved file are built from the same data. Handing
@@ -222,9 +456,17 @@ class ReportPreviewWorker(QThread):
         self._slicer_values = dict(slicer_values or {})
         self._geometry_mode = str(geometry_mode or "free")
         self._extra_css = str(extra_css or "")
+        self._report_payload = dict(report_payload or {})
+        self._report_specs = dict(report_specs or {})
 
     def run(self) -> None:
         try:
+            # A newer regen may have superseded this build while it sat in the
+            # queue. Bail before the multi-second build_export_report rather
+            # than running it for a result that gets discarded -- the canvas
+            # freeze under rapid edits.
+            if self.isInterruptionRequested():
+                return
             from services.export_service import build_export_report
 
             html, _safe = build_export_report(
@@ -239,16 +481,14 @@ class ReportPreviewWorker(QThread):
                 slicer_geometry=self._slicer_geometry,
                 slicer_values=self._slicer_values,
                 geometry_mode=self._geometry_mode,
-                # NO report_payload/report_specs here, deliberately: the live
-                # canvas drives its slicers PYTHON-side (a click re-runs the
-                # report and pushes fresh figures), and embedding the browser
-                # engine + dataset would make every click apply twice through
-                # two renderers. The SAVED file (ExportWorker) gets them.
-                # The bundle is served as a sibling file by ReportCanvas;
-                # embedding 4.5 MB on every settings tweak is not viable.
-                inline_plotly=False,
+                # The report payload is column-pruned and built in the input
+                # worker. Embed it in the preview so slicers filter this
+                # already-loaded ECharts board in place; the UI does not
+                # rebuild and reload the document on each selection.
                 extra_css=self._extra_css,
                 editor=True,
+                report_payload=self._report_payload,
+                report_specs=self._report_specs,
             )
             self.ready.emit(self._token, html)
         except Exception as exc:
@@ -281,36 +521,79 @@ class ReportInputsWorker(QThread):
         try:
             from services.chart_service import run_chart_recipe
             from services.slicer_service import (
-                active_slicers, affected_charts, filter_frame,
+                active_slicers, affected_charts, filter_frames_by_chart,
             )
             from services.export_service import build_export_charts
-            from modules.report_data import build_report_payload
             from services.filter_service import distinct_values
 
             charts = list(self._snapshot.get("charts") or [])
             slicers = list(self._snapshot.get("slicers") or [])
             df = self._snapshot.get("df")
+            dataset = self._snapshot.get("polars_dataset")
             recipes = self._snapshot.get("recipes") or {}
             cols = int(self._snapshot.get("grid_cols_n", 2))
+            kpis = list(self._snapshot.get("kpis") or [])
+
+            # Build the browser's column-pruned payload first. With this
+            # payload present, the already-loaded ECharts document can filter
+            # and update itself; Python only needs to rebuild chart snapshots
+            # when interactive data is unavailable.
+            report_payload = None
+            if dataset is not None or (df is not None and not getattr(df, "empty", True)):
+                try:
+                    from modules.report_data import (
+                        build_report_payload, build_report_payload_polars,
+                    )
+                    if dataset is not None:
+                        report_payload = build_report_payload_polars(
+                            dataset, recipes, slicers, kpis)
+                    if (not report_payload or not report_payload.get("columns")) and \
+                            df is not None and not getattr(df, "empty", True):
+                        report_payload = build_report_payload(
+                            df, recipes, slicers, kpis)
+                except Exception:
+                    log.debug("report payload not built; static export",
+                              exc_info=True)
+                    report_payload = None
+
+            has_live_data = bool(report_payload and report_payload.get("columns"))
 
             # Geometry stays on the page (_current_geometry reads bridge
             # state + does a grid-blob migration; duplicating it here would
             # drift). The worker returns filtered charts + payload; the page
             # merges its cheap geometry maps afterwards.
-            if charts and active_slicers(slicers) and df is not None                     and not df.empty:
+            if (not has_live_data and charts and active_slicers(slicers)
+                    and df is not None and not df.empty and recipes):
                 try:
-                    filtered = filter_frame(df, slicers)
+                    hit = set(affected_charts(recipes, slicers))
+                    # Each chart re-runs against only the slicers that
+                    # constrain it (report-scope = all; chart-scope = target),
+                    # with each distinct filter set computed once. A report
+                    # slicer is universal, so this re-runs every chart, but a
+                    # report-only board still filters the data a single time.
+                    frames = filter_frames_by_chart(
+                        df, slicers,
+                        [c[0] for c in charts if c[0] in hit])
                 except Exception:
-                    filtered = None
-                if filtered is not None:
-                    hit = set(affected_charts(recipes, slicers)) if recipes                         else set()
+                    log.warning("ReportInputsWorker: filter failed; "
+                                "charts left unfiltered", exc_info=True)
+                    frames = {}
+                if frames:
                     out = []
                     for chart in charts:
+                        # A newer regen superseded this one: stop re-running
+                        # recipes mid-way rather than finishing work whose
+                        # result will be thrown away. This is what stops a
+                        # burst of drags from piling up concurrent full
+                        # re-runs over millions of rows -- the "canvas freeze"
+                        # report.
+                        if self.isInterruptionRequested():
+                            return
                         uid = chart[0]
-                        if uid not in hit or uid not in recipes:
+                        if uid not in frames:
                             out.append(chart)
                             continue
-                        rebuilt = run_chart_recipe(recipes[uid], filtered)
+                        rebuilt = run_chart_recipe(recipes[uid], frames[uid])
                         out.append((uid, chart[1], rebuilt[2], *chart[3:])
                                    if rebuilt else chart)
                     charts = out
@@ -321,25 +604,25 @@ class ReportInputsWorker(QThread):
                 charts, meta_map=meta_map, notes=notes)
 
             slicer_values: dict = {}
-            if df is not None and not df.empty:
+            if dataset is not None or (df is not None and not getattr(df, "empty", True)):
                 for i, s in enumerate(slicers):
                     if not isinstance(s, dict):
                         continue
                     if str(s.get("widget") or "").lower()                             not in ("list", "dropdown"):
                         continue
                     try:
-                        slicer_values[str(i)] = distinct_values(
-                            df, str(s.get("column") or ""))
+                        column = str(s.get("column") or "")
+                        if dataset is not None and column in dataset.schema:
+                            import polars as pl
+                            candidates = (dataset.frame.select(
+                                pl.col(column).drop_nulls().unique(
+                                    maintain_order=True).head(500))
+                                .collect()[column].to_list())
+                            slicer_values[str(i)] = [str(value) for value in candidates]
+                        elif df is not None:
+                            slicer_values[str(i)] = distinct_values(df, column)
                     except Exception:
                         continue
-
-            report_payload = None
-            if slicers and df is not None:
-                try:
-                    report_payload = build_report_payload(
-                        df, meta_map, slicers)
-                except Exception:
-                    report_payload = None
 
             self.ready.emit(self._token, {
                 "charts": charts,

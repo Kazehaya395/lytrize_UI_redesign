@@ -262,7 +262,7 @@ class DistributionSettings(StatisticalSettings):
         self._ck_grid.toggled.connect(lambda v: self._set_layout(show_grid=bool(v)))
         rr.addWidget(self._check_row(self._ck_grid))
         self._ck_border = QCheckBox('Show border')
-        self._ck_border.setChecked(bool(self._layout_opts.get('show_border', True)))
+        self._ck_border.setChecked(bool(self._layout_opts.get('show_border', False)))
         self._ck_border.setToolTip('Border around the legend, colour bar / colour range')
         self._ck_border.toggled.connect(lambda v: self._set_layout(show_border=bool(v)))
         rr.addWidget(self._check_row(self._ck_border))
