@@ -85,15 +85,26 @@ EDITOR_CSS = """
    something you can pick up. The invisible extension does the real work: the
    visible chip stays small enough not to cover the plot, while a ::after
    pseudo-element widens the actual hit area well past the edge. */
-.ly-h-right  { top: 50%; right: 0; width: 12px; height: 44px;
+.ly-h-left  { top: 50%; left: 0; width: 12px; height: 44px;
   margin-top: -22px; cursor: ew-resize; }
+.ly-h-right { top: 50%; right: 0; width: 12px; height: 44px;
+  margin-top: -22px; cursor: ew-resize; }
+.ly-h-top   { left: 50%; top: 0; width: 44px; height: 12px;
+  margin-left: -22px; cursor: ns-resize; }
 .ly-h-bottom { left: 50%; bottom: 0; height: 12px; width: 44px;
   margin-left: -22px; cursor: ns-resize; }
-.ly-h-corner { right: 0; bottom: 0; width: 20px; height: 20px;
-  cursor: nesw-resize; }
-.ly-h-right::after, .ly-h-bottom::after, .ly-h-corner::after {
+.ly-h-corner { left: 0; top: 0; width: 20px; height: 20px;
+  cursor: nwse-resize; }
+.ly-h-top-left { left: 0; top: 0; width: 18px; height: 18px; cursor: nwse-resize; }
+.ly-h-top-right { right: 0; top: 0; width: 18px; height: 18px; cursor: nesw-resize; }
+.ly-h-bottom-left { left: 0; bottom: 0; width: 18px; height: 18px; cursor: nesw-resize; }
+.ly-h-bottom-right { right: 0; bottom: 0; width: 18px; height: 18px; cursor: nwse-resize; }
+.ly-h-right::after, .ly-h-bottom::after, .ly-h-left::after, .ly-h-top::after {
   content: ''; position: absolute; inset: -8px; }
-.ly-h-corner::after { inset: -10px; }
+.ly-h-left::after { left: -8px; }
+.ly-h-top::after { top: -8px; }
+.ly-h-top-left::after, .ly-h-top-right::after,
+.ly-h-bottom-left::after, .ly-h-bottom-right::after { inset: -8px; }
 
 /* Chart, KPI and slicer content needs clearance from the edit chrome. The grip
    and toolbar are absolutely positioned in the card corners. The dashboard
@@ -405,6 +416,7 @@ EDITOR_JS = r"""
       ev.stopPropagation();
       select(card);
       var r = card.getBoundingClientRect();
+      try { ev.currentTarget.setPointerCapture(ev.pointerId); } catch (e) {}
       drag = {mode: mode, edge: edge, el: card, start: readGeom(card),
               grabX: ev.clientX, grabY: ev.clientY,
               originX: r.left, originY: r.top, pending: null};
@@ -430,12 +442,38 @@ EDITOR_JS = r"""
         g.x = drag.start.x + dx / c.w;
         g.y = drag.start.y + dy;
       } else {
-        /* Only the edge that was grabbed moves. Dragging the right edge must
-         * not silently resize the height too -- a corner handle does both. */
-        if (drag.edge !== 'bottom') g.w = drag.start.w + dx / c.w;
-        if (drag.edge !== 'right')  g.h = drag.start.h + dy;
+        /* Resize only the hit edges. A left/top resize fixes the opposite
+         * edge; side resizes never change the perpendicular dimension. */
+        var edge = drag.edge || '';
+        var left = edge.indexOf('left') >= 0;
+        var right = edge.indexOf('right') >= 0;
+        var top = edge.indexOf('top') >= 0;
+        var bottom = edge.indexOf('bottom') >= 0;
+        if (left) { g.x = drag.start.x + dx / c.w; g.w = drag.start.w - dx / c.w; }
+        else if (right) { g.w = drag.start.w + dx / c.w; }
+        if (top) { g.y = drag.start.y + dy; g.h = drag.start.h - dy; }
+        else if (bottom) { g.h = drag.start.h + dy; }
       }
       clampGeom(g, el);
+      if (drag.mode === 'resize') {
+        var minH = el && uidOf(el) === '__title__' ? TITLE_MIN_H : MIN_H;
+        if (edge.indexOf('left') >= 0) {
+          var fixedRight = drag.start.x + drag.start.w;
+          g.w = Math.max(MIN_W, Math.min(fixedRight, g.w));
+          g.x = fixedRight - g.w;
+        } else if (edge.indexOf('right') >= 0) {
+          g.x = drag.start.x;
+          g.w = Math.max(MIN_W, Math.min(1 - g.x, g.w));
+        }
+        if (edge.indexOf('top') >= 0) {
+          var fixedBottom = drag.start.y + drag.start.h;
+          g.h = Math.max(minH, Math.min(fixedBottom, g.h));
+          g.y = fixedBottom - g.h;
+        } else if (edge.indexOf('bottom') >= 0) {
+          g.y = drag.start.y;
+          g.h = Math.max(minH, g.h);
+        }
+      }
     }
     /*__GRID_BEGIN__*/
     else {
@@ -557,7 +595,9 @@ EDITOR_JS = r"""
     grip.addEventListener('pointerdown', begin('move'));
     el.appendChild(grip);
 
-    var handles = [['right', '\u2195'], ['bottom', '\u2195'], ['corner', '\u292F']];
+    var handles = [['left', '\u2190'], ['right', '\u2192'], ['top', '\u2191'], ['bottom', '\u2193'],
+                   ['top-left', '\u2196'], ['top-right', '\u2197'],
+                   ['bottom-left', '\u2199'], ['bottom-right', '\u2198']];
     handles.forEach(function (spec) {
       var h = document.createElement('div');
       h.className = 'ly-handle ly-h-' + spec[0];
@@ -636,8 +676,20 @@ EDITOR_JS = r"""
         if (t.closest && t.closest('.ly-grip, .ly-handle, .ly-bar, .ly-sel, ' +
                                     'button, input, select, textarea, label, ' +
                                     '[contenteditable], ' +
-                                    '.notes, .slicer-body, .chart')) return;
-        begin('move')(ev);
+                                    '.notes, .slicer-body')) return;
+        var rect = el.getBoundingClientRect(), pad = 9;
+        var west = ev.clientX - rect.left <= pad;
+        var east = rect.right - ev.clientX <= pad;
+        var north = ev.clientY - rect.top <= pad;
+        var south = rect.bottom - ev.clientY <= pad;
+        var edge = (north ? 'top' : (south ? 'bottom' : '')) +
+                   (west ? 'left' : (east ? 'right' : ''));
+        /* A click remains a chart click. Start the edit gesture only after a
+         * small movement threshold; this also avoids stealing simple plot
+         * hover/click interactions while allowing a drag from anywhere. */
+        pendingPointer = {el: el, x: ev.clientX, y: ev.clientY,
+                          pointerId: ev.pointerId, edge: edge || null,
+                          eventTarget: ev.target};
       });
     }
   }
@@ -668,8 +720,12 @@ EDITOR_JS = r"""
         var delta = document.createElement('div');
         delta.className = 'kpi-delta';
         delta.setAttribute('data-ly-kpi-delta', key);
+        var spark = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        spark.setAttribute('viewBox', '0 0 120 32');
+        spark.setAttribute('role', 'img'); spark.setAttribute('aria-label', 'KPI trend');
+        spark.classList.add('kpi-sparkline');
         content.appendChild(label); content.appendChild(value);
-        content.appendChild(delta); card.appendChild(content);
+        content.appendChild(spark); content.appendChild(delta); card.appendChild(content);
         host.appendChild(card);
         decorate(card);
       }
@@ -679,9 +735,32 @@ EDITOR_JS = r"""
       card.style.height = Number(geom.h || 120) + 'px';
       var labelNode = card.querySelector('.kpi-label');
       var valueNode = card.querySelector('.kpi-value');
+      var deltaNode = card.querySelector('.kpi-delta');
+      var sparkNode = card.querySelector('.kpi-sparkline');
       if (labelNode) labelNode.textContent = String(kpi.label || kpi.name || 'KPI');
       if (valueNode) valueNode.textContent = String(kpi.prefix || '') +
         String(kpi.value == null ? '--' : kpi.value) + String(kpi.suffix || '');
+      if (deltaNode) {
+        var delta = kpi.trend_change_pct;
+        deltaNode.textContent = delta == null ? '' : ((delta >= 0 ? '+' : '') + Number(delta).toFixed(1) + '%');
+        deltaNode.style.color = delta == null ? '' : (delta >= 0 ? '#22c55e' : '#ef4444');
+        if (delta != null) deltaNode.title = delta >= 0 ? 'Positive trend' : 'Negative trend';
+      }
+      if (sparkNode) {
+        while (sparkNode.firstChild) sparkNode.removeChild(sparkNode.firstChild);
+        var trend = Array.isArray(kpi.trend) ? kpi.trend : [];
+        if (trend.length > 1) {
+          var vals = trend.map(function (p) { return Number(p[1]); });
+          var low = Math.min.apply(null, vals), high = Math.max.apply(null, vals), span = high - low || 1;
+          var points = vals.map(function (v, i) { return (4 + i * 112 / (vals.length - 1)) + ',' + (28 - (v - low) * 22 / span); }).join(' ');
+          var line = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+          line.setAttribute('points', points); line.setAttribute('fill', 'none');
+          line.setAttribute('stroke', kpi.trend_change_pct < 0 ? '#ef4444' : '#22c55e');
+          line.setAttribute('stroke-width', '2.5'); line.setAttribute('stroke-linecap', 'round');
+          sparkNode.appendChild(line); sparkNode.style.display = 'block';
+          sparkNode.setAttribute('aria-label', kpi.trend_change_pct < 0 ? 'Negative trend' : 'Positive trend');
+        } else sparkNode.style.display = 'none';
+      }
     });
     Array.prototype.forEach.call(host.querySelectorAll('.kpi-card[data-kpi]'),
       function (card) {
@@ -697,17 +776,102 @@ EDITOR_JS = r"""
    * new definitions and supplies list options without blocking this document.
    * Python keeps the full regeneration fallback for widget families that are
    * not represented by the live select controls yet. */
+  /* Slicer cards are also content-only board changes. Rebuilding the report
+   * for add/edit/remove used to serialize the full data payload and reload all
+   * charts. Create the controls in place; the live-filter worker receives the
+   * new definitions and supplies list options without blocking this document.
+   * Python keeps the full regeneration fallback for widget families that are
+   * not represented by the live select controls yet. */
   function syncSlicers(slicers, geometry) {
     var host = document.getElementById('board');
     if (!host) return;
     slicers = Array.isArray(slicers) ? slicers : [];
     geometry = geometry || {};
     var keep = Object.create(null);
+
+    function controlFor(slicer, spec, selected, key) {
+      var widget = String(slicer.widget || 'list').toLowerCase();
+      var body = document.createElement('div');
+      body.className = 'slicer-controls';
+      if (widget === 'list') {
+        var list = document.createElement('div');
+        list.className = 'slicer-list';
+        (spec.options || []).forEach(function (opt) {
+          var label = document.createElement('label');
+          var cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.value = String(opt.value);
+          cb.setAttribute('data-ly-role', 'value');
+          cb.dataset.lySlicer = key;
+          cb.dataset.lyUid = String(slicer.uid || ('slicer-' + key));
+          if (selected.indexOf(String(opt.value)) >= 0) cb.checked = true;
+          var txt = document.createElement('span');
+          txt.textContent = (opt.label != null ? String(opt.label) : String(opt.value));
+          label.appendChild(cb); label.appendChild(txt);
+          list.appendChild(label);
+        });
+        body.appendChild(list);
+      } else if (widget === 'dropdown') {
+        var sel = document.createElement('select');
+        sel.className = 'slicer-select';
+        sel.setAttribute('data-ly-role', 'values');
+        sel.setAttribute('data-ly-slicer', key);
+        sel.setAttribute('data-ly-uid', String(slicer.uid || ('slicer-' + key)));
+        var all = document.createElement('option');
+        all.value = ''; all.textContent = 'All';
+        sel.appendChild(all);
+        (spec.options || []).forEach(function (opt) {
+          var o = document.createElement('option');
+          o.value = String(opt.value);
+          o.textContent = (opt.label != null ? String(opt.label) : String(opt.value));
+          if (selected.indexOf(String(opt.value)) >= 0) o.selected = true;
+          sel.appendChild(o);
+        });
+        body.appendChild(sel);
+      } else if (widget === 'slider') {
+        var dateRange = String(spec.bounds_kind || spec.kind_of_bounds || '').toLowerCase() === 'datetime';
+        var lo = document.createElement('input');
+        lo.type = dateRange ? 'date' : 'range'; lo.min = String(spec.min != null ? spec.min : 0); lo.max = String(spec.max != null ? spec.max : 100); lo.step = Number(spec.step != null ? spec.step : 1);
+        lo.setAttribute('data-ly-role', 'low'); lo.dataset.lySlicer = key;
+        if (typeof spec.low !== 'undefined' && spec.low !== null && spec.low !== '') lo.value = String(spec.low);
+        var hi = document.createElement('input');
+        hi.type = dateRange ? 'date' : 'range'; hi.min = String(spec.min != null ? spec.min : 0); hi.max = String(spec.max != null ? spec.max : 100); hi.step = Number(spec.step != null ? spec.step : 1);
+        hi.setAttribute('data-ly-role', 'high'); hi.dataset.lySlicer = key;
+        if (typeof spec.high !== 'undefined' && spec.high !== null && spec.high !== '') hi.value = String(spec.high);
+        var loL = document.createElement('output');
+        loL.setAttribute('data-ly-role', 'low');
+        var hiL = document.createElement('output');
+        hiL.setAttribute('data-ly-role', 'high');
+        body.appendChild(lo); body.appendChild(loL); body.appendChild(hi); body.appendChild(hiL);
+      } else if (widget === 'search') {
+        var t = document.createElement('input');
+        t.type = 'text'; t.className = 'slicer-search';
+        t.setAttribute('data-ly-role', 'value'); t.dataset.lySlicer = key;
+        t.value = spec.value || '';
+        body.appendChild(t);
+      } else if (widget === 'top_n') {
+        var mode = document.createElement('select');
+        mode.setAttribute('data-ly-role', 'mode'); mode.dataset.lySlicer = key;
+        [['largest', 'Largest'], ['smallest', 'Smallest']].forEach(function (m) {
+          var o = document.createElement('option');
+          o.value = m[0]; o.textContent = m[1];
+          if ((spec.mode || (spec.least ? 'smallest' : 'largest')) === m[0]) o.selected = true;
+          mode.appendChild(o);
+        });
+        var n = document.createElement('input');
+        n.type = 'number'; n.min = 1; n.max = 100;
+        n.setAttribute('data-ly-role', 'n'); n.dataset.lySlicer = key;
+        n.value = String(spec.n != null ? spec.n : 5);
+        body.appendChild(mode); body.appendChild(n);
+      }
+      return body;
+    }
+
     slicers.forEach(function (slicer, index) {
       slicer = slicer || {};
       var key = String(index), uid = String(slicer.uid || ('slicer-' + key));
       var geom = geometry[key] || {}, card = host.querySelector(
-        '.slicer-card[data-slicer="' + key + '"]');
+        '.slicer-card[data-slicer=' + key + ']');
       keep[key] = true;
       if (!card) {
         card = document.createElement('section');
@@ -719,12 +883,24 @@ EDITOR_JS = r"""
         title.className = 'slicer-title';
         var body = document.createElement('div');
         body.className = 'slicer-body';
-        var select = document.createElement('select');
-        select.className = 'slicer-select';
-        select.setAttribute('data-ly-role', 'values');
-        body.appendChild(select); content.appendChild(title);
-        content.appendChild(body); card.appendChild(content); host.appendChild(card);
+        var spec = slicer.spec && typeof slicer.spec === 'object' ? slicer.spec : {};
+        var selected = Array.isArray(spec.values) ? spec.values : [];
+        body.appendChild(controlFor(slicer, spec, selected, key));
+        content.appendChild(title); content.appendChild(body);
+        card.appendChild(content); host.appendChild(card);
         decorate(card);
+      }
+      var spec = slicer.spec && typeof slicer.spec === 'object' ? slicer.spec : {};
+      var widgetSignature = JSON.stringify([slicer.widget || 'list', slicer.column || '',
+        spec.options || [], spec.min, spec.max, spec.step, spec.bounds_kind]);
+      if (card.dataset.lyWidgetSignature !== widgetSignature) {
+        var existingBody = card.querySelector('.slicer-body');
+        if (existingBody) {
+          while (existingBody.firstChild) existingBody.removeChild(existingBody.firstChild);
+          existingBody.appendChild(controlFor(slicer, spec,
+            Array.isArray(spec.values) ? spec.values : [], key));
+        }
+        card.dataset.lyWidgetSignature = widgetSignature;
       }
       card.style.left = (Number(geom.x || 0) * 100) + '%';
       card.style.top = Number(geom.y || 0) + 'px';
@@ -732,54 +908,8 @@ EDITOR_JS = r"""
       card.style.height = Number(geom.h || 180) + 'px';
       var titleNode = card.querySelector('.slicer-title');
       if (titleNode) titleNode.textContent = String(slicer.label || slicer.column || 'Filter');
-      var selectNode = card.querySelector('select.slicer-select');
-      if (selectNode) {
-        var widget = String(slicer.widget || 'list').toLowerCase();
-        selectNode.multiple = widget === 'list';
-        if (selectNode.multiple) selectNode.setAttribute('size', '5');
-        else selectNode.removeAttribute('size');
-        selectNode.setAttribute('data-ly-slicer', key);
-        selectNode.setAttribute('data-ly-uid', uid);
-        var spec = slicer.spec && typeof slicer.spec === 'object' ? slicer.spec : {};
-        var selected = Array.isArray(spec.values) ? spec.values : [];
-        selectNode.setAttribute('data-ly-selected', JSON.stringify(selected));
-        while (selectNode.options.length) selectNode.remove(0);
-        var all = document.createElement('option');
-        all.value = ''; all.textContent = 'All'; all.selected = selected.length === 0;
-        selectNode.appendChild(all);
-      }
-    });
-    Array.prototype.forEach.call(host.querySelectorAll('.slicer-card[data-slicer]'),
-      function (card) {
-        if (!keep[String(card.getAttribute('data-slicer'))]) card.remove();
-      });
-    wireSlicers();
-    syncCanvasHeight(host);
-  }
-  window.__lytrizeSyncSlicers = syncSlicers;
-  window.__lytrizeDecorateCard = decorate;
-  window.__lytrizeSyncCanvasHeight = syncCanvasHeight;
-
-  /* Notes are edited in place, which is what the Qt card's QTextEdit did, and
-   * committed on BLUR rather than per keystroke -- otherwise every character
-   * would trigger a full report regeneration. */
-  function wireNotes() {
-    Array.prototype.forEach.call(document.querySelectorAll('.notes'), function (n) {
-      if (n.dataset.lyNotes) return;
-      n.dataset.lyNotes = '1';
-      n.setAttribute('contenteditable', 'true');
-      n.addEventListener('keydown', function (ev) {
-        ev.stopPropagation();
-        if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
-          ev.preventDefault();
-          n.blur();
-        }
-      });
-      n.addEventListener('blur', function () {
-        var card = n.closest('.chart-card');
-        if (!card || !bridge) return;
-        var text = n.innerText.replace(/^\s*Analysis Notes:\s*/i, '').trim();
-        bridge.notesChanged(uidOf(card), text);
+      Array.prototype.forEach.call(card.querySelectorAll('[data-ly-slicer="' + key + '"]'), function (ctrl) {
+        ctrl.setAttribute('data-ly-uid', uid);
       });
     });
   }
@@ -846,7 +976,7 @@ EDITOR_JS = r"""
         /* A search box fires per keystroke: debouncing keeps one regen per
          * word rather than one per letter. Every other control reports
          * immediately -- change events are already discrete. */
-        if (ctrl.type === 'search' || ctrl.type === undefined) {
+        if (ctrl.type === 'text' || ctrl.type === 'search' || ctrl.type === undefined) {
           if (timer) clearTimeout(timer);
           timer = setTimeout(send, 350);
         } else {
@@ -884,9 +1014,75 @@ EDITOR_JS = r"""
     });
   }
 
-  document.addEventListener('pointermove', move);
-  document.addEventListener('pointerup', end);
-  document.addEventListener('pointercancel', end);
+  /* Notes are edited in place: while the board is being edited each chart
+   * card's notes box is a contenteditable region, and the commit goes to
+   * Python on blur (report_canvas._bridge.notesChanged), never on every
+   * keystroke -- a half-typed sentence is not a layout event. Escape
+   * reverts to the text the card had when focus landed.
+   *
+   * The notes box is EXCLUDED from the card's drag handling already (it has
+   * a data-note guard in the free-canvas pointerdown filter), so this never
+   * fights a drag. Contenteditable tracks the mode class: Preview leaves the
+   * text selectable but not editable, so a stray click in preview mode does
+   * not start editing. */
+  function applyNotesEditable() {
+    var on = document.body.classList.contains('ly-editing');
+    document.querySelectorAll('.notes').forEach(function (note) {
+      note.setAttribute('contenteditable', on ? 'true' : 'false');
+      if (on) note.setAttribute('spellcheck', 'false');
+    });
+  }
+  function wireNotes() {
+    document.querySelectorAll('.notes').forEach(function (note) {
+      var card = note.closest('.chart-card, .kpi-card, .title-card');
+      var uid = card ? uidOf(card) : '';
+      if (!uid) return;
+      var start = note.textContent;
+      note.addEventListener('focus', function () { start = note.textContent; });
+      note.addEventListener('keydown', function (ev) {
+        /* Typing must never nudge the card or trip the global keynav. */
+        ev.stopPropagation();
+        if (ev.key === 'Escape') { note.textContent = start; note.blur(); }
+      });
+      note.addEventListener('blur', function () {
+        if (!bridge) return;
+        var text = note.textContent;
+        if (text === start) return;
+        bridge.notesChanged(uid, text);
+      });
+    });
+    applyNotesEditable();
+  }
+
+  var pendingPointer = null;
+  document.addEventListener('pointermove', function (ev) {
+    if (!drag && pendingPointer && pendingPointer.pointerId === ev.pointerId) {
+      var dx = ev.clientX - pendingPointer.x, dy = ev.clientY - pendingPointer.y;
+      if (dx * dx + dy * dy >= 25) {
+        var p = pendingPointer; pendingPointer = null;
+        var mode = p.edge ? 'resize' : 'move';
+        var edge = p.edge;
+        /* Corners naturally combine horizontal and vertical edges. */
+        var rect = p.el.getBoundingClientRect();
+        if (p.edge === 'topright') edge = 'topright';
+        else if (p.edge === 'topleft') edge = 'topleft';
+        else if (p.edge === 'bottomright') edge = 'bottomright';
+        else if (p.edge === 'bottomleft') edge = 'bottomleft';
+        begin(mode, edge)({currentTarget: p.el, target: p.eventTarget,
+          clientX: p.x, clientY: p.y, pointerId: p.pointerId,
+          preventDefault: function () {}, stopPropagation: function () {}});
+        move(ev);
+      }
+    } else move(ev);
+  });
+  document.addEventListener('pointerup', function (ev) {
+    if (pendingPointer && pendingPointer.pointerId === ev.pointerId) pendingPointer = null;
+    end();
+  });
+  document.addEventListener('pointercancel', function (ev) {
+    if (pendingPointer && pendingPointer.pointerId === ev.pointerId) pendingPointer = null;
+    end();
+  });
   document.addEventListener('keydown', keyNav);
   window.addEventListener('resize', clearGhost);
 
@@ -896,6 +1092,7 @@ EDITOR_JS = r"""
     document.body.classList.toggle('ly-editing', !!on);
     document.body.classList.toggle('ly-free', FREE);
     document.body.classList.toggle('ly-grid-editing', !FREE);
+    applyNotesEditable();
     if (!on) { clearGhost(); select(null); }
   };
   window.lyEditMode = function () {

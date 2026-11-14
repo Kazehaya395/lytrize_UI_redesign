@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-import pandas as pd
+import polars as pl
 from PySide6.QtCore import Qt, Signal, QMimeData
 from PySide6.QtGui import QDrag
 from PySide6.QtWidgets import (
@@ -103,7 +103,7 @@ class ColumnClassifierPanel(QWidget):
     def __init__(self, bridge, parent=None) -> None:
         super().__init__(parent)
         self.bridge = bridge
-        self._df: Optional[pd.DataFrame] = None
+        self._df: Optional[pl.DataFrame] = None
         self._auto_num: list[str] = []
         self._auto_cat: list[str] = []
         self._auto_dt: list[str] = []
@@ -228,10 +228,12 @@ class ColumnClassifierPanel(QWidget):
 
     # -- Public API ---------------------------------------------------------
 
-    def set_dataframe(self, df: pd.DataFrame) -> None:
+    def set_dataframe(self, df: Any) -> None:
         """Load a DataFrame and auto-detect column types."""
+        if df is not None and not isinstance(df, pl.DataFrame):
+            df = pl.from_pandas(df)
         self._df = df
-        if df is None or df.empty:
+        if df is None or df.is_empty():
             self._clear_lists()
             return
 
@@ -275,7 +277,7 @@ class ColumnClassifierPanel(QWidget):
         self.list_cat.clear()
         self.list_dt.clear()
 
-        all_cols = self._df.columns.tolist() if self._df is not None else []
+        all_cols = self._df.columns if self._df is not None else []
         assigned = set()
 
         for col in self._auto_num:
@@ -374,7 +376,7 @@ class ColumnClassifierPanel(QWidget):
 
     def _df_is_valid(self) -> bool:
         """Basic sanity check before confirming."""
-        if self._df is None or self._df.empty:
+        if self._df is None or self._df.is_empty():
             QMessageBox.warning(self, "No Data", "Please upload a dataset first.")
             return False
         return True

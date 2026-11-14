@@ -45,7 +45,6 @@ ANALYSIS_OPTIONS = [
     {"id": "calendar_heatmap", "icon": "🗓️", "name": "Calendar Heatmap", "desc": "Daily activity patterns"},
     {"id": "waterfall", "icon": "🌊", "name": "Waterfall", "desc": "Cumulative changes"},
     {"id": "funnel", "icon": "🔻", "name": "Funnel", "desc": "Stage conversion"},
-    {"id": "globe_extruded_map", "icon": "🌐", "name": "3D Globe & Extruded Map", "desc": "Geographic visualization"},
 ]
 
 _NATIVE_BUILDERS = {
@@ -66,7 +65,6 @@ _NATIVE_BUILDERS = {
     "calendar_heatmap": "build_advanced_chart",
     "waterfall": "build_advanced_chart",
     "funnel": "build_advanced_chart",
-    "globe_extruded_map": "build_advanced_chart",
 }
 
 _NEEDS_AXES = {"statistical", "distribution", "correlation", "categorical",
@@ -217,10 +215,6 @@ WIDGET_SPEC = {
                   ("agg", "agg", "scalar"), ("palette", "palette", "palette")],
     "funnel": [("x", "x_cols", "scalar"), ("y", "y_cols", "scalar"),
                ("agg", "agg", "scalar"), ("palette", "palette", "palette")],
-    "globe_extruded_map": [
-        ("location_col", "location_col", "scalar"), ("value_col", "value_col", "scalar"),
-        ("map_style", "map_style", "scalar"), ("palette", "palette", "palette"),
-    ],
 }
 
 
@@ -293,7 +287,7 @@ def build_analysis_config(aid: str, df: pd.DataFrame,
     num = num_cols(df, roles=roles)
     cat = cat_cols(df, roles=roles)
     dt = dt_cols(df, roles=roles)
-    all_cols = df.columns.tolist()
+    all_cols = list(df.columns)
     NONE = "None"
 
     def g(key: str, default: Any = None) -> Any:
@@ -405,7 +399,6 @@ def build_analysis_config(aid: str, df: pd.DataFrame,
         kwargs.update(date_col=g("date_col", dt[0] if dt else None),
                       value_col=_single_choice_value(g("value_col", NONE), NONE),
                       agg=AGG_FUNCS.get(g("agg", "Sum"), "sum"))
-    elif aid == "globe_extruded_map":
         kwargs.update(location_col=g("location_col", cat[0] if cat else None),
                       value_col=_single_choice_value(g("value_col", NONE), NONE),
                       map_style=g("map_style", "Local boundaries (Light)"))
@@ -648,7 +641,9 @@ def run_analysis(aid: str, df: pd.DataFrame, roles: Optional[dict] = None,
                     config["y"] = raw_y[0] if isinstance(raw_y, list) and raw_y else raw_y
                 if "sort" not in config and "sort_by" in config:
                     config["sort"] = config["sort_by"]
-            if aid in {"sankey", "sunburst", "calendar_heatmap", "waterfall", "funnel", "globe_extruded_map"}:
+                config["chart_type"] = aid
+            elif aid in {"sankey", "sunburst", "calendar_heatmap",
+                         "waterfall", "funnel"}:
                 config["chart_type"] = aid
             builder = getattr(builders, builder_name)
             built = builder(dataset, config, roles=roles, layout=layout,

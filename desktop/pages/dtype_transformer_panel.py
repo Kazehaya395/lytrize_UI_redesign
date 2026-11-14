@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-import pandas as pd
+import polars as pl
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -39,7 +39,7 @@ class DtypeTransformerPanel(QWidget):
     def __init__(self, bridge, parent=None) -> None:
         super().__init__(parent)
         self.bridge = bridge
-        self._df: Optional[pd.DataFrame] = None
+        self._df: Optional[pl.DataFrame] = None
         self._worker = None
 
         self._build_ui()
@@ -197,10 +197,12 @@ class DtypeTransformerPanel(QWidget):
 
     # -- Public API ---------------------------------------------------------
 
-    def set_dataframe(self, df: pd.DataFrame) -> None:
+    def set_dataframe(self, df: Any) -> None:
         """Load a DataFrame and populate dtype table."""
+        if df is not None and not isinstance(df, pl.DataFrame):
+            df = pl.from_pandas(df)
         self._df = df
-        if df is None or df.empty:
+        if df is None or df.is_empty():
             self.table_dtypes.setRowCount(0)
             self.cmb_col.clear()
             return
@@ -209,7 +211,7 @@ class DtypeTransformerPanel(QWidget):
         self.table_dtypes.setRowCount(len(df.columns))
         for i, col in enumerate(df.columns):
             values = (col, str(df[col].dtype),
-                      str(df[col].iloc[0]) if len(df) > 0 else "")
+                      str(df[col].item(0)) if len(df) > 0 else "")
             for j, val in enumerate(values):
                 item = QTableWidgetItem(val)
                 item.setTextAlignment(Qt.AlignCenter)
@@ -217,7 +219,7 @@ class DtypeTransformerPanel(QWidget):
 
         # Populate column dropdown
         self.cmb_col.clear()
-        self.cmb_col.addItems(df.columns.tolist())
+        self.cmb_col.addItems(df.columns)
 
     # -- Slots --------------------------------------------------------------
 
@@ -328,12 +330,12 @@ class DtypeTransformerPanel(QWidget):
             self.lbl_preview_stats.setVisible(True)
 
             # Fill preview table
-            before_vals = result["sample_df"]["Before"].head(10)
-            after_vals = result["sample_df"]["After"].head(10)
+            before_vals = result["sample_df"]["Before"].head(10).to_list()
+            after_vals = result["sample_df"]["After"].head(10).to_list()
             self.table_preview.setRowCount(len(before_vals))
             for i in range(len(before_vals)):
-                for j, val in enumerate((str(before_vals.iloc[i]),
-                                         str(after_vals.iloc[i]))):
+                for j, val in enumerate((str(before_vals[i]),
+                                         str(after_vals[i]))):
                     item = QTableWidgetItem(val)
                     item.setTextAlignment(Qt.AlignCenter)
                     self.table_preview.setItem(i, j, item)
@@ -380,7 +382,7 @@ class DtypeTransformerPanel(QWidget):
         self._worker.failed.connect(self._on_worker_failed)
         self._worker.start()
 
-    def _on_apply_finished(self, new_df: pd.DataFrame) -> None:
+    def _on_apply_finished(self, new_df: pl.DataFrame) -> None:
         """Handle successful dtype conversion."""
         self.bridge.set_df(new_df)
         self.operation_applied.emit(

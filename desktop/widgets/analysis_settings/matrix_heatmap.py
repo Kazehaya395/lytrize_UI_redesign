@@ -122,6 +122,16 @@ class MatrixHeatmapSettings(CorrelationSettings):
         flow.add_section(self._single_section(
             'Top N rows', self._spin_topn, '0 keeps every row'))
 
+        if getattr(self, 'supports_row_hierarchy', False):
+            for level in range(3):
+                combo = _plain_combo([NONE_SENTINEL] + keys)
+                combo.currentTextChanged.connect(
+                    lambda _text, i=level: self._on_row_hierarchy(i))
+                setattr(self, f'_combo_row_level_{level}', combo)
+                flow.add_section(self._single_section(
+                    f'Row level {level + 1}', combo,
+                    'Ordered parent-to-child grouping for drill-down'))
+
         rl.addWidget(flow)
         rl.addStretch()
         return root
@@ -174,6 +184,8 @@ class MatrixHeatmapSettings(CorrelationSettings):
             'agg': p.get('agg', MATRIX_AGGS[0]),
             'sort_rows': p.get('sort_rows', MATRIX_SORTS[0]),
             'top_n_rows': int(p.get('top_n_rows') or 0),
+            **({'row_hierarchy': list(p.get('row_hierarchy') or [])}
+               if getattr(self, 'supports_row_hierarchy', False) else {}),
         }
 
     def prefill(self, values):
@@ -203,6 +215,16 @@ class MatrixHeatmapSettings(CorrelationSettings):
             except Exception:
                 pass
         self._pending['top_n_rows'] = int(v.get('top_n_rows') or 0)
+        if getattr(self, 'supports_row_hierarchy', False):
+            hierarchy = [c for c in (v.get('row_hierarchy') or [])
+                         if c in (self._all_cols or [])][:3]
+            self._pending['row_hierarchy'] = hierarchy
+            for level in range(3):
+                w = getattr(self, f'_combo_row_level_{level}', None)
+                if w is not None:
+                    w.blockSignals(True)
+                    w.setCurrentText(hierarchy[level] if level < len(hierarchy) else NONE_SENTINEL)
+                    w.blockSignals(False)
         w = getattr(self, '_spin_topn', None)
         if w is not None:
             try:
@@ -217,3 +239,27 @@ class MatrixHeatmapSettings(CorrelationSettings):
             self._pending['x'] = list(v.get('x', []) or [])
         except Exception:
             pass
+
+    def _on_row_hierarchy(self, _level):
+        if not getattr(self, 'supports_row_hierarchy', False):
+            return
+        selected = []
+        for level in range(3):
+            combo = getattr(self, f'_combo_row_level_{level}', None)
+            value = self._clean(combo.currentText()) if combo is not None else None
+            if value and value not in selected:
+                selected.append(value)
+        self._pending['row_hierarchy'] = selected
+        if selected:
+            self._pending['index_col'] = selected[0]
+            combo = getattr(self, '_combo_index', None)
+            if combo is not None and combo.currentText() != selected[0]:
+                combo.blockSignals(True)
+                combo.setCurrentText(selected[0])
+                combo.blockSignals(False)
+        self._mark_dirty(emit=True)
+
+    def build_typography(self):
+        root = super().build_typography()
+        self._mask_rows(root, ("Value size", "Value color", "Value Color"))
+        return root

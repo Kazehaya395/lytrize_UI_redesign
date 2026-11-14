@@ -19,6 +19,7 @@ from typing import Any, Optional
 import numpy as np
 
 from modules.chart_model import make_chart_model
+from modules.runtime_paths import assets_root
 
 
 _SUPPORTED_ANALYSES = {"pie_chart", "categorical", "statistical", "time_series",
@@ -108,8 +109,8 @@ def _legacy_choropleth_model(trace: dict, layout: dict, *, uid: str,
     values = _values(trace.get("z")) or []
     if not locations or not values:
         return None
-    lookup_path = (Path(__file__).resolve().parents[1] / "assets" / "echarts" /
-                   "maps" / "natural-earth" / "lookup.json")
+    lookup_path = (assets_root() / "echarts" / "maps" / "natural-earth" /
+                   "lookup.json")
     try:
         lookup = json.loads(lookup_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):

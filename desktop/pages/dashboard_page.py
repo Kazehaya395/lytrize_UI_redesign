@@ -74,6 +74,16 @@ _REGEN_SLOW_MS = 450
 MIN_TILE_SPAN = 1
 
 
+def _df_is_empty(df) -> bool:
+    if df is None:
+        return True
+    if hasattr(df, "is_empty"):
+        return bool(df.is_empty())
+    if hasattr(df, "empty"):
+        return bool(df.empty)
+    return len(df) == 0
+
+
 # Default values for every export-style key. Imported from the export service
 # rather than restated here: the panel, the live-apply path, the preview and the
 # exported payload must all agree on the same defaults, and two hand-maintained
@@ -322,6 +332,7 @@ class DashboardPage(QWidget):
         # Set while the panel widgets are being written FROM the bridge, so the
         # change signals that fires are not mistaken for user edits.
         self._syncing_widgets = False
+        self._needs_refresh = False
         self._slicer_state_signature = self._slicer_signature(
             self.bridge.get("slicers", []) or [])
 
@@ -2324,7 +2335,7 @@ class DashboardPage(QWidget):
         ``kpi_service``; this method is now just the dialog host.
         """
         df = self.bridge.df
-        if df is None or df.empty:
+        if _df_is_empty(df):
             QMessageBox.warning(self, "No Data",
                                 "Load a dataset before adding KPIs.")
             return
@@ -2357,7 +2368,7 @@ class DashboardPage(QWidget):
         if not (0 <= index < len(kpis)):
             return
         df = self.bridge.df
-        if df is None or df.empty:
+        if _df_is_empty(df):
             QMessageBox.warning(self, "No Data",
                                 "Load a dataset before editing KPIs.")
             return
@@ -2455,21 +2466,39 @@ class DashboardPage(QWidget):
         self.bridge.set("slicers", normalized)
 
     def _sync_slicers_live(self) -> bool:
-        """Patch list/dropdown slicers and their filter metadata in place."""
+        """Patch every supported slicer widget and its filter metadata in place."""
+        import polars as pl
         if not self.report_canvas.is_ready():
             return False
         slicers = list(self.bridge.get("slicers", []) or [])
-        if any(not isinstance(s, dict) or
-               str(s.get("widget") or "list").lower() not in
-               ("list", "dropdown") for s in slicers):
-            return False
         charts = self.bridge.get("charts", []) or []
         kpis = self.bridge.get("kpis", []) or []
         cols = int(self.bridge.get("grid_cols_n", 2) or 2)
         chart_map, kpi_map = self._current_geometry(charts, kpis, cols)
         slicer_geometry = dict(getattr(self, "_slicer_geom", {}) or {})
         self._persist_geometry(chart_map, kpi_map, cols, regen=False)
-        definitions = [dict(s, index=index) for index, s in enumerate(slicers)]
+        definitions = []
+        dataset = self.bridge.polars_dataset(create_if_missing=False)
+        for index, source in enumerate(slicers):
+            slicer = dict(source or {})
+            spec = dict(slicer.get("spec") or {})
+            if str(slicer.get("widget") or "").lower() == "slider" and dataset is not None:
+                col = slicer.get("column")
+                try:
+                    dtype = dataset.schema.get(col)
+                    if dtype in (pl.Date, pl.Datetime):
+                        low, high = dataset.frame.select(pl.col(col).min(), pl.col(col).max()).collect().row(0)
+                        spec.update({"min": str(low) if low is not None else "",
+                                     "max": str(high) if high is not None else "",
+                                     "bounds_kind": "datetime"})
+                    elif dtype is not None and dtype.is_numeric():
+                        low, high = dataset.frame.select(pl.col(col).min(), pl.col(col).max()).collect().row(0)
+                        spec.update({"min": low, "max": high, "step": 1 if dtype.is_integer() else 0.01,
+                                     "bounds_kind": "numeric"})
+                except Exception:
+                    log.debug("could not prepare slicer bounds for %s", col, exc_info=True)
+            slicer["spec"] = spec
+            definitions.append(dict(slicer, index=index))
         definition_json = json.dumps(
             definitions, ensure_ascii=False, separators=(",", ":"),
             default=str, allow_nan=False)
@@ -2510,7 +2539,7 @@ class DashboardPage(QWidget):
     def _on_add_slicer(self) -> None:
         """Open the slicer form and append the card it produces."""
         df = self.bridge.df
-        if df is None or df.empty:
+        if _df_is_empty(df):
             QMessageBox.warning(self, "No Data",
                                 "Load a dataset before adding slicers.")
             return
@@ -2550,7 +2579,7 @@ class DashboardPage(QWidget):
         whichever surface creates the slicer, the board rebuilds the same way.
         """
         df = self.bridge.df
-        if df is None or df.empty:
+        if _df_is_empty(df):
             QMessageBox.warning(self, "No Data",
                                 "Load a dataset before adding slicers.")
             return
@@ -2584,7 +2613,7 @@ class DashboardPage(QWidget):
         if not (0 <= index < len(slicers)):
             return
         df = self.bridge.df
-        if df is None or df.empty:
+        if _df_is_empty(df):
             QMessageBox.warning(self, "No Data",
                                 "Load a dataset before editing slicers.")
             return
@@ -2779,7 +2808,7 @@ class DashboardPage(QWidget):
         if not charts or not active_slicers(slicers):
             return list(charts)
         df = self.bridge.df
-        if df is None or df.empty:
+        if _df_is_empty(df):
             return list(charts)
 
         recipes = {c[0]: r for c in charts
@@ -2809,7 +2838,7 @@ class DashboardPage(QWidget):
                 # default, so taking it would silently discard a title the user
                 # set in Layout.
                 out.append((uid, chart[1], rebuilt[2], *chart[3:]))
-            elif filtered.empty:
+            elif _df_is_empty(filtered):
                 empty = self._empty_fig()
                 empty["uid"] = uid
                 out.append((uid, chart[1], empty, *chart[3:]))
@@ -2836,7 +2865,7 @@ class DashboardPage(QWidget):
         from services.filter_service import distinct_values
 
         out: dict = {}
-        if df is None or df.empty:
+        if _df_is_empty(df):
             return out
         for i, s in enumerate(slicers or []):
             if not isinstance(s, dict):
@@ -2856,6 +2885,7 @@ class DashboardPage(QWidget):
         same style dict and the same arrangement. That is why a session can be
         exported and then edited on: there is nothing in between to differ.
         """
+        import polars as pl
         charts = self.bridge.get("charts", [])
         kpis = self.bridge.get("kpis", [])
         slicers = list(self.bridge.get("slicers", []) or [])
@@ -2877,6 +2907,30 @@ class DashboardPage(QWidget):
         # discarded and the card fell back to auto-place -- a drag that appears
         # to work and then springs back on the next render.
         slicer_geom = dict(getattr(self, "_slicer_geom", {}) or {})
+        # Supply real slider bounds to both the editable canvas and the saved
+        # HTML. The filter spec remains the same; these fields describe only
+        # the control range and are ignored by the filtering algebra.
+        dataset = self.bridge.polars_dataset(create_if_missing=False)
+        if dataset is not None:
+            enriched = []
+            for source in slicers:
+                item = dict(source or {})
+                spec = dict(item.get("spec") or {})
+                if str(item.get("widget") or "").lower() == "slider":
+                    try:
+                        col, dtype = item.get("column"), dataset.schema.get(item.get("column"))
+                        if col and dtype in (pl.Date, pl.Datetime):
+                            low, high = dataset.frame.select(pl.col(col).min(), pl.col(col).max()).collect().row(0)
+                            spec.update({"min": str(low)[:10], "max": str(high)[:10], "bounds_kind": "datetime"})
+                        elif col and dtype is not None and dtype.is_numeric():
+                            low, high = dataset.frame.select(pl.col(col).min(), pl.col(col).max()).collect().row(0)
+                            spec.update({"min": low, "max": high, "step": 1 if dtype.is_integer() else 0.01,
+                                         "bounds_kind": "numeric"})
+                    except Exception:
+                        log.debug("could not prepare export slider bounds", exc_info=True)
+                item["spec"] = spec
+                enriched.append(item)
+            slicers = enriched
         # FULL column-pruned dataset for the in-browser engine of the SAVED
         # file (no row cap). Built here because this is the only layer that
         # has the DataFrame -- build_export_report itself is headless.
@@ -3468,8 +3522,18 @@ class DashboardPage(QWidget):
 
     def _on_charts_changed(self, charts) -> None:
         """Handle charts_changed signal."""
+        if not self.isVisible():
+            self._needs_refresh = True
+            return
         self._refresh_charts()
         self._refresh_kpis()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if getattr(self, "_needs_refresh", False):
+            self._needs_refresh = False
+            self._refresh_charts()
+            self._refresh_kpis()
 
     # -- Chart management ---------------------------------------------------
 
@@ -3678,12 +3742,21 @@ class DashboardPage(QWidget):
                     # bug. Best-effort: if the bundle is missing we still show
                     # the stored figures (the pre-bundle behaviour).
                     try:
-                        from services.session_bundle import load_dataset
+                        from services.session_bundle import load_dataset, load_polars_dataset
+                        restored_polars = load_polars_dataset(sm.get("dataset_uri", ""))
                         restored_df = load_dataset(sm.get("dataset_uri", ""))
                         if restored_df is not None and len(restored_df):
                             self.bridge.set_df(restored_df)
                             self.data_notice.setVisible(False)
                             self.btn_reupload.setVisible(False)
+                        if restored_polars is not None:
+                            # Re-attach the native snapshot AFTER set_df: the
+                            # df_changed callback deliberately wipes it (it
+                            # guards against stale rows after legacy edits).
+                            # Without this the restored board had no native
+                            # dataset, so KPIs fell back to a pandas->Polars
+                            # round-trip that raised when pyarrow was missing.
+                            self.bridge.set_polars_dataset(restored_polars)
                         else:
                             # Task 3: the session's data is gone (deleted
                             # parquet, moved profile, pre-bundle row). The

@@ -21,11 +21,12 @@ _HOST_HTML = r"""<!doctype html>
 html,body,#lytrize-chart{width:100%;height:100%;margin:0;overflow:hidden;background:transparent}
 body{font-family:Inter,'Noto Sans',sans-serif}
 </style>
-<script src="echarts.min.js"></script><script src="lytrize_adapter.js"></script>
+<script src="echarts.min.js"></script><script src="lytrize_adapter.js"></script><script src="lytrize_map_3d.js"></script>
 </head><body><div id="lytrize-chart" role="img" aria-label="Interactive chart"></div>
 <script>
 (function(){
-  let chart=null, model=null, renderer=null, resizeTimer=0, drawRevision=0;
+  let chart=null, model=null, renderer=null, activeThemeMode=null, resizeTimer=0, drawRevision=0;
+  let lastW=0, lastH=0;
   let mapLoadFailed=false;
   const pendingMaps={};
   const root=document.getElementById('lytrize-chart');
@@ -51,9 +52,26 @@ body{font-family:Inter,'Noto Sans',sans-serif}
     if(mapLoadFailed){root.textContent='';root.style.padding='';mapLoadFailed=false;}
     const w=root.clientWidth, h=root.clientHeight;
     if(!w || !h) return;
-    const requested=(model.display&&model.display.renderer)==='svg'?'svg':'canvas';
-    if(chart&&renderer!==requested){chart.dispose();chart=null;}
-    if(!chart){chart=echarts.init(root,null,{renderer:requested,useDirtyRect:true});renderer=requested;}
+    lastW = w; lastH = h;
+    const mapView=String((model.display&&model.display.map_visualization)||'').toLowerCase();
+    if(mapView==='globe'||mapView==='extruded'){
+      if(chart){chart.dispose();chart=null;}
+      renderer='map3d';activeThemeMode=String((model.display&&model.display.theme_mode)||'light');
+      const oldCanvas=root.querySelector('canvas.lytrize-map-3d');
+      const oldTip=root.querySelector('.lytrize-map-3d-tip');
+      if(oldCanvas&&oldCanvas.__lyMode!==mapView){oldCanvas.remove();if(oldTip)oldTip.remove();}
+      const map=echarts.getMap(model.data.map.id);
+      if(!window.Lytrize3DMap||!map){root.textContent='3D map renderer or local boundary asset is unavailable.';return;}
+      window.Lytrize3DMap.render(root,model,map.geoJSON||map.geoJson||map);
+      return;
+    }
+    const previous3d=root.querySelector('canvas.lytrize-map-3d');
+    if(previous3d){previous3d.remove();const tip=root.querySelector('.lytrize-map-3d-tip');if(tip)tip.remove();}
+    const isMapOr3D = model.chart_type === 'map_plot';
+    const requested = (isMapOr3D || (model.display && model.display.renderer === 'canvas')) ? 'canvas' : 'svg';
+    const themeMode = String((model.display && model.display.theme_mode) || 'light').toLowerCase();
+    if(chart && (renderer!==requested || activeThemeMode!==themeMode)){chart.dispose();chart=null;}
+    if(!chart){chart=echarts.init(root,null,{renderer:requested});renderer=requested;activeThemeMode=themeMode;}
     chart.setOption(window.LytrizeEChartsAdapter.buildOption(model,w,h,root),
                     {notMerge:true,lazyUpdate:true});
     chart.resize({width:w,height:h});
@@ -70,7 +88,7 @@ body{font-family:Inter,'Noto Sans',sans-serif}
     if(!window.echarts || !window.LytrizeEChartsAdapter || !model) return;
     const revision=++drawRevision;
     const asset=model.data&&model.data.map&&model.data.map.asset;
-    if((model.chart_type==='map_plot'||model.chart_type==='globe_extruded_map') && asset){
+    if((model.chart_type==='map_plot') && asset){
       ensureMap(asset).then(function(){drawOption(revision);}).catch(function(error){
         if(revision!==drawRevision) return;
         mapLoadFailed=true;
@@ -85,7 +103,9 @@ body{font-family:Inter,'Noto Sans',sans-serif}
   window.lytrizeSetChartModel=function(next){model=next;draw();};
   window.lytrizeDispose=function(){if(chart){chart.dispose();chart=null;}renderer=null;model=null;};
   new ResizeObserver(function(){
-    clearTimeout(resizeTimer);resizeTimer=setTimeout(draw,90);
+    const cw = root.clientWidth, ch = root.clientHeight;
+    if (cw === lastW && ch === lastH) return;
+    clearTimeout(resizeTimer);resizeTimer=setTimeout(draw,50);
   }).observe(root);
   document.fonts&&document.fonts.ready.then(draw);
   window.addEventListener('beforeunload',window.lytrizeDispose);
@@ -94,9 +114,18 @@ body{font-family:Inter,'Noto Sans',sans-serif}
 
 
 def echarts_asset_dir() -> Path:
-    """Return the shared vendored runtime path in source and Linux packages."""
-    project_root = Path(__file__).resolve().parents[2]
-    return project_root / "backend" / "assets" / "echarts"
+    """Return the shared vendored runtime path.
+
+    Frozen builds resolve the extracted ``<bundle>/backend/assets/echarts``;
+    the source tree keeps the repo-relative path. Never raises: a missing
+    asset shows up as a failed chart, not as a broken import at startup.
+    """
+    try:
+        from modules.runtime_paths import assets_root
+        return assets_root() / "echarts"
+    except Exception:  # backend not importable yet: keep the source-tree answer
+        project_root = Path(__file__).resolve().parents[2]
+        return project_root / "backend" / "assets" / "echarts"
 
 
 class EChartsWebView(QWidget):
@@ -120,7 +149,8 @@ class EChartsWebView(QWidget):
         layout.setSpacing(0)
 
         asset_dir = echarts_asset_dir()
-        required = (asset_dir / "echarts.min.js", asset_dir / "lytrize_adapter.js")
+        required = (asset_dir / "echarts.min.js", asset_dir / "lytrize_adapter.js",
+                    asset_dir / "lytrize_map_3d.js")
         missing = [path.name for path in required if not path.is_file()]
         try:
             from PySide6.QtWebEngineCore import QWebEngineSettings

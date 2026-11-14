@@ -394,6 +394,7 @@ class ChartCard(QFrame):
         self._title = normalized.get("title", self._title)
         self.setToolTip(self._title)
         self.btn_style.setVisible(False)
+        self._rendered_once = True
         self.plot_view.set_chart_model(normalized)
 
     def set_title(self, title: str) -> None:
@@ -427,20 +428,16 @@ class ChartCard(QFrame):
         return self._fig
 
     def refresh_view(self) -> None:
-        """Re-push the current figure into the web view.
-
-        Called when the card's tab becomes visible again: a
-        ``QWebEngineView`` inside a hidden ``QTabWidget`` page does not
-        reliably run its pending page load while off-screen, so a chart
-        created while another tab was selected can stay blank until its
-        figure is replayed after the tab is shown. ``Plotly.react`` is
-        in-place, so replaying the already-computed figure is flicker-free.
-        """
+        """Re-push the current figure into the web view if not yet rendered."""
         try:
+            if getattr(self, "_rendered_once", False):
+                return
             if self._chart_model is not None and hasattr(self, "plot_view"):
                 self.plot_view.set_chart_model(self._chart_model)
+                self._rendered_once = True
             elif self._fig is not None and hasattr(self, "plot_view"):
                 self.plot_view.set_figure(self._fig)
+                self._rendered_once = True
         except Exception:
             log.debug("ChartCard.refresh_view failed", exc_info=True)
 

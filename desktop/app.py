@@ -126,6 +126,10 @@ def main() -> int:
     # first use, so this cannot be installed after the app object exists.
     _guard_crasher_emoji_fonts()
 
+    # Prevent Chromium Linux GPU/Vulkan rasterization compositor dropouts
+    os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS",
+                          "--disable-vulkan-surface --disable-gpu-rasterization --disable-zero-copy")
+
     # High-DPI: crisp fractional geometry and high-res pixmaps at any DPI.
     # Both attributes are deprecated and no-ops in Qt 6 (high-DPI scaling is
     # always on), but they are kept so an older Qt still behaves as before.

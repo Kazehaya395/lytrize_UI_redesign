@@ -30,7 +30,7 @@ def _fonts() -> list:
     """Installed font choices, with the app defaults first when present."""
     try:
         from chart_display import available_fonts
-        return available_fonts(prefer=['Inter'])
+        return [f["family"] for f in available_fonts(prefer=['Inter'])]
     except Exception:
         return ['DejaVu Sans', 'DejaVu Serif', 'DejaVu Sans Mono']
 
@@ -62,172 +62,238 @@ class StatisticalSettings(AnalysisSettingsBase):
             if not hasattr(self, attr):
                 setattr(self, attr, None)
     def prefill(self, values):
-        v = values or {}
+        self._suppress = True
         try:
-            self._pending['x'] = v.get('x', '')
-            self._pending['y'] = list(v.get('y', []) or [])
-            self._pending['palette'] = v.get('palette', None)
-        except Exception:
-            pass
-        try:
-            if getattr(self, '_combo_groupby', None) is not None:
-                opts = [NONE_SENTINEL] + list(self._group_cols or [])
-                want = self._pending.get('x') or NONE_SENTINEL
-                idx = opts.index(want) if want in opts else 0
-                self._combo_groupby.setCurrentIndex(idx)
-        except Exception:
-            pass
-        try:
-            if getattr(self, '_combo_metrics', None) is not None:
-                self._combo_metrics.set_selection(list(self._pending.get('y') or []))
-        except Exception:
-            pass
-        try:
-            if getattr(self, '_combo_palette', None) is not None and self._pending.get('palette'):
-                self._combo_palette.setCurrentText(str(self._pending['palette']))
-        except Exception:
-            pass
+            v = values or {}
+            try:
+                self._pending['x'] = v.get('x', '')
+                self._pending['y'] = list(v.get('y', []) or [])
+                self._pending['palette'] = v.get('palette', None)
+            except Exception:
+                pass
+            try:
+                if getattr(self, '_combo_groupby', None) is not None:
+                    opts = [NONE_SENTINEL] + list(self._group_cols or [])
+                    want = self._pending.get('x') or NONE_SENTINEL
+                    idx = opts.index(want) if want in opts else 0
+                    self._combo_groupby.setCurrentIndex(idx)
+            except Exception:
+                pass
+            try:
+                if getattr(self, '_combo_metrics', None) is not None:
+                    self._combo_metrics.set_selection(list(self._pending.get('y') or []))
+            except Exception:
+                pass
+            try:
+                if getattr(self, '_combo_palette', None) is not None and self._pending.get('palette'):
+                    self._combo_palette.setCurrentText(str(self._pending['palette']))
+            except Exception:
+                pass
+        finally:
+            self._suppress = False
     def prefill_layout(self, values):
+        self._suppress = True
         try:
-            from chart_display import default_layout_opts
-            base = default_layout_opts()
-        except Exception:
-            base = {}
-        base.update(values or {})
-        self._layout_opts = base
-        for attr, key in (("_le_title", "title"), ("_le_x", "x_label"), ("_le_y", "y_label"), ("_le_leg", "legend_title")):
             try:
-                w = getattr(self, attr, None)
-                if w is not None:
+                from chart_display import default_layout_opts
+                base = default_layout_opts()
+            except Exception:
+                base = {}
+            base.update(values or {})
+            self._layout_opts = base
+            for attr, key in (("_le_title", "title"), ("_le_x", "x_label"), ("_le_y", "y_label"),
+                              ("_le_y2", "y2_label"), ("_le_leg", "legend_title"),
+                              ("_le_cb", "colorbar_title"), ("_le_cb_title", "colorbar_title")):
+                try:
+                    w = getattr(self, attr, None)
+                    if w is not None:
+                        w.blockSignals(True)
+                        w.setText(str(self._layout_opts.get(key, "") or ""))
+                        w.blockSignals(False)
+                except Exception:
+                    pass
+            for attr, key in (("_ck_vals", "show_value_labels"), ("_ck_grid", "show_grid"),
+                              ("_ck_border", "show_border"), ("_ck_markers", "show_markers"),
+                              ("_ck_ann", "heatmap_show_text"), ("_ck_annot", "heatmap_show_text"),
+                              ("_cb_center_total", "donut_center_total")):
+                try:
+                    w = getattr(self, attr, None)
+                    if w is not None:
+                        w.blockSignals(True)
+                        w.setChecked(bool(self._layout_opts.get(key, False)))
+                        w.blockSignals(False)
+                except Exception:
+                    pass
+            for attr, key, dflt in (("_cb_lpos", "label_position", "outside"),
+                                    ("_cb_bmode", "bar_mode", "group"),
+                                    ("_cb_legpos", "legend_position", "Top Right"),
+                                    ("_cb_legorient", "legend_orientation", "Auto"),
+                                    ("_cb_legorder", "legend_order", "Normal"),
+                                    ("_cb_legclick", "legend_itemclick", "toggle"),
+                                    ("_cb_textinfo", "pie_textinfo", "label+percent"),
+                                    ("_cb_pdir", "pie_direction", "clockwise"),
+                                    ("_cb_lshape", "line_shape", "linear"),
+                                    ("_cb_lfill", "line_fill", "none"),
+                                    ("_cb_cbpos", "colorbar_position", "right"),
+                                    ("_cb_cb_pos", "colorbar_position", "right"),
+                                    ("_cb_cborient", "colorbar_orientation", "auto"),
+                                    ("_cb_cb_orient", "colorbar_orientation", "auto"),
+                                    ("_cb_cs", "heatmap_colorscale", "RdBu"),
+                                    ("_cb_rmode", "render_mode", "svg"),
+                                    ("_cb_ialign", "table_index_align", "left"),
+                                    ("_cb_dalign", "table_data_align", "right"),
+                                    ("_cb_numfmt", "table_number_format", ",.2f"),
+                                    ("_cb_basemap", "map_basemap", "monochrome"),
+                                    ("_cb_proj", "map_projection", "natural earth")):
+                try:
+                    w = getattr(self, attr, None)
+                    if w is None:
+                        continue
                     w.blockSignals(True)
-                    w.setText(str(self._layout_opts.get(key, "") or ""))
+                    want = str(self._layout_opts.get(key, dflt) or dflt)
+                    friendly = {"toggle": "Toggle item",
+                                "toggleothers": "Toggle others",
+                                "false": "Do nothing"}
+                    if key == "legend_itemclick":
+                        want = friendly.get(want, "")
+                        if want not in [w.itemText(i) for i in range(w.count())]:
+                            want = friendly[dflt]
+                            self._layout_opts[key] = dflt
+                    elif want not in [w.itemText(i) for i in range(w.count())]:
+                        want = dflt
+                        self._layout_opts[key] = want
+                    w.setCurrentText(want)
                     w.blockSignals(False)
-            except Exception:
-                pass
-        for attr, key in (("_ck_vals", "show_value_labels"), ("_ck_grid", "show_grid"),
-                          ("_ck_border", "show_border")):
-            try:
-                w = getattr(self, attr, None)
-                if w is not None:
-                    w.blockSignals(True)
-                    w.setChecked(bool(self._layout_opts.get(key, False)))
-                    w.blockSignals(False)
-            except Exception:
-                pass
-        for attr, key, dflt in (("_cb_lpos", "label_position", "outside"),
-                                ("_cb_bmode", "bar_mode", "group"),
-                                ("_cb_legpos", "legend_position", "Top Right"),
-                                ("_cb_legorient", "legend_orientation", "Auto"),
-                                ("_cb_legorder", "legend_order", "Normal"),
-                                ("_cb_legclick", "legend_itemclick", "toggle")):
-            try:
-                w = getattr(self, attr, None)
-                if w is None:
-                    continue
-                w.blockSignals(True)
-                want = str(self._layout_opts.get(key, dflt) or dflt)
-                # The click control shows a FRIENDLY label ("Toggle item") for a
-                # stored key ("toggle"), so the two are mapped in both directions
-                # here. Comparing the raw key against the combo's items would find
-                # no match and snap every saved click action back to the default.
-                #
-                # The STORED value must stay a key, because that is what
-                # ``collect_layout`` returns and what ``chart_display`` reads --
-                # storing the label here would make the option dead on reload.
-                friendly = {"toggle": "Toggle item",
-                            "toggleothers": "Toggle others",
-                            "false": "Do nothing"}
-                if key == "legend_itemclick":
-                    want = friendly.get(want, "")
-                    if want not in [w.itemText(i) for i in range(w.count())]:
-                        # Unrecognised (a hand-edited config, or a build that had
-                        # different keys): snap the STORED key too, so the option
-                        # is not silently dead on the next generate.
-                        want = friendly[dflt]
-                        self._layout_opts[key] = dflt
-                elif want not in [w.itemText(i) for i in range(w.count())]:
-                    # A chart saved by an older build (or hand-edited config) can
-                    # name a value this build does not offer. Snapping the stored
-                    # value back keeps ``collect_layout`` and the visible combo
-                    # in agreement -- otherwise the chart would render one way and
-                    # the settings pane would claim another.
-                    want = dflt
-                    self._layout_opts[key] = want
-                w.setCurrentText(want)
-                w.blockSignals(False)
-            except Exception:
-                pass
-        try:
-            if getattr(self, "_gap_spin", None) is not None:
-                self._gap_spin.blockSignals(True)
-                self._gap_spin.setValue(float(self._layout_opts.get("bar_gap", 0.28)))
-                self._gap_spin.blockSignals(False)
-        except Exception:
-            pass
+                except Exception:
+                    pass
+            for attr, key, dflt in (("_gap_spin", "bar_gap", 0.28),
+                                    ("_lw_spin", "line_width", 2),
+                                    ("_bins_spin", "histogram_bins", 30),
+                                    ("_op_spin", "histogram_opacity", 0.8),
+                                    ("_dh_spin", "donut_hole", 0.0),
+                                    ("_spin_donut", "donut_hole", 0.0),
+                                    ("_pl_spin", "pull_slices", 0.0),
+                                    ("_spin_pull", "pull_slices", 0.0),
+                                    ("_pr_spin", "pie_rotation", 0),
+                                    ("_spin_rot", "pie_rotation", 0),
+                                    ("_pvs_spin", "pie_value_size", 11),
+                                    ("_spin_pval", "pie_value_size", 11),
+                                    ("_ms_spin", "marker_size", 6),
+                                    ("_spin_msize", "marker_size", 6),
+                                    ("_spin_ssize", "marker_size", 6),
+                                    ("_mo_spin", "marker_opacity", 0.8),
+                                    ("_spin_sopacity", "marker_opacity", 0.8),
+                                    ("_cbtsz_spin", "colorbar_title_size", 11),
+                                    ("_spin_cbtitle_sz", "colorbar_title_size", 11),
+                                    ("_cbts_spin", "colorbar_tick_size", 10),
+                                    ("_spin_cbtick_sz", "colorbar_tick_size", 10),
+                                    ("_prec_spin", "heatmap_annotation_precision", 2),
+                                    ("_spin_annot_prec", "heatmap_annotation_precision", 2),
+                                    ("_ann_spin", "heatmap_annotation_size", 10),
+                                    ("_spin_annot_sz", "heatmap_annotation_size", 10),
+                                    ("_thh_spin", "table_header_height", 28),
+                                    ("_rqh_spin", "table_header_height", 28)):
+                try:
+                    w = getattr(self, attr, None)
+                    if w is not None:
+                        w.blockSignals(True)
+                        val = self._layout_opts.get(key, dflt)
+                        if isinstance(dflt, float):
+                            w.setValue(float(val if val is not None else dflt))
+                        else:
+                            w.setValue(int(val if val is not None else dflt))
+                        w.blockSignals(False)
+                except Exception:
+                    pass
+            for attr, key in (("_sw_pvc", "pie_value_color"), ("_sw_pcol", "pie_value_color"),
+                              ("_sw_cbtclr", "colorbar_title_color"), ("_sw_cbtitle_col", "colorbar_title_color"),
+                              ("_sw_cbtc", "colorbar_tick_color"), ("_sw_cbtick_col", "colorbar_tick_color"),
+                              ("_sw_ann", "heatmap_annotation_color"), ("_sw_annot_col", "heatmap_annotation_color")):
+                try:
+                    w = getattr(self, attr, None)
+                    if w is not None and hasattr(w, "_retint"):
+                        val = str(self._layout_opts.get(key, "auto") or "auto")
+                        w._retint(val)
+                except Exception:
+                    pass
+        finally:
+            self._suppress = False
     def _halign_key(self, label):
         """'Center' -> 'center'; anything unrecognised falls back to 'left'."""
         text = str(label or '').strip().lower()
         return text if text in HALIGNS else 'left'
 
     def prefill_typography(self, values):
+        self._suppress = True
         try:
-            from chart_display import default_typo_opts
-            base = default_typo_opts()
-        except Exception:
-            base = {}
-        base.update(values or {})
-        self._typo_opts = base
-        for attr, key in (("_cb_fam", "family"), ("_cb_fstyle", "font_style"), ("_cb_hfont", "header_family"), ("_cb_hfstyle", "header_font_style")):
             try:
-                w = getattr(self, attr, None)
+                from chart_display import default_typo_opts
+                base = default_typo_opts()
+            except Exception:
+                base = {}
+            base.update(values or {})
+            self._typo_opts = base
+            for attr, key in (("_cb_fam", "family"), ("_cb_fstyle", "font_style"), ("_cb_hfont", "header_family"), ("_cb_hfstyle", "header_font_style")):
+                try:
+                    w = getattr(self, attr, None)
+                    if w is not None:
+                        w.blockSignals(True)
+                        w.setCurrentText(str(self._typo_opts.get(key, "")))
+                        w.blockSignals(False)
+                except Exception:
+                    pass
+            for attr, key, dflt in (("_hs_spin", "header_size", 28), ("_ts_spin", "axis_title_size", 16), ("_axs_spin", "axis_tick_size", 12), ("_ls_spin", "legend_item_size", 11), ("_vs_spin", "value_label_size", 11), ("_tips_spin", "tooltip_size", 12)):
+                try:
+                    w = getattr(self, attr, None)
+                    if w is not None:
+                        w.blockSignals(True)
+                        w.setValue(int(self._typo_opts.get(key, dflt)))
+                        w.blockSignals(False)
+                except Exception:
+                    pass
+            try:
+                w = getattr(self, "_cb_halign", None)
                 if w is not None:
+                    _a = self._halign_key(self._typo_opts.get("header_align", "left"))
                     w.blockSignals(True)
-                    w.setCurrentText(str(self._typo_opts.get(key, "")))
+                    w.setCurrentText(HALIGN_LABELS[_a])
                     w.blockSignals(False)
             except Exception:
                 pass
-        for attr, key, dflt in (("_hs_spin", "header_size", 28), ("_ts_spin", "axis_title_size", 16), ("_axs_spin", "axis_tick_size", 12), ("_ls_spin", "legend_item_size", 11), ("_vs_spin", "value_label_size", 11), ("_tips_spin", "tooltip_size", 12)):
             try:
-                w = getattr(self, attr, None)
-                if w is not None:
-                    w.blockSignals(True)
-                    w.setValue(int(self._typo_opts.get(key, dflt)))
-                    w.blockSignals(False)
+                from desktop.theme import current_mode
+                mode = current_mode()
+            except Exception:
+                mode = "light"
+            auto_ink = "#f8fafc" if mode == "dark" else "#111827"
+            for attr, key in (("_sw_hcol", "header_color"), ("_sw_tcol", "axis_title_color"), ("_sw_acol", "axis_tick_color"), ("_sw_lcol", "legend_item_color"), ("_sw_vcol", "value_label_color"), ("_sw_tipcol", "tooltip_color")):
+                try:
+                    w = getattr(self, attr, None)
+                    if w is not None and hasattr(w, "_retint"):
+                        value = str(self._typo_opts.get(key, ""))
+                        w._retint("auto" if value.lower() in ("", "auto", "none") else value)
+                except Exception:
+                    pass
+            for attr, key in (("_ck_vauto", "value_label_color"), ("_ck_tipauto", "tooltip_color")):
+                try:
+                    check = getattr(self, attr, None)
+                    if check is not None:
+                        check.blockSignals(True)
+                        check.setChecked(str(self._typo_opts.get(key, "auto")).lower() == "auto")
+                        check.blockSignals(False)
+                        swatch = getattr(self, "_sw_vcol" if key == "value_label_color" else "_sw_tipcol", None)
+                        if swatch is not None:
+                            swatch.setEnabled(not check.isChecked())
+                except Exception:
+                    pass
+            try:
+                self._refresh_previews()
             except Exception:
                 pass
-        try:
-            w = getattr(self, "_cb_halign", None)
-            if w is not None:
-                _a = self._halign_key(self._typo_opts.get("header_align", "left"))
-                w.blockSignals(True)
-                w.setCurrentText(HALIGN_LABELS[_a])
-                w.blockSignals(False)
         except Exception:
             pass
-        for attr, key in (("_sw_hcol", "header_color"), ("_sw_tcol", "axis_title_color"), ("_sw_acol", "axis_tick_color"), ("_sw_lcol", "legend_item_color"), ("_sw_vcol", "value_label_color"), ("_sw_tipcol", "tooltip_color")):
-            try:
-                w = getattr(self, attr, None)
-                if w is not None and hasattr(w, "_retint"):
-                    value = str(self._typo_opts.get(key, ""))
-                    w._retint("#111827" if value.lower() == "auto" else value)
-            except Exception:
-                pass
-        for attr, key in (("_ck_vauto", "value_label_color"), ("_ck_tipauto", "tooltip_color")):
-            try:
-                check = getattr(self, attr, None)
-                if check is not None:
-                    check.blockSignals(True)
-                    check.setChecked(str(self._typo_opts.get(key, "auto")).lower() == "auto")
-                    check.blockSignals(False)
-                    swatch = getattr(self, "_sw_vcol" if key == "value_label_color" else "_sw_tipcol", None)
-                    if swatch is not None:
-                        swatch.setEnabled(not check.isChecked())
-            except Exception:
-                pass
-        try:
-            self._refresh_previews()
-        except Exception:
-            pass
+        finally:
+            self._suppress = False
     def _on_groupby(self, text):
         self._pending['x'] = None if text in ('', NONE_SENTINEL) else text
         # emit=True so the host panel learns the form is dirty (Re-Generate
@@ -432,7 +498,7 @@ class StatisticalSettings(AnalysisSettingsBase):
         # Layout edits count as changes too: they dirty the form (gates
         # Re-Generate) even though they also live-apply to the chart.
         self._dirty = True
-        if emit:
+        if emit and not getattr(self, "_suppress", False):
             try:
                 self.values_changed.emit({'layout': dict(self._layout_opts)})
             except Exception:
@@ -479,7 +545,7 @@ class StatisticalSettings(AnalysisSettingsBase):
         self._vs_spin.valueChanged.connect(lambda v: self._set_typo(value_label_size=int(v)))
         bl.addWidget(grid_row('Value size', value_size, label_w))
         value_color_row, self._ck_vauto, self._sw_vcol = self._auto_color_control(
-            'value_label_color', 'Value color')
+            'value_label_color', 'Value color', label_w)
         bl.addWidget(value_color_row)
         bl.addStretch()
         # -- Column 2: the header (the chart title) + its live preview ------
@@ -491,7 +557,7 @@ class StatisticalSettings(AnalysisSettingsBase):
         except Exception:
             pass
         hl.addWidget(grid_row('Header size', hs, label_w))
-        self._sw_hcol = color_swatch(str(self._typo_opts.get('header_color', '#6163df')), lambda c: self._set_typo(header_color=c))
+        self._sw_hcol = color_swatch(str(self._typo_opts.get('header_color', 'auto')), lambda c: self._set_typo(header_color=c))
         hl.addWidget(grid_row('Header color', self._sw_hcol, label_w))
         self._cb_hfont = QComboBox()
         cap_widget(self._cb_hfont, 220)
@@ -537,7 +603,7 @@ class StatisticalSettings(AnalysisSettingsBase):
         except Exception:
             pass
         al.addWidget(grid_row('Title size', ts, label_w))
-        self._sw_tcol = color_swatch(str(self._typo_opts.get('axis_title_color', '#cbd5e1')), lambda c: self._set_typo(axis_title_color=c))
+        self._sw_tcol = color_swatch(str(self._typo_opts.get('axis_title_color', 'auto')), lambda c: self._set_typo(axis_title_color=c))
         al.addWidget(grid_row('Title color', self._sw_tcol, label_w))
         axs = slider_with_readout(8, 24, int(self._typo_opts.get('axis_tick_size', 12)))
         self._axs_slider = axs._as_slider
@@ -547,7 +613,7 @@ class StatisticalSettings(AnalysisSettingsBase):
         except Exception:
             pass
         al.addWidget(grid_row('Axis size', axs, label_w))
-        self._sw_acol = color_swatch(str(self._typo_opts.get('axis_tick_color', '#94a3b8')), lambda c: self._set_typo(axis_tick_color=c))
+        self._sw_acol = color_swatch(str(self._typo_opts.get('axis_tick_color', 'auto')), lambda c: self._set_typo(axis_tick_color=c))
         al.addWidget(grid_row('Axis color', self._sw_acol, label_w))
         ls = slider_with_readout(8, 24, int(self._typo_opts.get('legend_item_size', 11)))
         self._ls_slider = ls._as_slider
@@ -557,14 +623,14 @@ class StatisticalSettings(AnalysisSettingsBase):
         except Exception:
             pass
         al.addWidget(grid_row('Legend size', ls, label_w))
-        self._sw_lcol = color_swatch(str(self._typo_opts.get('legend_item_color', '#e2e8f0')), lambda c: self._set_typo(legend_item_color=c, legend_title_color=c))
+        self._sw_lcol = color_swatch(str(self._typo_opts.get('legend_item_color', 'auto')), lambda c: self._set_typo(legend_item_color=c, legend_title_color=c))
         al.addWidget(grid_row('Legend color', self._sw_lcol, label_w))
         tooltip_size = slider_with_readout(8, 32, int(self._typo_opts.get('tooltip_size', 12)))
         self._tips_spin = tooltip_size._as_spin
         self._tips_spin.valueChanged.connect(lambda v: self._set_typo(tooltip_size=int(v)))
         al.addWidget(grid_row('Tooltip size', tooltip_size, label_w))
         tooltip_color_row, self._ck_tipauto, self._sw_tipcol = self._auto_color_control(
-            'tooltip_color', 'Tooltip color')
+            'tooltip_color', 'Tooltip color', label_w)
         al.addWidget(tooltip_color_row)
         al.addStretch()
         cl.addWidget(body, stretch=1)
@@ -574,18 +640,27 @@ class StatisticalSettings(AnalysisSettingsBase):
         rl.addStretch()
         self._refresh_previews()
         return root
-    def _auto_color_control(self, key, label):
-        """Color picker with a theme-aware automatic-contrast default."""
-        row = QWidget()
-        lay = QHBoxLayout(row)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(ROW_SPACING)
-        caption = QLabel(label)
-        caption.setStyleSheet(group_label_style())
-        caption.setProperty('theme_role', 'section')
-        lay.addWidget(caption)
-        lay.addStretch()
+    def _auto_color_control(self, key, label, label_w=104):
+        """Color picker with a theme-aware automatic-contrast default.
+
+        Built as one compact widget and handed to ``grid_row`` -- exactly how
+        every other typography control is built -- so the Auto tick and the
+        swatch sit hard against the caption on the same left edge as the Value
+        size / Font style controls, instead of a bespoke row whose spacing
+        drifted away from the rest of the page.
+        """
+        # Compact group: keep Auto and the swatch immediately together and
+        # push any spare horizontal space to the trailing side of the row.
+        group = QWidget()
+        # Maximum: the Auto+swatch group may never take leftover width -- it
+        # stays packed against the caption and the trailing stretch owns the
+        # rest of the row.
+        group.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        group_lay = QHBoxLayout(group)
+        group_lay.setContentsMargins(0, 0, 0, 0)
+        group_lay.setSpacing(4)
         auto = QCheckBox('Auto')
+        auto.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         auto.setToolTip('Choose a readable color automatically for the current chart theme')
         current = str(self._typo_opts.get(key, 'auto'))
         is_auto = current.lower() == 'auto'
@@ -595,9 +670,9 @@ class StatisticalSettings(AnalysisSettingsBase):
         auto.setChecked(is_auto)
         auto.toggled.connect(lambda checked: (swatch.setEnabled(not checked),
             self._set_typo(**{key: 'auto' if checked else str(swatch.text() or '#111827')})))
-        lay.addWidget(auto)
-        lay.addWidget(swatch)
-        return row, auto, swatch
+        group_lay.addWidget(auto)
+        group_lay.addWidget(swatch)
+        return grid_row(label, group, label_w), auto, swatch
     def _set_typo(self, emit=True, discrete=False, **kw):
         """Update typography options and (optionally) notify listeners.
 
@@ -617,7 +692,7 @@ class StatisticalSettings(AnalysisSettingsBase):
             self._refresh_previews()
         except Exception:
             pass
-        if emit and not no_emit:
+        if emit and not no_emit and not getattr(self, "_suppress", False):
             try:
                 self.values_changed.emit({'typography': dict(self._typo_opts),
                                           'discrete': bool(discrete)})
@@ -634,3 +709,131 @@ class StatisticalSettings(AnalysisSettingsBase):
                 apply_preview_font(self._prev2, str(self._typo_opts.get('header_family', 'Inter')), str(self._typo_opts.get('header_font_style', 'Normal')), int(self._typo_opts.get('header_size', 28)))
         except Exception:
             pass
+
+    def collect_layout(self):
+        opts = dict(self._layout_opts)
+        for attr, key in (("_le_title", "title"), ("_le_x", "x_label"), ("_le_y", "y_label"),
+                          ("_le_y2", "y2_label"), ("_le_leg", "legend_title"),
+                          ("_le_cb", "colorbar_title"), ("_le_cb_title", "colorbar_title")):
+            w = getattr(self, attr, None)
+            if w is not None:
+                try:
+                    opts[key] = str(w.text() or "").strip()
+                except Exception:
+                    pass
+        for attr, key in (("_ck_vals", "show_value_labels"), ("_ck_grid", "show_grid"),
+                          ("_ck_border", "show_border"), ("_ck_markers", "show_markers"),
+                          ("_ck_ann", "heatmap_show_text"), ("_ck_annot", "heatmap_show_text"),
+                          ("_cb_center_total", "donut_center_total")):
+            w = getattr(self, attr, None)
+            if w is not None:
+                try:
+                    opts[key] = bool(w.isChecked())
+                except Exception:
+                    pass
+        for attr, key in (("_cb_lpos", "label_position"), ("_cb_bmode", "bar_mode"),
+                          ("_cb_legpos", "legend_position"), ("_cb_legorient", "legend_orientation"),
+                          ("_cb_legorder", "legend_order"), ("_cb_textinfo", "pie_textinfo"),
+                          ("_cb_pdir", "pie_direction"), ("_cb_lshape", "line_shape"),
+                          ("_cb_lfill", "line_fill"), ("_cb_cbpos", "colorbar_position"),
+                          ("_cb_cb_pos", "colorbar_position"), ("_cb_cborient", "colorbar_orientation"),
+                          ("_cb_cb_orient", "colorbar_orientation"), ("_cb_cs", "heatmap_colorscale"),
+                          ("_cb_rmode", "render_mode"), ("_cb_ialign", "table_index_align"),
+                          ("_cb_dalign", "table_data_align"), ("_cb_numfmt", "table_number_format"),
+                          ("_cb_basemap", "map_basemap"), ("_cb_proj", "map_projection")):
+            w = getattr(self, attr, None)
+            if w is not None:
+                try:
+                    opts[key] = str(w.currentText() or "").strip()
+                except Exception:
+                    pass
+        w = getattr(self, "_cb_legclick", None)
+        if w is not None:
+            try:
+                txt = str(w.currentText() or "").lower()
+                opts["legend_itemclick"] = "toggleothers" if "others" in txt else ("none" if "nothing" in txt or "false" in txt else "toggle")
+            except Exception:
+                pass
+        for attr, key in (("_gap_spin", "bar_gap"), ("_lw_spin", "line_width"),
+                          ("_bins_spin", "histogram_bins"), ("_op_spin", "histogram_opacity"),
+                          ("_dh_spin", "donut_hole"), ("_spin_donut", "donut_hole"),
+                          ("_pl_spin", "pull_slices"), ("_spin_pull", "pull_slices"),
+                          ("_pr_spin", "pie_rotation"), ("_spin_rot", "pie_rotation"),
+                          ("_pvs_spin", "pie_value_size"), ("_spin_pval", "pie_value_size"),
+                          ("_ms_spin", "marker_size"), ("_spin_msize", "marker_size"),
+                          ("_spin_ssize", "marker_size"), ("_mo_spin", "marker_opacity"),
+                          ("_spin_sopacity", "marker_opacity"),
+                          ("_cbtsz_spin", "colorbar_title_size"), ("_spin_cbtitle_sz", "colorbar_title_size"),
+                          ("_cbts_spin", "colorbar_tick_size"), ("_spin_cbtick_sz", "colorbar_tick_size"),
+                          ("_prec_spin", "heatmap_annotation_precision"), ("_spin_annot_prec", "heatmap_annotation_precision"),
+                          ("_ann_spin", "heatmap_annotation_size"), ("_spin_annot_sz", "heatmap_annotation_size"),
+                          ("_thh_spin", "table_header_height"), ("_rqh_spin", "table_header_height")):
+            w = getattr(self, attr, None)
+            if w is not None:
+                try:
+                    opts[key] = w.value()
+                except Exception:
+                    pass
+        for attr, key in (("_sw_pvc", "pie_value_color"), ("_sw_pcol", "pie_value_color"),
+                          ("_sw_cbtclr", "colorbar_title_color"), ("_sw_cbtitle_col", "colorbar_title_color"),
+                          ("_sw_cbtc", "colorbar_tick_color"), ("_sw_cbtick_col", "colorbar_tick_color"),
+                          ("_sw_ann", "heatmap_annotation_color"), ("_sw_annot_col", "heatmap_annotation_color")):
+            w = getattr(self, attr, None)
+            if w is not None:
+                try:
+                    val = str(getattr(w, "_color_value", w.text()) or "").strip()
+                    opts[key] = "auto" if val.lower() in ("", "auto", "none") else val
+                except Exception:
+                    pass
+        self._layout_opts.update(opts)
+        return dict(self._layout_opts)
+
+    def collect_typography(self):
+        opts = dict(self._typo_opts)
+        for attr, key in (("_cb_fam", "family"), ("_cb_fstyle", "font_style"),
+                          ("_cb_hfont", "header_family"), ("_cb_hfstyle", "header_font_style")):
+            w = getattr(self, attr, None)
+            if w is not None:
+                try:
+                    opts[key] = str(w.currentText() or "").strip()
+                except Exception:
+                    pass
+        w = getattr(self, "_cb_halign", None)
+        if w is not None:
+            try:
+                opts["header_align"] = self._halign_key(w.currentText())
+            except Exception:
+                pass
+        for attr, key in (("_hs_spin", "header_size"), ("_ts_spin", "axis_title_size"),
+                          ("_axs_spin", "axis_tick_size"), ("_ls_spin", "legend_item_size"),
+                          ("_vs_spin", "value_label_size"), ("_tips_spin", "tooltip_size")):
+            w = getattr(self, attr, None)
+            if w is not None:
+                try:
+                    opts[key] = int(w.value())
+                except Exception:
+                    pass
+        for attr, key in (("_sw_hcol", "header_color"), ("_sw_tcol", "axis_title_color"),
+                          ("_sw_acol", "axis_tick_color"), ("_sw_lcol", "legend_item_color")):
+            w = getattr(self, attr, None)
+            if w is not None:
+                try:
+                    val = str(getattr(w, "_color_value", w.text()) or "").strip()
+                    opts[key] = "auto" if val.lower() in ("", "auto", "none") else val
+                except Exception:
+                    pass
+        for ck_attr, sw_attr, key in (("_ck_vauto", "_sw_vcol", "value_label_color"),
+                                      ("_ck_tipauto", "_sw_tipcol", "tooltip_color")):
+            ck = getattr(self, ck_attr, None)
+            sw = getattr(self, sw_attr, None)
+            if ck is not None and sw is not None:
+                try:
+                    if ck.isChecked():
+                        opts[key] = "auto"
+                    else:
+                        val = str(getattr(sw, "_color_value", sw.text()) or "").strip()
+                        opts[key] = "auto" if val.lower() in ("", "auto", "none") else val
+                except Exception:
+                    pass
+        self._typo_opts.update(opts)
+        return dict(self._typo_opts)

@@ -19,13 +19,14 @@
 
   function fontStyle(typography, part, size, color) {
     var heading = part === "header";
-    var style = String(typography[heading ? "header_font_style" : "font_style"] || "Normal").toLowerCase();
+    var style = String((typography || {})[heading ? "header_font_style" : "font_style"] || "Normal").toLowerCase();
+    var fallbackColor = heading ? "#111827" : "#263247";
     return {
-      fontFamily: String(typography[heading ? "header_family" : "family"] || "Inter"),
+      fontFamily: String((typography || {})[heading ? "header_family" : "family"] || "Inter"),
       fontSize: Number(size || (heading ? 20 : 12)),
       fontWeight: style.indexOf("bold") >= 0 ? 700 : 400,
       fontStyle: style.indexOf("italic") >= 0 || style.indexOf("oblique") >= 0 ? "italic" : "normal",
-      color: color || "#263247"
+      color: configuredColor(color, fallbackColor)
     };
   }
 
@@ -63,6 +64,31 @@
   function configuredColor(value, fallback) {
     var color = String(value || "").trim();
     return !color || color.toLowerCase() === "auto" ? fallback : color;
+  }
+
+  function formatCompactNumber(value) {
+    if (value === null || value === undefined || !isFinite(value)) return "";
+    var n = Number(value);
+    var sign = n < 0 ? "-" : "";
+    var abs = Math.abs(n);
+    if (abs >= 1e9) return sign + trimNum(abs / 1e9) + "B";
+    if (abs >= 1e6) return sign + trimNum(abs / 1e6) + "M";
+    if (abs >= 1e3) return sign + trimNum(abs / 1e3) + "K";
+    return sign + trimNum(abs);
+  }
+  function trimNum(v) {
+    if (v >= 100) return String(Math.round(v));
+    if (v >= 10) return String(Math.round(v * 10) / 10);
+    return String(Math.round(v * 100) / 100);
+  }
+  // Graphics are the only label surface guaranteed to paint for every ECharts
+  // component in every renderer (the continuous visualMap drops its default
+  // tick labels and its `name` on some builds), so chart chrome that must
+  // always be visible -- the colour-bar title -- is drawn this way.
+  function pushGraphic(option, item) {
+    if (!option.graphic) option.graphic = [];
+    if (!Array.isArray(option.graphic)) option.graphic = [option.graphic];
+    option.graphic.push(item);
   }
 
   function orderedNames(names, order) {
@@ -148,8 +174,19 @@
     var legendBand = !hasLegend ? 8 : legendOrientation === "vertical" ?
       Math.min(Math.max(84, height * 0.30), Math.max(84, height * 0.48)) :
       Math.max(30, Number(legend.font_size || 11) + 16);
+    var legendTitleBand = hasLegend && legendTitle ? Math.max(20,
+      Number(typography.legend_title_size || legend.title_font_size || 11) + 8) : 0;
     var sideLegend = atLeft || atRight;
+    // Width a vertical left/right legend column occupies, so the plot
+    // grid can leave room for it instead of sitting underneath it.
+    var sideLegendWidth = (sideLegend && legendOrientation === "vertical") ?
+      Math.max(74, Math.min(150, width * 0.28)) : 0;
+    var sideLegendGutter = sideLegendWidth ? sideLegendWidth + 18 : 0;
     var autoValueColor = contrastColor(root, display.text_color || "#111827", display.theme_mode);
+    var axisInk = configuredColor(typography.axis_tick_color,
+      contrastColor(root, display.text_color || "#111827", display.theme_mode));
+    var axisTitleInk = configuredColor(typography.axis_title_color, axisInk);
+    var headerInk = configuredColor(typography.header_color, axisInk);
     var oldDefaultLabelColor = ["#fff", "#ffffff", "#e2e8f0"].indexOf(
       String((labels || {}).color || "").toLowerCase()) >= 0;
     var valueLabelColor = configuredColor(typography.value_label_color,
@@ -162,7 +199,7 @@
     // computed for the card. autoValueColor is "#111827" exactly when the
     // card under the chart reads light (app light mode or a light export
     // board), so the same rule holds on screen and in exports.
-    var legendLightRemap = {"#f1f5f9": "#1e293b", "#e2e8f0": "#334155",
+    var legendLightRemap = {"#f8fafc": "#1e293b", "#f1f5f9": "#1e293b", "#e2e8f0": "#334155",
       "#cbd5e1": "#334155", "#94a3b8": "#475569", "#64748b": "#475569",
       "#f5f7ff": "#0f172a", "#ffffff": "#1e293b", "#fff": "#1e293b",
       "white": "#1e293b"};
@@ -185,7 +222,7 @@
     var isCalendar = model.chart_type === "calendar_heatmap";
     var isWaterfall = model.chart_type === "waterfall";
     var isFunnel = model.chart_type === "funnel";
-    var isGlobeMap = model.chart_type === "globe_extruded_map";
+    var isGlobeMap = false;
     var isCategorical = model.chart_type === "categorical" || model.chart_type === "bar";
     var isScatter = model.chart_type === "scatter_plot" || model.chart_type === "scatter";
     var isHeatmap = model.chart_type === "matrix_heatmap" || model.chart_type === "heatmap";
@@ -197,18 +234,18 @@
       backgroundColor: display.chart_background || "transparent",
       animation: width * height < 1000000,
       textStyle: fontStyle(typography, "body", typography.axis_tick_size,
-        typography.axis_tick_color || display.text_color),
+        axisInk),
       color: Array.isArray(color) ? color : undefined,
       title: titleText ? {
         text: titleText,
-        left: display.title_align || "left",
+        left: String(display.title_align || typography.header_align || "left").toLowerCase(),
         top: topTitle ? 4 : undefined,
         bottom: topTitle ? undefined : (hasLegend && !atTop ? legendBand + 2 : 4),
         width: Math.max(80, width - 148),
         overflow: "truncate",
         textStyle: Object.assign(fontStyle(typography, "header",
           typography.header_size || display.title_size,
-          typography.header_color || display.text_color), {overflow: "truncate"}),
+          headerInk), {overflow: "truncate"}),
         padding: [4, 8]
       } : undefined,
       legend: hasLegend ? {
@@ -217,11 +254,11 @@
         left: (atLeft || legendPos.indexOf("left") >= 0) ? 6 :
           atCenter ? "center" : (atEnd || atRight) ? undefined : 8 + legendTitleWidth,
         right: (atEnd || atRight) ? 6 : undefined,
-        top: atTop ? titleBand + 2 : sideLegend ? "middle" : undefined,
+        top: atTop ? titleBand + legendTitleBand + 2 : sideLegend ? "middle" : undefined,
         bottom: atBottom ? (titleText && !topTitle ? titleBand + 2 : 2) : undefined,
-        width: sideLegend && legendOrientation === "vertical" ? Math.max(74, Math.min(150, width * 0.28)) :
+        width: sideLegend ? Math.max(74, Math.min(150, width * 0.28)) :
           Math.max(40, width - legendTitleWidth - 16),
-        height: sideLegend && legendOrientation === "vertical" ? Math.max(40, height - titleBand - 12) : legendBand,
+        height: sideLegend ? Math.max(40, height - titleBand - 12) : legendBand,
         pageIconSize: 9,
         itemWidth: 10,
         itemHeight: 10,
@@ -229,7 +266,8 @@
         textStyle: fontStyle(typography, "body",
           typography.legend_item_size || legend.font_size,
           legendItemColor),
-        selectedMode: legend.click !== false,
+        selectedMode: (legend.click === false || layout.legend_itemclick === "false" || layout.legend_itemclick === "none") ? false :
+          (layout.legend_itemclick === "toggleothers" || legend.click === "single") ? "single" : true,
         borderColor: layout.show_border ? (display.text_color || "#64748b") : "transparent",
         borderWidth: layout.show_border ? 1 : 0,
         padding: layout.show_border ? 6 : 2
@@ -241,23 +279,35 @@
       series: []
     };
     if (hasLegend && legendTitle) {
-      var titleY = atTop ? titleBand + 9 : atBottom ?
-        height - legendBand - (titleText && !topTitle ? titleBand : 0) + 9 : "middle";
-      option.graphic = [{type: "text",
-        left: sideLegend && atRight ? Math.max(8, width - Math.min(150, width * 0.28) + 8) : atCenter ? "center" : atEnd ? undefined : 8,
-        right: atEnd ? 8 : undefined,
-        top: sideLegend ? (atTop ? titleBand + 4 : "middle") : titleY,
+      // The title always sits directly ABOVE the legend category list, for
+      // horizontal and vertical legends alike (left / right / top / bottom).
+      var sideTop = (titleText && !topTitle) ? 4 : 8;
+      var legendTitleTop = sideLegend ? (atTop ? titleBand + 3 : sideTop)
+        : (atTop ? titleBand + 3
+          : atBottom ? height - legendBand - legendTitleBand - 2
+          : sideTop);
+      // style.x/style.y + textAlign are the only reliable graphic-text
+      // anchors (see the colour-bar title fix) -- style.align is ignored.
+      var titleX, titleAlign;
+      if (atCenter) { titleX = width / 2; titleAlign = "center"; }
+      else if (atEnd || atRight) { titleX = width - 8; titleAlign = "right"; }
+      else { titleX = 8; titleAlign = "start"; }
+      pushGraphic(option, {type: "text",
         silent: true, style: {text: legendTitle,
-          align: atCenter ? "center" : atEnd ? "right" : "left",
+          x: titleX,
+          y: legendTitleTop + Math.max(10, legendTitleBand / 2),
+          textAlign: titleAlign,
+          textVerticalAlign: "middle",
           fill: legendTitleColor,
           font: (String(typography.font_style || "Normal").toLowerCase().indexOf("italic") >= 0 ? "italic " : "") +
             (String(typography.font_style || "Normal").toLowerCase().indexOf("bold") >= 0 ? "700 " : "400 ") +
             Number(typography.legend_title_size || legend.title_font_size || legend.font_size || 11) + "px \"" +
-            String(typography.family || "Inter") + "\""}}];
-      if (sideLegend && hasLegend && legendOrientation === "vertical") {
-        option.legend.top = atTop ? titleBand + legendBand + 2 : 8;
-        option.legend.bottom = atBottom ? titleBand + legendBand + 2 : 8;
-        option.legend.height = Math.max(36, height - titleBand - legendBand - 12);
+            String(typography.family || "Inter") + "\""}});
+      if (sideLegend) {
+        // Start the category list below its title instead of underneath it.
+        option.legend.top = legendTitleTop + legendTitleBand;
+        option.legend.bottom = 4;
+        option.legend.height = Math.max(36, height - option.legend.top - 10);
       }
     }
     if (option.legend && layout.legend_labels && typeof layout.legend_labels === "object") {
@@ -313,10 +363,10 @@
         cellSize: display.calendar_cell_size || ["auto", 18],
         orient: display.calendar_orient || "horizontal",
         yearLabel: {show: display.calendar_year_label !== false,
-          color: typography.axis_tick_color || display.text_color},
-        monthLabel: {color: typography.axis_tick_color || display.text_color,
+          color: axisInk},
+        monthLabel: {color: axisInk,
           fontSize: Number(typography.axis_tick_size || 11)},
-        dayLabel: {firstDay: 1, color: typography.axis_tick_color || display.text_color,
+        dayLabel: {firstDay: 1, color: axisInk,
           fontSize: Number(typography.axis_tick_size || 10)}};
       option.visualMap = {min: dateMin, max: dateMax, calculable: false,
         orient: "horizontal", left: "center", bottom: 0,
@@ -342,6 +392,9 @@
         textStyle: fontStyle(typography, "body", typography.legend_item_size || 11, legendItemColor)};
       option.grid = {left: 58, right: 22, top: titleBand + 8,
         bottom: Math.max(legendBand, 28) + (!topTitle ? titleBand : 8), containLabel: true};
+      if (sideLegendGutter) {
+        if (atLeft) option.grid.left += sideLegendGutter; else option.grid.right += sideLegendGutter;
+      }
       option.xAxis = {type: "category", data: water.map(function (pair) { return pair[0]; }),
         axisLabel: Object.assign(fontStyle(typography, "body", typography.axis_tick_size || 11, valueLabelColor), {hideOverlap: true})};
       option.yAxis = {type: "value", axisLabel: fontStyle(typography, "body", typography.axis_tick_size || 11, valueLabelColor),
@@ -447,8 +500,20 @@
             borderColor: mapDisplay.map_borders ? (mapDisplay.map_border_color || "#9aa8ba") : "transparent",
             borderWidth: mapDisplay.map_borders ? 0.55 : 0},
           emphasis: {itemStyle: {areaColor: mapDisplay.map_emphasis_color || "#cbd5e1"}}};
-        option.visualMap.dimension = 2;
-        option.visualMap.seriesIndex = 0;
+        // A continuous visualMap bound to dimension 2 turns points whose
+        // third value is null into fill="none" -- the whole scatter vanishes
+        // even with show:false. Bind it only when the model really carries a
+        // numeric colour dimension (or this is a density grid, whose cells
+        // always carry a count); otherwise drop it and let itemStyle paint.
+        if (isDensityMap || mapDisplay.map_numeric_color === true) {
+          option.visualMap.dimension = 2;
+          option.visualMap.seriesIndex = 0;
+          // Belt and braces: an out-of-range colour so null cells paint gray
+          // instead of disappearing.
+          option.visualMap.outOfRange = {color: ["#64748b"]};
+        } else {
+          option.visualMap = undefined;
+        }
         if (isDensityMap) {
           var densityValues = (mapSeries.values || []).map(function (item) {
             return {name: item.name || "Density", value: item.value,
@@ -504,7 +569,8 @@
     } else if (isPie) {
       var source = series[0] || {values: []};
       var pieData = (source.values || []).map(function (pair) {
-        return {name: String(pair[0] == null ? "" : pair[0]), value: cleanNumber(pair[1])};
+        return {name: String(pair[0] == null ? "" : pair[0]), value: cleanNumber(pair[1]),
+          selected: Number(display.pull_slices || 0) > 0};
       }).filter(function (point) { return point.value !== null; });
       if (option.legend && option.legend.show !== false) {
         option.legend.data = orderedNames(pieData.map(function (point) { return point.name; }), layout.legend_order);
@@ -530,17 +596,16 @@
         // vertical legend. Move it above the compact horizontal legend so it
         // does not sit over the pie after the responsive fallback.
         if (legendTitle && Array.isArray(option.graphic) && option.graphic.length) {
-          option.graphic[0].left = "center";
-          option.graphic[0].right = undefined;
-          option.graphic[0].top = Math.max(0, height - legendBand -
-            (titleText && !topTitle ? titleBand : 0) - 14);
-          option.graphic[0].style.align = "center";
+          option.graphic[0].style.x = width / 2;
+          option.graphic[0].style.textAlign = "center";
+          option.graphic[0].style.y = Math.max(6, height - legendBand -
+            (titleText && !topTitle ? titleBand : 0) - legendTitleBand / 2 - 2);
         }
       }
       var pieLegendWidth = sideLegend && hasLegend ?
         Math.min(180, Math.max(76, width * 0.30)) : 0;
       var pieTop = (topTitle && titleText ? titleBand + 5 : 8) +
-        (atTop && hasLegend ? legendBand + 4 : 0);
+        (atTop && hasLegend ? legendBand + legendTitleBand + 4 : 0);
       var pieBottom = (!topTitle && titleText ? titleBand + 5 : 8) +
         (atBottom && hasLegend ? legendBand + 4 : 0);
       var pieLeft = 8, pieRight = Math.max(8, width - 8);
@@ -570,6 +635,10 @@
         radius: [display.donut ? (Number(display.donut_ratio || 38) + "%") : 0,
           outerRadius],
         center: [cx, cy], data: pieData,
+        // boolean true means 'single' in ECharts 6; the Pull option pulls ALL slices.
+        selectedMode: Number(display.pull_slices || 0) > 0 ? "multiple" : false,
+        selectedOffset: Math.round(outerRadius * Math.max(0, Math.min(0.5,
+          Number(display.pull_slices || 0)))),
         startAngle: Number(display.rotation || 0),
         clockwise: display.direction !== "counterclockwise",
         avoidLabelOverlap: true,
@@ -590,55 +659,84 @@
           return sum + (Number.isFinite(point.value) ? point.value : 0);
         }, 0);
         var totalText;
+        var absTotal = Math.abs(centerTotal), compactSuffix = "", compactValue = centerTotal;
+        if (absTotal >= 1e9) { compactValue = centerTotal / 1e9; compactSuffix = "B"; }
+        else if (absTotal >= 1e6) { compactValue = centerTotal / 1e6; compactSuffix = "M"; }
+        else if (absTotal >= 1e3) { compactValue = centerTotal / 1e3; compactSuffix = "K"; }
         try {
           totalText = new Intl.NumberFormat(undefined, {
-            maximumFractionDigits: Number(display.center_total_precision == null ? 2 : display.center_total_precision)
-          }).format(centerTotal);
-        } catch (e) { totalText = String(Math.round(centerTotal * 100) / 100); }
-        // Graphic `left`/`top` place the text element's bounding box by its
-        // upper-left corner. Passing the pie center directly there shifted
-        // the total right and down by half its own size. Give the text a box
-        // matching the donut hole and center that box on the actual pie
-        // center, which also stays correct when a side legend shifts the pie.
-        var centerHole = outerRadius * Math.max(0, Math.min(0.9,
-          Number(display.donut_ratio || 38) / 100));
-        var centerBoxWidth = Math.max(24, centerHole * 2);
-        var centerBoxHeight = Math.max(24, Math.min(40, centerHole * 1.5));
+            maximumFractionDigits: compactSuffix ? 2 : Number(display.center_total_precision == null ? 2 : display.center_total_precision)
+          }).format(compactValue) + compactSuffix;
+        } catch (e) { totalText = String(Math.round(compactValue * 100) / 100) + compactSuffix; }
+        // ECharts graphic text honours textAlign/textVerticalAlign only
+        // through style.x/style.y; style.align with left/top is silently
+        // ignored and left-anchored the total beside the donut. Placing
+        // style.x/style.y on the pie centre pins it to the absolute centre
+        // no matter where a side legend moved the pie.
         option.graphic = (option.graphic || []).concat([{
-          type: "text", left: cx - centerBoxWidth / 2,
-          top: cy - centerBoxHeight / 2, z: 20, silent: true,
+          type: "text", z: 20, silent: true,
           style: {text: "Total\n" + totalText,
-            width: centerBoxWidth, height: centerBoxHeight,
-            overflow: "break", align: "center", verticalAlign: "middle", lineHeight: 18,
-            fill: configuredColor(typography.center_total_color, autoValueColor),
-            font: "600 " + Math.max(10, Math.min(16, Number(typography.value_label_size || 12))) + "px " +
+            x: cx, y: cy,
+            textAlign: "center", textVerticalAlign: "middle",
+            lineHeight: 18,
+            fill: configuredColor(display.center_total_color || typography.pie_center_total_color, autoValueColor),
+            font: "600 " + Math.max(8, Math.min(28, Number(display.center_total_size || typography.pie_center_total_size || 12))) + "px " +
               String(typography.family || "Inter")}
         }]);
       }
     } else if (isScatter) {
-      var scatterTop = (topTitle ? titleBand : 12) + (atTop && hasLegend ? legendBand : 4);
-      var scatterBottom = (!atTop && hasLegend ? legendBand : 8) + (!topTitle ? titleBand : 8);
-      option.grid = {left: 58, right: 20, top: scatterTop, bottom: scatterBottom, containLabel: true};
+      var scatterTop = (topTitle ? titleBand : 12) + (atTop && hasLegend ? legendBand + legendTitleBand : 4);
+      var scatterBottom = (!atTop && hasLegend ? legendBand + legendTitleBand : 8) + (!topTitle ? titleBand : 8);
+      option.grid = {left: 58, right: 20, top: scatterTop, bottom: scatterBottom,
+        containLabel: true, show: !!display.show_border,
+        borderWidth: display.show_border ? 1 : 0,
+        borderColor: display.border_color || "#cbd5e1"};
+      if (sideLegendGutter) {
+        if (atLeft) option.grid.left += sideLegendGutter; else option.grid.right += sideLegendGutter;
+      }
       option.xAxis = {type: "value", name: display.x_title || "", scale: true,
-        axisLabel: fontStyle(typography, "body", typography.axis_tick_size, typography.axis_tick_color),
-        nameTextStyle: fontStyle(typography, "body", typography.axis_title_size, typography.axis_title_color)};
+        axisLabel: fontStyle(typography, "body", typography.axis_tick_size, axisInk),
+        nameTextStyle: fontStyle(typography, "body", typography.axis_title_size, axisTitleInk),
+        splitLine: {show: display.show_grid !== false, lineStyle: {opacity: 0.18, color: axisInk}}};
       option.yAxis = {type: "value", name: display.y_title || "", scale: true,
-        axisLabel: fontStyle(typography, "body", typography.axis_tick_size, typography.axis_tick_color),
-        nameTextStyle: fontStyle(typography, "body", typography.axis_title_size, typography.axis_title_color)};
+        axisLabel: fontStyle(typography, "body", typography.axis_tick_size, axisInk),
+        nameTextStyle: fontStyle(typography, "body", typography.axis_title_size, axisTitleInk),
+        splitLine: {show: display.show_grid !== false, lineStyle: {opacity: 0.18, color: axisInk}}};
       option.series = series.map(function (s, i) {
         if (s.type === "line") {
           var lineStyle = s.style || {};
+          // Line shape is the SAME interpolation vocabulary the line charts
+          // use (linear / spline / hv / vh / hvh / vhv) -- it drives the
+          // trendline's smoothing and step mode. The previous build mapped
+          // "diamond"/"triangle" onto the point symbols and "dashed"/
+          // "dotted" onto the dash, none of which exist in LINE_SHAPES, so
+          // the control looked connected while every chart drew a dashed
+          // circle-marked line. trend dash stays dashed unless the series
+          // carries its own dash; interpolation is the line_shape's job.
+          var trendShape = String(display.line_shape || "linear").toLowerCase();
+          var trendStepShapes = ["hv", "vh", "hvh", "vhv"];
+          var trendStep = trendStepShapes.indexOf(trendShape) >= 0 ?
+            (trendShape === "vh" || trendShape === "vhv" ? "end" :
+              (trendShape === "hvh" ? "middle" : "start")) : undefined;
           return {id: s.id || "series-" + i, name: s.name || "Trend",
-            type: "line", data: (s.values || []).map(function (pair) {
+            type: "line", smooth: trendShape === "spline", step: trendStep,
+            data: (s.values || []).map(function (pair) {
               return [cleanNumber(pair[0]), cleanNumber(pair[1])];
             }).filter(function (pair) { return pair[0] !== null && pair[1] !== null; }),
             showSymbol: false, symbol: "none", silent: true,
-            lineStyle: {color: lineStyle.color || "#ef4444", width: 2,
-              type: lineStyle.dash || "dashed"},
+            lineStyle: {color: lineStyle.color || "#ef4444",
+              width: Number(display.line_width || lineStyle.width || 2),
+              type: display.line_shape === "dashed" ? "dashed" :
+                (display.line_shape === "dotted" ? "dotted" : (lineStyle.dash || "dashed"))},
+            areaStyle: display.line_fill && display.line_fill !== "none" ? {opacity: 0.16} : undefined,
             tooltip: {show: false}, z: 4};
         }
         return {id: s.id || "series-" + i, name: s.name || s.id || "Series " + (i + 1),
-          type: "scatter", symbolSize: display.size_by_value ? function (value) {
+          // A scatter draws bare points; the marker shape has no dedicated
+          // control of its own, so keep the established circle instead of
+          // the old dead "diamond"/"triangle" mapping off line_shape.
+          type: "scatter", symbol: "circle",
+          symbolSize: display.size_by_value ? function (value) {
             return Number(value && value[2] || display.symbol_size || 6);
           } : Number(display.symbol_size || 8),
           itemStyle: {opacity: Number(display.symbol_opacity || 0.8),
@@ -667,6 +765,18 @@
         .filter(function (v) { return v !== null; });
       var minValue = numericValues.length ? Math.min.apply(null, numericValues) : 0;
       var maxValue = numericValues.length ? Math.max.apply(null, numericValues) : 1;
+      // Typography "Value colour" is the general ink for chart values. A
+      // heatmap keeps its data ink inside the cells -- the Layout "Ann
+      // color" control owns those -- so Value colour carries the matrix's
+      // tick labels. Precedence: an explicitly configured Value colour
+      // wins; otherwise the explicitly configured Axis colour; otherwise
+      // the auto contrast ink.
+      var heatTickInk = configuredColor(typography.value_label_color,
+        configuredColor(typography.axis_tick_color, autoValueColor));
+      // The Value ink doubles as the fallback for the matrix axis titles --
+      // "Value colour" is the chart's value ink (ticks, axis headers, other
+      // chart values); an explicitly set axis-title colour still wins.
+      var heatAxisTitleInk = configuredColor(typography.axis_title_color, heatTickInk);
       option.grid = {
         left: 76 + (colorbarVertical && colorbarAtLeft ? 54 : 0),
         right: 20 + (colorbarVertical && colorbarAtRight ? 54 : 0),
@@ -677,41 +787,88 @@
         containLabel: true};
       option.xAxis = {type: "category", data: columns, name: display.x_title || "",
         splitArea: {show: true}, axisLabel: Object.assign(fontStyle(typography, "body",
-          typography.axis_tick_size, typography.axis_tick_color), {hideOverlap: true}),
-        nameTextStyle: fontStyle(typography, "body", typography.axis_title_size, typography.axis_title_color)};
+          typography.axis_tick_size, heatTickInk), {hideOverlap: true}),
+        nameTextStyle: fontStyle(typography, "body", typography.axis_title_size, heatAxisTitleInk)};
       option.yAxis = {type: "category", data: rows, name: display.y_title || "",
         splitArea: {show: true}, axisLabel: Object.assign(fontStyle(typography, "body",
-          typography.axis_tick_size, typography.axis_tick_color), {hideOverlap: true}),
-        nameTextStyle: fontStyle(typography, "body", typography.axis_title_size, typography.axis_title_color)};
+          typography.axis_tick_size, heatTickInk), {hideOverlap: true}),
+        nameTextStyle: fontStyle(typography, "body", typography.axis_title_size, heatAxisTitleInk)};
+      var colorbarMin = display.heatmap_min == null ? minValue : display.heatmap_min;
+      var colorbarMax = display.heatmap_max == null ? maxValue : display.heatmap_max;
+      var colorbarTickInk = configuredColor(display.colorbar_tick_color || display.text_color,
+        autoValueColor);
+      var colorbarTitleInk = configuredColor(display.colorbar_title_color || display.text_color,
+        colorbarTickInk);
+      // The continuous visualMap draws NO tick labels unless calculable:true
+      // (which would add draggable data-filtering handles -- not a display
+      // colorbar) or an explicit text pair is given. Supply one.
+      // Geometry semantics: vertical -> itemWidth = bar WIDTH,
+      // itemHeight = bar LENGTH; horizontal -> itemWidth = bar LENGTH
+      // (defaulting to a nearly invisible 20px), itemHeight = thickness.
+      var colorbarBarLength = colorbarVertical ? Math.max(90, Math.round(height * 0.62))
+        : Math.min(Math.max(160, Math.round(width * 0.36)), 340);
+      var colorbarBarThickness = colorbarVertical ? 14 : 12;
       option.visualMap = {
         show: display.show_colorbar !== false,
-        min: display.heatmap_min == null ? minValue : display.heatmap_min,
-        max: display.heatmap_max == null ? maxValue : display.heatmap_max,
+        type: "continuous",
+        dimension: 2, seriesIndex: 0,
+        min: colorbarMin,
+        max: colorbarMax,
         calculable: false,
         orient: colorbarVertical ? "vertical" : "horizontal",
         left: colorbarVertical ? (colorbarAtLeft ? 4 : undefined) : "center",
         right: colorbarVertical && colorbarAtRight ? 4 : undefined,
         top: colorbarVertical ? "middle" : (colorbarAtTop ? (topTitle ? titleBand + 4 : 8) : undefined),
-        bottom: !colorbarVertical && !colorbarAtTop ? 4 : undefined,
-        itemWidth: colorbarVertical ? 12 : undefined,
-        itemHeight: colorbarVertical ? Math.max(80, Math.round(height * 0.62)) : 10,
-        name: display.colorbar_title || "",
-        nameLocation: "middle",
-        nameGap: Number(display.colorbar_title_size || 11) + 8,
+        bottom: !colorbarVertical && !colorbarAtTop ? 6 : undefined,
+        itemWidth: colorbarVertical ? colorbarBarThickness : colorbarBarLength,
+        itemHeight: colorbarVertical ? colorbarBarLength : colorbarBarThickness,
+        text: [formatCompactNumber(colorbarMax), formatCompactNumber(colorbarMin)],
+        textGap: 6,
         inRange: display.heatmap_colors ? {color: display.heatmap_colors} : undefined,
-        borderColor: display.colorbar_border ? "rgba(100,116,139,.55)" : "transparent",
+        borderColor: display.colorbar_border ? "#94a3b8" : "transparent",
         borderWidth: display.colorbar_border ? 1 : 0,
         textStyle: fontStyle(typography, "body", display.colorbar_tick_size || 10,
-          display.colorbar_tick_color || display.text_color || "#263247"),
-        nameTextStyle: fontStyle(typography, "body", display.colorbar_title_size || 11,
-          display.colorbar_title_color || display.text_color || "#263247")};
+          colorbarTickInk)};
+      // The colour-bar title is drawn by the host, not by visualMap: the
+      // continuous visualMap silently drops its `name` on some builds, which
+      // is why a custom title never appeared.
+      var colorbarTitle = String(display.colorbar_title || "").trim();
+      if (display.show_colorbar !== false && colorbarTitle) {
+        var cbTitleSize = Number(display.colorbar_title_size || 11);
+        var cbTitleFont = (String(typography.font_style || "Normal").toLowerCase().indexOf("italic") >= 0 ? "italic " : "") +
+          (String(typography.font_style || "Normal").toLowerCase().indexOf("bold") >= 0 ? "700 " : "400 ") +
+          cbTitleSize + "px \"" + String(typography.family || "Inter") + "\"";
+        // ECharts graphic text only honours textAlign/textVerticalAlign via
+        // style.x/style.y; style.align with left/right/top clips the title
+        // past the canvas edge. Anchor deterministically instead.
+        var cbTitleItem = {type: "text", silent: true, style: {
+          text: colorbarTitle,
+          fill: colorbarTitleInk, font: cbTitleFont,
+          textAlign: "center", textVerticalAlign: "middle"}};
+        if (colorbarVertical) {
+          var barTop = Math.round((height - colorbarBarLength) / 2);
+          cbTitleItem.style.y = Math.max(2, barTop - cbTitleSize - 4) + cbTitleSize / 2;
+          if (colorbarAtRight) { cbTitleItem.style.x = width - 2; cbTitleItem.style.textAlign = "right"; }
+          else if (colorbarAtLeft) { cbTitleItem.style.x = 2; cbTitleItem.style.textAlign = "start"; }
+          else { cbTitleItem.style.x = width / 2; }
+        } else if (colorbarAtTop) {
+          // Just below the bar, inside the reserved colour-bar space.
+          cbTitleItem.style.x = width / 2;
+          cbTitleItem.style.y = (topTitle ? titleBand + 4 : 8) + colorbarBarThickness + 3 + cbTitleSize / 2;
+        } else {
+          // Just above the bottom bar, inside the reserved colour-bar space.
+          cbTitleItem.style.x = width / 2;
+          cbTitleItem.style.y = height - 6 - colorbarBarThickness - 4 - cbTitleSize / 2;
+        }
+        pushGraphic(option, cbTitleItem);
+      }
       option.series = [{id: (series[0] && series[0].id) || "heatmap",
         name: (series[0] && series[0].name) || "Value", type: "heatmap",
         data: heatValues.map(function (point) {
           return [columns.indexOf(point[0]), rows.indexOf(point[1]), cleanNumber(point[2])];
         }).filter(function (point) { return point[0] >= 0 && point[1] >= 0 && point[2] !== null; }),
         label: Object.assign(fontStyle(typography, "body", labels.font_size || typography.value_label_size || 10,
-          valueLabelColor), {
+          configuredColor(labels.color, autoValueColor)), {
           show: labels.show !== false && width > 420 && height > 300,
           formatter: function (params) {
             var value = params.value && params.value[2];
@@ -729,12 +886,17 @@
         });
       });
       var horizontal = display.orientation === "horizontal";
-      var gridTop = (topTitle ? titleBand : 12) + (atTop && hasLegend ? legendBand : 4);
-      var gridBottom = (!atTop && hasLegend ? legendBand : 8) + (!topTitle ? titleBand : 8);
-      var axisColor = display.text_color || "#263247";
+      var gridTop = (topTitle ? titleBand : 12) + (atTop && hasLegend ? legendBand + legendTitleBand : 4);
+      var gridBottom = (!atTop && hasLegend ? legendBand + legendTitleBand : 8) + (!topTitle ? titleBand : 8);
+      var axisColor = axisInk;
       var axisLabelStyle = Object.assign(fontStyle(typography, "body",
-        typography.axis_tick_size, typography.axis_tick_color || axisColor), {hideOverlap: true});
-      option.grid = {left: horizontal ? 68 : 54, right: 22, top: gridTop,
+        typography.axis_tick_size, axisColor), {hideOverlap: true});
+      var showBorder = display.show_border !== undefined ? !!display.show_border : !!layout.show_border;
+      option.grid = {
+        show: showBorder,
+        borderWidth: showBorder ? 1 : 0,
+        borderColor: configuredColor(display.border_color || layout.border_color, "#cbd5e1"),
+        left: horizontal ? 68 : 54, right: 22, top: gridTop,
         bottom: gridBottom, containLabel: true};
       var dualXAxis = display.dual_axis && display.dual_axis_orientation === "x";
       var dualYAxis = display.dual_axis && !dualXAxis;
@@ -751,13 +913,17 @@
         position: "right", scale: true, axisLabel: axisLabelStyle,
         splitLine: {show: false}};
       option.yAxis = dualYAxis ? [primaryYAxis, secondaryYAxis] : primaryYAxis;
-      if (dualYAxis) option.grid.right = 64;
+      if (dualYAxis) option.grid.right = Math.max(option.grid.right, 64);
       if (dualXAxis) option.grid.top = gridTop + 24;
+      if (sideLegendGutter) {
+        if (atLeft) option.grid.left += sideLegendGutter; else option.grid.right += sideLegendGutter;
+      }
+      var showGrid = (display.show_grid !== undefined) ? !!display.show_grid : (layout.show_grid !== false);
       [].concat(option.xAxis, option.yAxis).forEach(function (axis) {
         axis.nameTextStyle = fontStyle(typography, "body",
-          typography.axis_title_size, typography.axis_title_color || axisColor);
+          typography.axis_title_size, axisTitleInk);
         axis.axisLine = {lineStyle: {color: axisColor}};
-        axis.splitLine = {show: layout.show_grid !== false && axis !== secondaryYAxis && !horizontal && axis.type === "value",
+        axis.splitLine = {show: showGrid && axis !== secondaryYAxis && axis.type === "value",
           lineStyle: {color: axisColor, opacity: 0.18}};
       });
       var paletteColors = (Array.isArray(display.palette) && display.palette.length) ? display.palette :
@@ -779,6 +945,9 @@
         var seriesStyle = s.style || {};
         (s.values || []).forEach(function (pair) { lookup[String(pair[0])] = cleanNumber(pair[1]); });
         var isLine = s.type === "line";
+        var axisLabelsVisible = Number(s.axis) === 1 ?
+          (display.secondary_show_value_labels !== undefined ? !!display.secondary_show_value_labels : labels.show !== false) :
+          (display.primary_show_value_labels !== undefined ? !!display.primary_show_value_labels : labels.show !== false);
         var data = categories.map(function (category, pointIndex) {
           var value = lookup[category];
           if (isLine && horizontal && dualXAxis) {
@@ -820,9 +989,11 @@
           itemStyle: !isLine && display.histogram_opacity !== undefined ?
             {opacity: Number(display.histogram_opacity)} : undefined,
           barMaxWidth: isCategorical ? 48 : undefined,
-          label: isCategorical && labels.show !== false ? {
-            show: true, position: labels.position === "outside" ?
-              (horizontal ? "right" : "top") : (labels.position || "top"),
+          label: {
+            show: axisLabelsVisible,
+            position: (labels.position || layout.label_position) === "inside" ? "inside" :
+              ((labels.position || layout.label_position) === "outside" ?
+                (horizontal ? "right" : "top") : ((labels.position || layout.label_position) || "top")),
             color: valueLabelColor,
             fontSize: Number(labels.font_size || typography.value_label_size || 11),
             fontFamily: String(typography.family || "Inter"),
@@ -832,7 +1003,7 @@
               var value = params.value && typeof params.value === "object" ? params.value.value : params.value;
               return value == null ? "" : String(value);
             }
-          } : undefined,
+          },
           data: data};
       });
       if (option.legend) {

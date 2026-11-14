@@ -14,7 +14,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-import pandas as pd
+import polars as pl
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -307,7 +307,7 @@ class UploadPage(QWidget):
         self._import_worker.failed.connect(self._on_import_failed)
         self._import_worker.start()
 
-    def _on_import_finished(self, df: pd.DataFrame) -> None:
+    def _on_import_finished(self, df: pl.DataFrame) -> None:
         """Handle successful import from the worker thread."""
         path = Path(self._current_file or "")
         self.progress.setValue(60)
@@ -377,7 +377,7 @@ class UploadPage(QWidget):
         self.progress.setVisible(False)
         self.btn_import.setEnabled(True)
 
-    def _on_df_changed(self, df: pd.DataFrame) -> None:
+    def _on_df_changed(self, df: pl.DataFrame) -> None:
         """Handle a DataFrame change from the session bridge."""
         self._model.set_dataframe(df)
         self._update_preview_label()
@@ -448,7 +448,7 @@ class UploadPage(QWidget):
         after the user pauses typing for the debounce interval."""
         df = self.bridge.df
         if df is None or not self._pending_search_text.strip():
-            self._model.set_dataframe(df if df is not None else pd.DataFrame())
+            self._model.set_dataframe(df if df is not None else pl.DataFrame())
             self._auto_fit_index_width()
             return
 
@@ -466,18 +466,24 @@ class UploadPage(QWidget):
     # -- Helpers -------------------------------------------------------------
 
     @staticmethod
-    def _value_sig(series: pd.Series) -> tuple:
+    def _value_sig(series: pl.Series) -> tuple:
         """Fingerprint a column's value profile (dtype + sampled value types).
 
-        pandas dtype strings alone can't detect date/time conversions
-        (string 'object' -> date/time objects is object -> object), so the
-        sample of actual value types is part of the signature.
+        The Polars dtype alone cannot detect a date/time conversion -- a text
+        column converted to real ``date``/``datetime`` objects keeps the same
+        *kind* of column but changes what its values ARE -- so the sample of
+        actual value types is part of the signature.
+
+        This is the same fingerprint ``services.column_roles`` uses; the
+        helper is kept here so the page can compute one without importing the
+        service module at class-definition time.
         """
-        non_null = series.dropna()
-        types = tuple(sorted({type(v).__name__ for v in non_null.iloc[:20]}))
+        non_null = series.drop_nulls()
+        types = tuple(sorted({type(v).__name__
+                              for v in non_null.head(20).to_list()}))
         return (str(series.dtype), types)
 
-    def _effective_classification(self, df: pd.DataFrame) -> tuple:
+    def _effective_classification(self, df: pl.DataFrame) -> tuple:
         """Resolve the active column families for the current df.
 
         Delegates to ``services.column_roles.resolve_roles`` -- the single
@@ -558,14 +564,14 @@ class UploadPage(QWidget):
         """
         fit_columns_to_content(self.table)
 
-    def _build_filter_row(self, df: pd.DataFrame) -> None:
+    def _build_filter_row(self, df: pl.DataFrame) -> None:
         """Build per-column filter inputs based on DataFrame columns."""
         # Clear existing filters
         for inp in self._filter_inputs:
             inp.deleteLater()
         self._filter_inputs.clear()
 
-        if df is None or df.empty:
+        if df is None or df.height == 0:
             return
 
         # Create a filter input for each column
@@ -578,7 +584,7 @@ class UploadPage(QWidget):
             self._filter_inputs.append(inp)
             self.filter_row.layout().addWidget(inp)
 
-    def _current_view_df(self) -> pd.DataFrame:
+    def _current_view_df(self) -> pl.DataFrame:
         """The rows currently on screen, as a real DataFrame.
 
         This is the single source of truth for "what the user is looking at".
@@ -598,7 +604,7 @@ class UploadPage(QWidget):
         """
         df = self.bridge.df
         if df is None:
-            return pd.DataFrame()
+            return pl.DataFrame()
 
         # Global search across every column.
         text = (getattr(self, "_pending_search_text", "") or "").strip()
@@ -612,68 +618,69 @@ class UploadPage(QWidget):
             if not col_text:
                 continue
             try:
-                mask = df[col].astype(str).str.contains(
-                    col_text, case=False, na=False)
-                df = df[mask]
+                df = df.filter(
+                    pl.col(col).cast(pl.Utf8)
+                    .str.contains(col_text, literal=True)
+                    .fill_null(False))
             except Exception as exc:
                 log.warning("Column filter on %r failed: %s", col, exc)
         return df
 
     @staticmethod
-    def _rows_matching(df: pd.DataFrame, text: str) -> pd.DataFrame:
+    def _rows_matching(df: pl.DataFrame, text: str) -> pl.DataFrame:
         """Rows where *text* appears in ANY column, scanning one at a time.
 
-        The obvious spelling of this is::
-
-            df.astype(str).apply(lambda c: c.str.contains(text, ...)).any(axis=1)
-
-        which materialises a full stringified COPY of the entire frame before
-        matching anything. Measured on a 500k x 12 categorical frame that copy
-        was 286 MB against a 5.7 MB original -- a 50x amplification -- and it
-        ran on every debounced keystroke, so the page allocated and freed
-        hundreds of megabytes per character typed.
+        The obvious spelling of this is a full stringified frame followed by a
+        row-wise OR, which materialises a stringified COPY of the entire frame
+        before matching anything. Measured on a 500k x 12 categorical frame
+        that copy was 286 MB against a 5.7 MB original -- a 50x amplification --
+        and it ran on every debounced keystroke, so the page allocated and
+        freed hundreds of megabytes per character typed.
 
         Here each column is stringified, tested and released before the next
         one, so the peak extra allocation is one column rather than the whole
         frame. The result is identical; only the memory profile changes.
 
-        The mask is also accumulated with ``|=`` per column and checked for
+        The mask is also accumulated with ``|`` per column and checked for
         "everything already matches", so a needle found in an early column
-        stops the scan entirely -- ``any(axis=1)`` could not do that, because
-        it has to build the whole boolean frame first.
+        stops the scan entirely -- a row-wise ``any`` could not do that,
+        because it has to build the whole boolean frame first.
         """
-        if df is None or df.empty or not text:
+        if df is None or df.height == 0 or not text:
             return df
-        keep = pd.Series(False, index=df.index)
-        total = len(df.index)
+        needle = text.lower()
+        total = df.height
+        keep = None
 
         for column in df.columns:
             try:
-                # One copy of ONE column at a time, released on the next
-                # iteration. ``case=False`` already does the case folding, so
-                # there is deliberately NO extra ``.str.lower()`` pass -- that
-                # would allocate a second full string Series per column, which
-                # is the very cost this rewrite exists to remove.
-                hit = df[column].astype(str).str.contains(
-                    text, case=False, na=False, regex=False)
-                keep |= hit
+                # One column at a time. The case folding is folded into the
+                # match so there is no second full string Series per column,
+                # which is the very cost this rewrite exists to remove.
+                hit = (pl.col(column).cast(pl.Utf8)
+                       .str.to_lowercase()
+                       .str.contains(needle, literal=True)
+                       .fill_null(False))
+                keep = hit if keep is None else (keep | hit)
             except Exception as exc:
                 log.debug("global search skipped %r: %s", column, exc)
                 continue
-            if keep.all():
+            if keep is not None and keep.all():
                 # Every row already matches; no later column can change that.
                 break
 
+        if keep is None:
+            return df
         if total and int(keep.sum()) == total:
             return df
-        return df[keep]
+        return df.filter(keep)
 
     def _run_filters(self) -> None:
         """Apply all active filters (search + per-column). Runs only after
         the user pauses typing for the debounce interval (see _filter_timer).
         """
         df = self.bridge.df
-        if df is None or df.empty:
+        if df is None or df.height == 0:
             return
 
         self._model.set_dataframe(self._current_view_df())
@@ -704,7 +711,7 @@ class UploadPage(QWidget):
         not silently reset the user's view."""
         df = self.bridge.df
         if df is None:
-            self._model.set_dataframe(pd.DataFrame())
+            self._model.set_dataframe(pl.DataFrame())
             return
         self._model.set_dataframe(self._current_view_df())
 
@@ -725,7 +732,7 @@ class UploadPage(QWidget):
         total = len(self.bridge.df)
         filtered_out = total - len(df)
 
-        if df.empty:
+        if df is None or (df.is_empty() if hasattr(df, "is_empty") else len(df) == 0):
             QMessageBox.warning(
                 self,
                 "Nothing to Save",
@@ -776,14 +783,14 @@ class UploadPage(QWidget):
 
     # -- Excel handling -----------------------------------------------------
 
-    def _on_excel_sheet_selected(self, df: pd.DataFrame, sheet_name: str) -> None:
+    def _on_excel_sheet_selected(self, df: pl.DataFrame, sheet_name: str) -> None:
         """Handle single sheet selection from Excel loader."""
         self.bridge.set_df(df)
         self.bridge.set("file_name", f"{sheet_name}.xlsx")
         self._update_preview_label()
         self.btn_go_analysis.setEnabled(True)
 
-    def _on_excel_merged_ready(self, df: pd.DataFrame, summary: str) -> None:
+    def _on_excel_merged_ready(self, df: pl.DataFrame, summary: str) -> None:
         """Handle merged table from Excel loader."""
         self.bridge.set_df(df)
         self.bridge.set("file_name", "merged_table.xlsx")

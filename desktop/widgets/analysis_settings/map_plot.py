@@ -15,7 +15,8 @@ from .categorical import AGGS
 
 # Generate-row options. The two map modes are the exact strings the service
 # branch compares against.
-MAP_MODES = ["Scatter (Lat/Lon)", "Choropleth (Location Names)"]
+MAP_MODES = ["Scatter (Lat/Lon)", "Choropleth (Location Names)",
+             "3D Globe (Location Names)", "Extruded Map (Location Names)"]
 
 # Keep irrelevant controls hidden as the mode changes. Location, Value, Colour,
 # Aggregation, Borders, and tooltip fields apply to both chart modes.
@@ -78,6 +79,11 @@ class MapPlotSettings(CorrelationSettings):
             if not hasattr(self, attr):
                 setattr(self, attr, None)
 
+    def build_typography(self):
+        root = super().build_typography()
+        self._mask_rows(root, ("Value size", "Value color", "Value Color"))
+        return root
+
     # -- Generate ----------------------------------------------------------
     def _combo_section(self, title, hint, items, current, on_change):
         """One Generate slot: a compact combo inside the shared section box."""
@@ -129,7 +135,7 @@ class MapPlotSettings(CorrelationSettings):
             return box
 
         box, self._combo_mode = self._combo_section(
-            'Mode', 'Scatter plots points; Choropleth fills whole countries.',
+            'Mode', 'Scatter, choropleth, interactive 3D globe, or extruded map.',
             MAP_MODES, MAP_MODES[0], self._on_mode)
         add('Mode', box)
 
@@ -266,14 +272,15 @@ class MapPlotSettings(CorrelationSettings):
         if flow is None or not sections:
             return
         mode = str(self._pending.get('map_mode') or MAP_MODES[0])
-        choropleth = mode == MAP_MODES[1]
+        choropleth = mode != MAP_MODES[0]
+        three_dimensional = mode in MAP_MODES[2:]
         scatter_only = SCATTER_ONLY_SECTIONS
         choro_only = CHOROPLETH_ONLY_SECTIONS
         for title, box in sections.items():
             if title in scatter_only:
                 flow.set_section_hidden(box, choropleth)
             elif title in choro_only:
-                flow.set_section_hidden(box, not choropleth)
+                flow.set_section_hidden(box, not choropleth or three_dimensional)
 
     def _set_pending(self, **kw):
         """Record a Generate value and mark the form dirty."""

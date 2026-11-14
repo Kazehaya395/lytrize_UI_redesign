@@ -1,21 +1,20 @@
-"""desktop/session_bridge.py -- Qt signal bridge for the headless SessionManager.
+"""desktop/session_bridge.py -- Qt signal bridge for the headless SessionManager (Polars-native).
 
 Wraps ``services.session_service.SessionManager`` in a ``QObject`` so the Qt
 UI can subscribe to state changes via signals instead of manually polling
 ``st.session_state``.
 
 Threading rule: the SessionManager is owned by the main (GUI) thread. Worker
-threads must NOT touch it directly — they should compute results and emit
+threads must NOT touch it directly -- they should compute results and emit
 signals to the main thread, which then applies the result.
 """
-
 from __future__ import annotations
 
 import logging
 import threading
 from typing import Any, Optional
 
-import pandas as pd
+import polars as pl
 from PySide6.QtCore import QObject, Signal
 
 from services.session_service import SessionManager
@@ -23,12 +22,18 @@ from services.session_service import SessionManager
 log = logging.getLogger(__name__)
 
 
+def ensure_dataset(data: Any, *, source: str = "session-bridge"):
+    """Polymorphically convert input to PolarsDataset."""
+    from services.polars_engine import ensure_dataset as _ensure
+    return _ensure(data, source=source)
+
+
 class SessionBridge(QObject):
-    """QObject wrapper around the headless SessionManager."""
+    """QObject wrapper around the headless SessionManager (Polars-native)."""
 
     # -- Signals emitted when session state changes --
-    df_changed = Signal(object)        # emits pd.DataFrame
-    charts_changed = Signal(object)    # emits list of (uid, title, fig)
+    df_changed = Signal(object)        # emits pl.DataFrame
+    charts_changed = Signal(object)    # emits list of (uid, title, chart_model)
     state_changed = Signal(str, object)  # emits key, value
     user_changed = Signal(object)      # emits user_id int
     theme_changed = Signal(str)        # emits theme_mode ("dark" | "light")
@@ -42,11 +47,11 @@ class SessionBridge(QObject):
         self._manager.on_state_changed(self._on_state_changed)
 
         # Internal mirror to avoid emitting the same df twice
-        self._last_df: Optional[pd.DataFrame] = None
+        self._last_df: Optional[pl.DataFrame] = None
         self._polars_dataset = None
 
         # Async draft-save queue (latest-wins). save_draft() serialises the
-        # whole session (Plotly to_json + SQLite write) which stalls the UI
+        # whole session (charts JSON + SQLite write) which stalls the UI
         # on a large session, so the write runs on ONE background thread:
         # at most one save in flight plus one pending carrying the newest
         # snapshot. Tests that need determinism set _save_sync or call
@@ -61,8 +66,8 @@ class SessionBridge(QObject):
     def manager(self) -> SessionManager:
         return self._manager
 
-    # -- Python callbacks → Qt signals --
-    def _on_df_changed(self, df: pd.DataFrame) -> None:
+    # -- Python callbacks -> Qt signals --
+    def _on_df_changed(self, df: pl.DataFrame) -> None:
         self._last_df = df
         # DataFrame edits still originate in legacy pages. Invalidate the
         # separate Polars snapshot so the next native operation rebuilds it
@@ -81,17 +86,114 @@ class SessionBridge(QObject):
         except Exception:                 # caching must never break a load
             pass
         self.df_changed.emit(df)
-        if df is not None:
-            self.charts_changed.emit(self._manager.get("charts", []))
 
     def _on_state_changed(self, key: str, value: Any) -> None:
         self.state_changed.emit(key, value)
-        if key == "user_id":
-            self.user_changed.emit(value)
-        elif key == "charts":
-            self.charts_changed.emit(value)
 
-    # -- Convenience proxies --
+    # -- Polars DataFrame access --
+    @property
+    def df(self) -> Optional[pl.DataFrame]:
+        return self._manager.df
+
+    @df.setter
+    def df(self, value: Optional[pl.DataFrame]) -> None:
+        self._manager.df = value
+
+    def set_df(self, df: Optional[pl.DataFrame]) -> None:
+        """Store a Polars DataFrame and emit df_changed."""
+        self._manager.set_df(df)
+
+    def set_polars_dataset(self, dataset) -> None:
+        """Store the optional native query snapshot associated with this data."""
+        self._polars_dataset = dataset
+
+    def polars_dataset(self, *, create_if_missing: bool = True):
+        """Return the current Polars snapshot, creating a compatibility copy.
+
+        CSV import supplies a direct ``scan_csv`` snapshot. After data edits,
+        this creates a fresh Polars snapshot from the current frame at the
+        boundary instead of reusing stale rows.
+        """
+        if self._polars_dataset is None and create_if_missing and self.df is not None:
+            try:
+                self._polars_dataset = ensure_dataset(self.df)
+            except Exception as exc:
+                log.debug("Polars compatibility snapshot unavailable: %s", exc)
+        return self._polars_dataset
+
+    # -- Chart management --
+    def add_chart(self, uid: str, title: str, chart_model: dict,
+                  chart_type: str = "", meta: Optional[dict] = None,
+                  note: str = "") -> None:
+        """Add a chart to the session and emit charts_changed."""
+        charts = list(self._manager.get("charts", []))
+        charts.append((uid, title, chart_model))
+        self._manager.set("charts", charts)
+        if chart_type:
+            self._manager.set(f"chart_type_{uid}", chart_type)
+        if meta:
+            self._manager.set(f"chart_meta_{uid}", meta)
+        if note:
+            self._manager.set_note(uid, note)
+        self.charts_changed.emit(charts)
+
+    def replace_chart(self, uid: str, new_fig: Any, new_title: Optional[str] = None, emit_signal: bool = True) -> None:
+        """Replace a chart's figure (and optionally title) in place."""
+        charts = list(self._manager.get("charts", []))
+        for i, (c_uid, c_title, c_fig) in enumerate(charts):
+            if c_uid == uid:
+                charts[i] = (uid, new_title or c_title, new_fig)
+                self._manager.set("charts", charts)
+                if emit_signal:
+                    self.charts_changed.emit(charts)
+                return
+
+    def remove_chart(self, uid: str) -> None:
+        """Remove a chart from the session."""
+        charts = list(self._manager.get("charts", []))
+        charts = [c for c in charts if c[0] != uid]
+        self._manager.set("charts", charts)
+        self.charts_changed.emit(charts)
+
+    def clear_charts(self) -> None:
+        """Remove all charts."""
+        self._manager.set("charts", [])
+        self.charts_changed.emit([])
+
+    def set_note(self, uid: str, text: str) -> None:
+        if hasattr(self._manager, "set_note"):
+            self._manager.set_note(uid, text)
+        else:
+            self._manager.set(f"chart_note_{uid}", str(text or ""))
+
+    def get_note(self, uid: str) -> str:
+        if hasattr(self._manager, "get_note"):
+            return self._manager.get_note(uid)
+        return str(self._manager.get(f"chart_note_{uid}", "") or "")
+
+    def get_chart_meta(self, uid: str) -> dict:
+        if hasattr(self._manager, "get_chart_meta"):
+            return self._manager.get_chart_meta(uid)
+        return dict(self._manager.get(f"chart_meta_{uid}", {}) or {})
+
+    def set_chart_meta(self, uid: str, **kwargs) -> None:
+        if hasattr(self._manager, "set_chart_meta"):
+            self._manager.set_chart_meta(uid, **kwargs)
+        else:
+            meta = dict(self.get_chart_meta(uid))
+            meta.update(kwargs)
+            self._manager.set(f"chart_meta_{uid}", meta)
+
+    def record_dataset_analysed(self) -> bool:
+        user_id = self._manager.get("user_id")
+        if not user_id:
+            return False
+        from services.database_service import record_dataset_analysed
+        file_name = self._manager.get("file_name")
+        file_signature = self._manager.get("file_signature")
+        return record_dataset_analysed(user_id, file_name or "", file_signature or "")
+
+    # -- Generic state access --
     def get(self, key: str, default: Any = None) -> Any:
         return self._manager.get(key, default)
 
@@ -102,139 +204,12 @@ class SessionBridge(QObject):
         return self._manager.pop(key, default)
 
     def clear_session(self) -> None:
-        """Reset all session state to start a fresh analysis session.
-
-        Clears the DataFrame, charts, KPIs, slicers, tile geometry, and
-        file metadata so that a new upload/analysis starts from a clean slate.
-        """
+        """Reset all session state to start a fresh analysis session."""
         self._manager._state.clear()
+        self._last_df = None
+        self._polars_dataset = None
 
-    @property
-    def df(self) -> Optional[pd.DataFrame]:
-        return self._manager.df
-
-    @df.setter
-    def df(self, value: pd.DataFrame) -> None:
-        self._manager.df = value
-
-    def set_df(self, df: pd.DataFrame) -> None:
-        self._manager.df = df
-
-    def set_polars_dataset(self, dataset) -> None:
-        """Store the optional native query snapshot associated with this data."""
-        self._polars_dataset = dataset
-
-    def polars_dataset(self, *, create_if_missing: bool = True):
-        """Return the current Polars snapshot, creating a compatibility copy.
-
-        CSV import supplies a direct ``scan_csv`` snapshot. After legacy data
-        edits, this creates a fresh Polars snapshot from the current pandas
-        frame at the boundary instead of reusing stale rows.
-        """
-        if self._polars_dataset is None and create_if_missing and self.df is not None:
-            try:
-                from services.polars_engine import PolarsDataset
-                self._polars_dataset = PolarsDataset.from_pandas(self.df)
-            except Exception as exc:
-                log.debug("Polars compatibility snapshot unavailable: %s", exc)
-        return self._polars_dataset
-
-    def add_chart(self, uid: str, title: str, fig: Any, chart_type: str = "",
-                  meta: Optional[dict] = None, note: str = "") -> None:
-        """Add a chart to the session and emit charts_changed."""
-        charts = list(self._manager.get("charts", []))
-        charts.append((uid, title, fig))
-        self._manager.set("charts", charts)
-        if chart_type:
-            self._manager.set(f"chart_type_{uid}", chart_type)
-        if meta:
-            self._manager.set(f"chart_meta_{uid}", meta)
-        if note:
-            self._manager.set_note(uid, note)
-
-    def replace_chart(self, uid: str, new_fig: Any, new_title: Optional[str] = None) -> None:
-        """Replace a chart's figure (and optionally title) in place."""
-        charts = list(self._manager.get("charts", []))
-        for i, (c_uid, c_title, c_fig) in enumerate(charts):
-            if c_uid == uid:
-                charts[i] = (c_uid, new_title or c_title, new_fig)
-                break
-        self._manager.set("charts", charts)
-
-    def remove_chart(self, uid: str) -> None:
-        """Remove a chart by uid and clean up its associated state."""
-        charts = list(self._manager.get("charts", []))
-        charts = [c for c in charts if c[0] != uid]
-        self._manager.set("charts", charts)
-        self._manager.pop_note(uid)
-        self._manager.pop(f"chart_type_{uid}", None)
-        self._manager.pop(f"chart_meta_{uid}", None)
-        self._manager.pop(f"desc_{uid}", None)
-
-    def clear_charts(self) -> None:
-        """Remove all charts and chart-related state."""
-        self._manager.set("charts", [])
-        self._manager.set("selected_analyses", [])
-        for key in list(self._manager.keys()):
-            if key.startswith("chart_type_") or key.startswith("chart_meta_") \
-                    or key.startswith("desc_") or key.startswith("_edit_"):
-                self._manager.pop(key, None)
-        self._manager.invalidate_cache()
-
-    def set_note(self, uid: str, text: str) -> None:
-        self._manager.set_note(uid, text)
-
-    def get_note(self, uid: str) -> str:
-        return self._manager.get_note(uid)
-
-    def get_chart_meta(self, uid: str) -> dict:
-        return self._manager.get(f"chart_meta_{uid}", {})
-
-    def set_chart_meta(self, uid: str, **kwargs) -> None:
-        meta = dict(self._manager.get(f"chart_meta_{uid}", {}))
-        meta.update(kwargs)
-        self._manager.set(f"chart_meta_{uid}", meta)
-
-    # -- Persistence helpers --
-    def record_dataset_analysed(self) -> bool:
-        """Record that the loaded dataset has reached the analysis stage.
-
-        Called from the two entry points that genuinely mean "the user started
-        analysing this data": proceeding to the Analysis page from Upload, and
-        successfully generating a chart when they jumped straight there from
-        the sidebar. Both call this one method so the identity used for
-        de-duplication is identical no matter which door the user came in by.
-
-        De-duplication is by ``file_signature`` ("<name>:<size>"), so the same
-        file analysed again in the same or a later session does not
-        double-count, while an updated file that happens to share the name does.
-
-        Returns True when the count actually went up.
-        """
-        df = self._manager.df
-        user_id = self._manager.get("user_id")
-        if df is None or user_id is None:
-            return False
-        file_name = str(self._manager.get("file_name") or "")
-        # file_signature is set at import time from the real on-disk size.
-        # Datasets that arrive by another route (an Excel sheet selection, a
-        # restored session) have no size, so fall back to name+shape, which
-        # still distinguishes genuinely different data.
-        signature = str(self._manager.get("file_signature") or "")
-        if not signature:
-            if not file_name:
-                return False
-            signature = f"{file_name}:{len(df)}x{df.shape[1]}"
-        try:
-            from services.database_service import record_dataset_analysed
-            return record_dataset_analysed(
-                user_id, file_name, signature, len(df), df.shape[1])
-        except Exception as exc:
-            # Counting is telemetry; never let it break navigation or chart
-            # generation.
-            log.warning("record_dataset_analysed failed: %s", exc)
-            return False
-
+    # -- Persistence --
     def save_df_snapshot_async(self, user_id: int) -> None:
         df = self._manager.df
         if df is not None:
@@ -266,101 +241,28 @@ class SessionBridge(QObject):
         # are stored as bare 3-tuples -- the type lives in a separate
         # "chart_type_<uid>" key. Rebuild 6-tuples so the type survives
         # autosave; without it a restored chart has no analysis binding and
-        # re-rendering falls back to guessing.
-        serialisable = []
-        for uid, title, fig in charts:
-            serialisable.append((
-                uid, title, fig,
-                notes.get(uid, ""),
-                self._manager.get(f"chart_type_{uid}", ""),
-                chart_meta.get(uid, {}),
-            ))
+        # is orphaned.
+        full_charts = []
+        for uid, title, model in charts:
+            ct = self._manager.get(f"chart_type_{uid}", "")
+            full_charts.append((uid, title, model, ct, {}, {}))
 
-        snapshot = dict(
-            user_id=user_id,
-            page=self._manager.get("page", "home"),
-            charts_json=charts_to_json(serialisable, notes=notes, meta_map=chart_meta),
-            file_name=self._manager.get("file_name", ""),
-            editing_session_id=self._manager.get("editing_session_id"),
-            editing_session_name=self._manager.get("editing_session_name"),
-            editing_file_name=self._manager.get("editing_file_name", ""),
-            dashboard_title=self._manager.get("dashboard_title", ""),
-            kpis_json=json.dumps(self._manager.get("kpis", [])),
-            chart_meta_json=json.dumps(
-                {f"chart_meta_{k}": v for k, v in chart_meta.items()},
-                default=str,
-            ),
-            layout_mode=self._manager.get("layout_mode", "portrait"),
-            tile_geometry_json=json.dumps(tile_geometry, default=str),
-        )
-        if self._save_sync:
-            # Tests only: deterministic, same-thread write.
-            from services.database_service import save_draft as db_save_draft
-            db_save_draft(**snapshot)
-            return
-        with self._save_lock:
-            if self._save_in_flight:
-                # A save is already running: remember only the newest
-                # snapshot. Rapid generate/delete/edit bursts collapse to
-                # two writes (in-flight + latest) instead of N.
-                self._save_pending = snapshot
-                return
-            self._save_in_flight = True
-        threading.Thread(target=self._save_loop,
-                         args=(snapshot,), daemon=True).start()
-
-    def _write_draft_snapshot(self, snapshot: dict) -> None:
-        """Perform one draft write. Runs on the saver thread, never the UI."""
         try:
-            from services.database_service import save_draft as db_save_draft
-            db_save_draft(**snapshot)
+            db_save_draft(
+                user_id,
+                self._manager.get("session_name") or "Untitled",
+                self._manager.get("file_name"),
+                self._manager.get("file_signature"),
+                json.dumps(full_charts, default=str),
+                self._manager.get("slicers", []),
+                tile_geometry,
+                self._manager.get("kpis", []),
+            )
         except Exception as exc:
-            log.warning("save_draft: write failed: %s", exc)
-
-    def _save_loop(self, first: dict) -> None:
-        """Drain the save queue: first snapshot, then the latest pending."""
-        snapshot = first
-        while snapshot is not None:
-            self._write_draft_snapshot(snapshot)
-            with self._save_lock:
-                snapshot = self._save_pending
-                self._save_pending = None
-                if snapshot is None:
-                    self._save_in_flight = False
-
-    def flush_draft_save(self, timeout: float = 10.0) -> bool:
-        """Block until the saver thread is idle. Tests only.
-
-        Returns True when the queue drained within *timeout* seconds.
-        """
-        import time
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            with self._save_lock:
-                idle = (not self._save_in_flight
-                        and self._save_pending is None)
-            if idle:
-                return True
-            time.sleep(0.02)
-        return False
+            log.error("save_draft: %s", exc)
 
     def restore_draft(self) -> bool:
-        """Reload the last auto-saved draft into the live session.
-
-        Counterpart to :meth:`save_draft`. Autosave runs every 2 minutes and
-        on every Generate, but nothing read the row back, so a close/reopen
-        silently lost the session even though the draft was sitting in
-        ``draft_sessions``.
-
-        Restores the DataFrame from the parquet snapshot plus every chart
-        (figure, title, notes, chart_type, meta) and the assorted page
-        bookkeeping fields. Returns True when at least one chart came back.
-
-        Never raises: a missing or corrupt draft is a normal empty-start
-        condition, and a bad launch must not be blocked by it.
-        """
-        import json
-
+        """Restore the most recent draft for the current user."""
         from services.database_service import get_draft as db_get_draft
         from services.chart_service import charts_from_json
 
@@ -386,8 +288,7 @@ class SessionBridge(QObject):
             if df is not None:
                 self._manager.df = df
 
-        # -- Charts: one bulk write so charts_changed fires once and the
-        #    analysis page rebuilds its tabs a single time.
+        # -- Charts: one bulk write so charts_changed fires once --
         try:
             restored = charts_from_json(draft.get("charts_json") or "")
         except Exception as exc:
@@ -398,11 +299,11 @@ class SessionBridge(QObject):
 
         charts: list = []
         for entry in restored:
-            uid, title, fig = entry[0], entry[1], entry[2]
+            uid, title, model = entry[0], entry[1], entry[2]
             desc = entry[3] if len(entry) > 3 else ""
             chart_type = entry[4] if len(entry) > 4 else ""
             meta = entry[5] if len(entry) > 5 else {}
-            charts.append((uid, title, fig))
+            charts.append((uid, title, model))
             if desc:
                 self._manager.set_note(uid, desc)
             if chart_type:
@@ -412,7 +313,7 @@ class SessionBridge(QObject):
 
         self._manager.set("charts", charts)
 
-        # -- Scalar page bookkeeping, persisted alongside the charts.
+        # -- Scalar page bookkeeping --
         for key, col in (
             ("file_name", "file_name"),
             ("editing_session_id", "editing_session_id"),
@@ -425,8 +326,6 @@ class SessionBridge(QObject):
             if value not in (None, ""):
                 self._manager.set(key, value)
 
-        # The active page is restored by the caller (it owns navigation);
-        # keep only the page that actually carries a draft.
         if draft.get("page"):
             self._manager.set("draft_page", draft["page"])
 
@@ -437,9 +336,7 @@ class SessionBridge(QObject):
         if kpis:
             self._manager.set("kpis", kpis)
 
-        # -- Free-canvas placement. Restored AFTER the charts so the geometry
-        #    the user dragged is put back verbatim instead of the dashboard
-        #    re-auto-placing every card on the restored list.
+        # -- Free-canvas placement --
         try:
             tile_geometry = json.loads(draft.get("tile_geometry_json") or "{}")
         except (ValueError, TypeError):

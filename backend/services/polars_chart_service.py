@@ -18,6 +18,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from modules.chart_model import make_chart_model, validate_chart_model
+from modules.runtime_paths import assets_root as _assets_root_fn
+
+_ASSETS_ROOT = _assets_root_fn()
 from services.polars_engine import (
     PolarsDataset, _aggregate_expression, _json_scalar, _parse_dates, pl,
 )
@@ -36,6 +39,37 @@ _SORTS = {
 }
 
 log = logging.getLogger(__name__)
+
+def _numeric_values_expr(name: str, schema) -> "pl.Expr":
+    """A Float64 expression for a column that may hold currency / thousands.
+
+    Real-world exports carry numbers as text: "$1,234.56", "2,000",
+    "(500)" (accounting negatives), "30%" and padded values. A bare
+    ``cast(pl.Float64, strict=False)`` turns every one of those into null,
+    which silently emptied histograms and dropped scatter points for such
+    columns. Strip the decoration and parse; numeric columns keep the plain
+    cast path.
+    """
+    dtype = None
+    try:
+        dtype = schema.get(name) if hasattr(schema, "get") else None
+    except Exception:
+        dtype = None
+    try:
+        numeric = dtype is not None and (dtype.is_numeric() or dtype == pl.Boolean)
+    except Exception:
+        numeric = False
+    if numeric:
+        return pl.col(name).cast(pl.Float64, strict=False).fill_nan(None)
+    return (pl.col(name).cast(pl.String, strict=False).fill_null("")
+            .str.replace_all(r"\(\s*([^()]*)\s*\)", "-${1}")
+            # Strip ANY currency symbol (₹, $, €, £, ¥, ...) plus grouping
+            # commas, percent signs and whitespace. The old [,$%\s] class kept
+            # ₹ and friends, which nulled out every value in an INR-formatted
+            # column -- the chart then drew an empty histogram and the bins
+            # slider appeared to do nothing at all.
+            .str.replace_all(r"\p{Sc}|[,\s%]", "")
+            .cast(pl.Float64, strict=False).fill_nan(None))
 
 
 def _palette(name: Any) -> list[str]:
@@ -116,10 +150,7 @@ def _heatmap_display_options(layout: Optional[dict], typography: Optional[dict],
 
     annotation_color = pick("heatmap_annotation_color", None)
     if not annotation_color:
-        annotation_color = pick("value_label_color", None)
-    if not annotation_color:
-        annotation_color = prev_labels.get("color") or previous.get(
-            "text_color", "#263247")
+        annotation_color = prev_labels.get("color") or "auto"
 
     options = {
         "heatmap_colors": _heatmap_palette(scale, diverging),
@@ -173,7 +204,8 @@ def _display(layout: Optional[dict], typography: Optional[dict], palette) -> dic
                  "label+value" if text_info == "label+value" else
                  "percent" if text_info == "percent" else
                  "value" if text_info == "value" else "label")
-    pie_value_size = layout.get("pie_value_size", 11)
+    pie_value_size = typography.get("slice_value_size",
+                                   layout.get("pie_value_size", 11))
     if pie_value_size in (None, 11, "11"):
         pie_value_size = typography.get("value_label_size", pie_value_size)
     return {
@@ -181,7 +213,7 @@ def _display(layout: Optional[dict], typography: Optional[dict], palette) -> dic
         "title_align": typography.get("header_align", "left"),
         "title_weight": 700 if "bold" in str(typography.get("header_font_style", "")).lower()
         else 600,
-        "text_color": typography.get("axis_tick_color", "#e2e8f0"),
+        "text_color": typography.get("axis_tick_color", "auto"),
         "palette": palette,
         "chart_background": "transparent",
         "legend": {
@@ -198,12 +230,17 @@ def _display(layout: Optional[dict], typography: Optional[dict], palette) -> dic
             "position": label_position,
             "formatter": formatter,
             "font_size": pie_value_size,
-            "color": layout.get("pie_value_color", "#e2e8f0"),
+            "color": typography.get("slice_value_color",
+                                    layout.get("pie_value_color", "auto")),
         },
         "donut": float(layout.get("donut_hole", 0) or 0) > 0,
         "donut_ratio": max(0, min(80, round(float(layout.get("donut_hole", 0) or 0) * 100))),
         "donut_center_total": bool(layout.get("donut_center_total", False)),
         "center_total_precision": max(0, min(6, int(layout.get("center_total_precision", 2) or 0))),
+        "center_total_size": int(typography.get("pie_center_total_size", pie_value_size or 12)),
+        "center_total_color": typography.get("pie_center_total_color",
+                                              layout.get("pie_value_color", "auto")),
+        "pull_slices": max(0.0, min(0.5, float(layout.get("pull_slices", 0.0) or 0.0))),
         "rotation": int(layout.get("pie_rotation", 0) or 0),
         "direction": layout.get("pie_direction", "clockwise"),
     }
@@ -307,6 +344,8 @@ def build_categorical_charts(dataset: PolarsDataset, config: dict, *,
     if not isinstance(dataset, PolarsDataset):
         raise TypeError("build_categorical_charts requires a PolarsDataset")
     config = dict(config or {})
+    layout = dict(layout or {})
+    layout.setdefault("show_value_labels", False)
     schema = dataset.schema
     role_dims = list((roles or {}).get("dimensions") or [])
     if not role_dims:
@@ -451,8 +490,7 @@ def build_statistical_charts(dataset: PolarsDataset, config: dict, *,
     palette = _palette(config.get("palette"))
     if group:
         selected_metrics = [
-            pl.col(metric).cast(pl.Float64, strict=False).fill_nan(None)
-            .alias(f"__m{metric_index}")
+            _numeric_values_expr(metric, schema).alias(f"__m{metric_index}")
             for metric_index, metric in enumerate(metrics)
         ]
         stat_exprs = []
@@ -506,7 +544,7 @@ def build_statistical_charts(dataset: PolarsDataset, config: dict, *,
     # CSV-backed LazyFrame is not rescanned for every selected metric.
     stat_exprs = []
     for metric_index, metric in enumerate(metrics):
-        metric_expr = pl.col(metric).cast(pl.Float64, strict=False).fill_nan(None)
+        metric_expr = _numeric_values_expr(metric, schema)
         stat_exprs.extend([
             metric_expr.mean().alias(f"m{metric_index}_Mean"),
             metric_expr.min().alias(f"m{metric_index}_Min"),
@@ -865,6 +903,75 @@ def build_matrix_table_chart(dataset: PolarsDataset, config: dict, *,
          totals.get(str(row))]
         for row in rows
     ]
+    hierarchy_meta = []
+    hierarchy = [str(name) for name in (config.get("row_hierarchy") or [])
+                 if str(name) in dataset.schema and str(name) not in
+                 {columns_col, values_col}]
+    hierarchy = list(dict.fromkeys(hierarchy))[:3]
+    if len(hierarchy) >= 2:
+        try:
+            source = dataset.frame.select(
+                *[pl.col(name).alias(f"__h{i}") for i, name in enumerate(hierarchy)],
+                pl.col(columns_col).alias("__column"),
+                pl.col(values_col).alias("__metric"),
+            )
+            valid = pl.col("__column").is_not_null()
+            for i, name in enumerate(hierarchy):
+                valid = valid & pl.col(f"__h{i}").is_not_null()
+                if dataset.schema[name].is_float():
+                    valid = valid & ~pl.col(f"__h{i}").is_nan()
+            if dataset.schema[columns_col].is_float():
+                valid = valid & ~pl.col("__column").is_nan()
+            prefix_keys = []
+            hierarchy_rows = []
+            seen_paths = set()
+            for depth in range(1, len(hierarchy) + 1):
+                keys = [f"__h{i}" for i in range(depth)]
+                agg_expr = (pl.col("__metric").count().alias("__value")
+                            if operation == "count" else
+                            _aggregate_expression(operation, "__metric").alias("__value"))
+                grouped = source.filter(valid).group_by([*keys, "__column"]).agg(agg_expr).collect()
+                grouped_map = {}
+                for record in grouped.to_dicts():
+                    path = tuple(_json_scalar(record[k]) for k in keys)
+                    col_key = str(_json_scalar(record["__column"]))
+                    grouped_map[(path, col_key)] = _json_scalar(record["__value"])
+                    seen_paths.add(path)
+                paths = sorted({path for path, _column in grouped_map},
+                               key=lambda path: tuple(str(part) for part in path))
+                for path in paths:
+                    vals = [grouped_map.get((path, str(column))) for column in columns]
+                    # Overall total is aggregated from the source rows for this
+                    # exact prefix, so parent averages are never averages of averages.
+                    prefix_filter = pl.lit(True)
+                    for i, value in enumerate(path):
+                        prefix_filter = prefix_filter & (pl.col(f"__h{i}") == value)
+                    total_expr = (pl.col("__metric").count().alias("__total")
+                                  if operation == "count" else
+                                  _aggregate_expression(operation, "__metric").alias("__total"))
+                    total = source.filter(valid & prefix_filter).select(total_expr).collect().item()
+                    hierarchy_rows.append([str(path[-1]), *vals, _json_scalar(total)])
+                    hierarchy_meta.append({"depth": depth - 1,
+                                           "path": [str(part) for part in path],
+                                           "has_children": depth < len(hierarchy) and
+                                               any(candidate[:depth] == path for candidate in seen_paths)})
+            if hierarchy_rows:
+                ordered = sorted(zip(hierarchy_rows, hierarchy_meta),
+                                 key=lambda item: tuple(item[1]["path"]))
+                table_rows = [item[0] for item in ordered]
+                hierarchy_meta = [item[1] for item in ordered]
+        except Exception:
+            # Fall back to the existing single-index table if a legacy recipe
+            # contains an invalid hierarchy column or unsupported grouping.
+            hierarchy_meta = []
+
+    if hierarchy_meta:
+        headers[0] = " / ".join(hierarchy)
+    try:
+        from desktop.theme import current_mode
+        table_theme = current_mode()
+    except Exception:
+        table_theme = "light"
     table_display = {
         "table_font_size": int(layout.get("table_font_size", 11)),
         "table_header_font_size": int(layout.get("table_header_font_size", 12)),
@@ -873,12 +980,20 @@ def build_matrix_table_chart(dataset: PolarsDataset, config: dict, *,
         "table_index_align": str(layout.get("table_index_align", "left")),
         "table_data_align": str(layout.get("table_data_align", "right")),
         "table_number_format": str(layout.get("table_number_format", ",.2f")),
-        "table_font_color": str(layout.get("table_font_color", "#f1f5f9")),
+        "table_font_color": str(layout.get("table_font_color", "auto")),
         "table_header_color": str(layout.get("table_header_color", "#6163df")),
-        "table_stripe_even_color": str(layout.get("table_stripe_even_color", "#1e293b")),
-        "table_stripe_odd_color": str(layout.get("table_stripe_odd_color", "#0f172a")),
+        "table_stripe_even_color": str(layout.get("table_stripe_even_color", "auto")),
+        "table_stripe_odd_color": str(layout.get("table_stripe_odd_color", "auto")),
+        "theme_mode": str((typography or {}).get("theme_mode") or table_theme),
+        "table_hierarchy": hierarchy_meta,
+        "table_font_family": str((typography or {}).get("family", "Inter")),
+        "table_header_font_family": str((typography or {}).get(
+            "header_family", (typography or {}).get("family", "Inter"))),
         "title_size": int((typography or {}).get("header_size", 20)),
-        "text_color": str((typography or {}).get("axis_tick_color", "#e2e8f0")),
+        "title_color": str((typography or {}).get("header_color", "auto")),
+        "title_font_style": str((typography or {}).get("header_font_style", "Bold")),
+        "title_align": str((typography or {}).get("header_align", "left")),
+        "text_color": str((typography or {}).get("axis_tick_color", "auto")),
         "chart_background": "transparent",
     }
     return make_chart_model(
@@ -962,12 +1077,12 @@ def build_descriptive_table_chart(dataset: PolarsDataset, *,
             "table_header_height": int(layout.get("table_header_height", 28)),
             "table_index_align": "left", "table_data_align": "right",
             "table_number_format": str(layout.get("table_number_format", ",.4f")),
-            "table_font_color": str(layout.get("table_font_color", "#f1f5f9")),
+            "table_font_color": str(layout.get("table_font_color", "auto")),
             "table_header_color": str(layout.get("table_header_color", "#6163df")),
-            "table_stripe_even_color": str(layout.get("table_stripe_even_color", "#1e293b")),
-            "table_stripe_odd_color": str(layout.get("table_stripe_odd_color", "#0f172a")),
+            "table_stripe_even_color": str(layout.get("table_stripe_even_color", "auto")),
+            "table_stripe_odd_color": str(layout.get("table_stripe_odd_color", "auto")),
             "title_size": int(typography.get("header_size", 20)),
-            "text_color": str(typography.get("axis_tick_color", "#e2e8f0")),
+            "text_color": str(typography.get("axis_tick_color", "auto")),
             "chart_background": "transparent",
         },
         source={"engine": "polars", "revision": dataset.revision,
@@ -1098,7 +1213,7 @@ def build_outlier_charts(dataset: PolarsDataset, columns: list, *,
                     "config": {"column": column, "multiplier": multiplier}},
             display={
                 "title_size": int(typography.get("header_size", 18)),
-                "text_color": str(typography.get("axis_tick_color", "#e2e8f0")),
+                "text_color": str(typography.get("axis_tick_color", "auto")),
                 "x_title": "Source row ID", "y_title": column,
                 "symbol_size": 6, "symbol_opacity": 0.6,
                 "legend": {"show": True, "position": "top right",
@@ -1163,7 +1278,7 @@ def build_data_quality_charts(dataset: PolarsDataset, *,
             }]},
             recipe={"version": 1, "chart_type": "data_quality",
                     "config": {"view": "missing_summary"}},
-            display={"title_size": 18, "text_color": "#e2e8f0",
+            display={"title_size": 18, "text_color": "auto",
                      "x_title": "Column", "y_title": "Missing %",
                      "legend": {"show": False}, "labels": {"show": True},
                      "chart_background": "transparent"},
@@ -1229,7 +1344,7 @@ def build_data_quality_charts(dataset: PolarsDataset, *,
             }]},
             recipe={"version": 1, "chart_type": "data_quality",
                     "config": {"view": "duplicates"}},
-            display={"title_size": 18, "text_color": "#e2e8f0",
+            display={"title_size": 18, "text_color": "auto",
                      "palette": ["#6163df", "#ef4444"], "donut": True,
                      "donut_ratio": 48, "legend": {"show": True,
                      "position": "bottom", "layout": "horizontal"},
@@ -1242,8 +1357,8 @@ def build_data_quality_charts(dataset: PolarsDataset, *,
 
 @lru_cache(maxsize=1)
 def _natural_earth_lookup() -> dict:
-    asset = (Path(__file__).resolve().parents[1] / "assets" / "echarts" /
-             "maps" / "natural-earth" / "lookup.json")
+    asset = (_ASSETS_ROOT / "echarts" / "maps" / "natural-earth" /
+             "lookup.json")
     try:
         return json.loads(asset.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -1256,8 +1371,26 @@ def _geo_norm(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", " ", text).strip()
 
 
-def _map_agg_expr(column: str, operation: str):
-    value = pl.col(column)
+def _map_agg_expr(column: str, operation: str, schema=None):
+    """Aggregation expression that tolerates string-typed numeric columns.
+
+    CSV exports carry numbers as text ("$1,234.56"); a bare pl.col(...).sum()
+    on such a column raises "sum operation not supported for dtype str" and
+    the whole map chart vanished. When a schema is supplied and the column is
+    not natively numeric, parse it the same way the rest of the service does.
+    """
+    if schema is not None:
+        try:
+            dtype = schema.get(column)
+            native_numeric = dtype is not None and (dtype.is_numeric() or dtype == pl.Boolean)
+        except Exception:
+            native_numeric = False
+        if not native_numeric:
+            value = _numeric_values_expr(column, schema)
+        else:
+            value = pl.col(column)
+    else:
+        value = pl.col(column)
     if operation == "mean":
         return value.mean()
     if operation == "median":
@@ -1297,7 +1430,7 @@ def build_choropleth_chart(dataset: PolarsDataset, config: dict, *,
             recipe={"version": 1, "chart_type": "map_plot", "config": config,
                     "layout": layout, "typography": typography},
             display={"empty_message": message,
-                     "text_color": typography.get("axis_tick_color", "#e2e8f0"),
+                     "text_color": typography.get("axis_tick_color", "auto"),
                      "title_size": typography.get("header_size", 20),
                      "legend": {"show": False}},
             source={"engine": "polars", "revision": dataset.revision})
@@ -1404,7 +1537,22 @@ def build_choropleth_chart(dataset: PolarsDataset, config: dict, *,
     value_col = config.get("value_col")
     if value_col not in schema or value_col == dataset.row_id:
         value_col = None
-    numeric_value = bool(value_col and schema[value_col].is_numeric())
+    # Value columns may hold currency / grouped numbers as text; treat a
+    # column as numeric when it PARSES as one, not just by declared dtype,
+    # so "sum" on an amount column does not silently degrade to "count".
+    numeric_value = False
+    if value_col:
+        try:
+            numeric_value = bool(schema[value_col].is_numeric())
+        except Exception:
+            numeric_value = False
+    if value_col and not numeric_value:
+        try:
+            numeric_value = bool(dataset.frame.select(
+                _numeric_values_expr(value_col, schema).is_not_null().sum()
+            ).collect().item())
+        except Exception:
+            numeric_value = False
     operation = str(config.get("agg_func") or "sum").strip().lower()
     if operation not in {"sum", "mean", "median", "count", "min", "max"}:
         operation = "sum"
@@ -1420,10 +1568,10 @@ def build_choropleth_chart(dataset: PolarsDataset, config: dict, *,
     if operation == "count" and (not value_col or not numeric_value):
         aggregations.append(pl.len().alias("__ly_value"))
     else:
-        if schema[value_col].is_float():
-            mapped = mapped.filter(pl.col(value_col).is_not_null() &
-                                   pl.col(value_col).is_finite())
-        aggregations.append(_map_agg_expr(value_col, operation).alias("__ly_value"))
+        mapped = mapped.with_columns(
+            _numeric_values_expr(value_col, schema).alias("__ly_value_num"))
+        aggregations.append(_map_agg_expr("__ly_value_num", operation)
+                            .alias("__ly_value"))
 
     extra_columns = []
     hover_dims = config.get("hover_dims") or [config.get("hover_dim1"),
@@ -1445,7 +1593,7 @@ def build_choropleth_chart(dataset: PolarsDataset, config: dict, *,
         if not schema[column].is_numeric():
             agg_name = "count"
         alias = f"__ly_val_{index}"
-        aggregations.append(_map_agg_expr(column, agg_name).alias(alias))
+        aggregations.append(_map_agg_expr(column, agg_name, schema).alias(alias))
         extra_columns.append((alias, f"{agg_name.upper()}({column})"))
 
     if value_col and not numeric_value:
@@ -1500,7 +1648,7 @@ def build_choropleth_chart(dataset: PolarsDataset, config: dict, *,
         title += f" · {len(unresolved):,} unmatched"
     display = {
         "title_size": int(typography.get("header_size", 20)),
-        "text_color": str(typography.get("axis_tick_color", "#e2e8f0")),
+        "text_color": str(typography.get("axis_tick_color", "auto")),
         "map_asset": map_asset, "map_id": map_id,
         "map_center": center, "map_zoom": zoom,
         "map_projection": projection,
@@ -1557,22 +1705,46 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
         raise TypeError("build_map_plot_chart requires a PolarsDataset")
     config, layout, typography = (dict(config or {}), dict(layout or {}),
                                   dict(typography or {}))
-    if (str(config.get("map_mode", "")).lower().startswith("choropleth") or
+    map_mode = str(config.get("map_mode", "")).strip().lower()
+    is_3d_map = map_mode.startswith("3d globe") or map_mode.startswith("extruded map")
+    if (map_mode.startswith("choropleth") or is_3d_map or
             (config.get("geo_col") and not config.get("lat_col") and
              not config.get("lon_col"))):
-        return build_choropleth_chart(dataset, config, layout=layout,
-                                      typography=typography)
+        model = build_choropleth_chart(dataset, config, layout=layout,
+                                       typography=typography)
+        if model and is_3d_map:
+            model["display"]["map_visualization"] = (
+                "globe" if map_mode.startswith("3d globe") else "extruded")
+            model["display"]["map_interaction"] = (
+                "drag-to-rotate" if map_mode.startswith("3d globe") else "wheel-to-zoom")
+        return model
     schema = dataset.schema
     names = list(schema)
+
+    def _ly_numeric_ok(name):
+        if name not in schema:
+            return False
+        try:
+            if schema[name].is_numeric() or schema[name] == pl.Boolean:
+                return True
+        except Exception:
+            return False
+        try:
+            return bool(dataset.frame.select(
+                _numeric_values_expr(name, schema).is_not_null().sum()
+            ).collect().item())
+        except Exception:
+            return False
+
     lat = config.get("lat_col")
     lon = config.get("lon_col")
-    if lat not in schema or lon not in schema or not schema[lat].is_numeric() or not schema[lon].is_numeric():
-        lat = next((c for c in names if "lat" in c.lower() and schema[c].is_numeric()), None)
-        lon = next((c for c in names if any(k in c.lower() for k in ("lon", "lng", "long")) and schema[c].is_numeric()), None)
+    if not _ly_numeric_ok(lat) or not _ly_numeric_ok(lon):
+        lat = next((c for c in names if "lat" in c.lower() and _ly_numeric_ok(c)), None)
+        lon = next((c for c in names if any(k in c.lower() for k in ("lon", "lng", "long")) and _ly_numeric_ok(c)), None)
     location = config.get("location_col")
     location = location if location in schema else None
     value_col = config.get("value_col")
-    value_col = value_col if value_col in schema and schema[value_col].is_numeric() else None
+    value_col = value_col if _ly_numeric_ok(value_col) else None
     color_col = config.get("color_col")
     color_col = color_col if color_col in schema else None
     mode = str(config.get("render_mode") or "Density (all points)").lower()
@@ -1659,8 +1831,8 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
         row_index = "_" + row_index
     if lat in schema and lon in schema:
         frame = frame.with_columns(
-            pl.col(lat).cast(pl.Float64, strict=False).alias("__ly_lat"),
-            pl.col(lon).cast(pl.Float64, strict=False).alias("__ly_lon"),
+            _numeric_values_expr(lat, schema).alias("__ly_lat"),
+            _numeric_values_expr(lon, schema).alias("__ly_lon"),
         ).filter(pl.col("__ly_lat").is_finite() & pl.col("__ly_lon").is_finite()
                  & pl.col("__ly_lat").is_between(-90, 90)
                  & pl.col("__ly_lon").is_between(-180, 180)
@@ -1689,17 +1861,17 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
             agg = "mean"
         group_aggs = [
             pl.col("__ly_lon").first(), pl.col("__ly_lat").first(),
-            _map_agg_expr(value_col, agg).alias("__ly_metric"),
+            _map_agg_expr(value_col, agg, schema).alias("__ly_metric"),
         ]
         if color_col and color_col != value_col:
             group_aggs.append(pl.col(color_col).drop_nulls().first().alias("__ly_color"))
         if config.get("size_col") in schema and config.get("size_col") != value_col:
-            group_aggs.append(_map_agg_expr(config["size_col"], agg).alias("__ly_size"))
+            group_aggs.append(_map_agg_expr(config["size_col"], agg, schema).alias("__ly_size"))
         for i, (column, fn, _label) in enumerate(extras):
             group_aggs.append(
                 pl.col(column).drop_nulls().first().alias(f"__ly_extra_{i}")
                 if fn == "first" else
-                _map_agg_expr(column, fn).alias(f"__ly_extra_{i}"))
+                _map_agg_expr(column, fn, schema).alias(f"__ly_extra_{i}"))
         frame = frame.group_by(location).agg(group_aggs)
         lat, lon = "__ly_lat", "__ly_lon"
     elif sampled:
@@ -1713,14 +1885,15 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
         density_aggs = [pl.col("__ly_lat").mean(), pl.col("__ly_lon").mean(),
                         pl.len().alias("__ly_count")]
         if density_metric:
-            density_aggs.append(pl.col(density_metric).mean().alias("__ly_metric"))
+            density_aggs.append(
+                _numeric_values_expr(density_metric, schema).mean().alias("__ly_metric"))
         if color_col and not schema[color_col].is_numeric() and color_col not in (location,):
             density_aggs.append(pl.col(color_col).drop_nulls().first().alias("__ly_color"))
         for index, (column, operation, _label) in enumerate(extras):
             density_aggs.append(
                 pl.col(column).drop_nulls().first().alias(f"__ly_extra_{index}")
                 if operation == "first" else
-                _map_agg_expr(column, operation).alias(f"__ly_extra_{index}"))
+                _map_agg_expr(column, operation, schema).alias(f"__ly_extra_{index}"))
         frame = frame.with_columns(
             (((pl.col("__ly_lat").clip(-90, 90) + 90) * (45 / 180)).floor().clip(0, 44)).alias("__ly_ybin"),
             (((pl.col("__ly_lon").clip(-180, 180) + 180) * (45 / 360)).floor().clip(0, 44)).alias("__ly_xbin"),
@@ -1856,7 +2029,7 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
         max_value = min_value + 1
     display = {
         "title_size": int(typography.get("header_size", 20)),
-        "text_color": str(typography.get("axis_tick_color", "#e2e8f0")),
+        "text_color": str(typography.get("axis_tick_color", "auto")),
         "chart_background": "transparent", "legend": {"show": categorical, "position": "bottom", "layout": "horizontal", "font_size": 10},
         "map_asset": map_asset, "map_id": map_id, "map_center": center,
         "map_zoom": zoom, "map_projection": str(config.get("choropleth_projection") or "natural earth"),
@@ -1905,17 +2078,24 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
 
 
 def _categorical_display(layout: Optional[dict], typography: Optional[dict],
-                         palette: list[str]) -> dict:
+                         palette: list[str], *, theme_mode: Optional[str] = None) -> dict:
     layout, typography = dict(layout or {}), dict(typography or {})
     position = str(layout.get("legend_position", "Top Right")).lower()
     orientation = str(layout.get("legend_orientation", "Auto")).lower()
     if orientation == "auto":
         orientation = "vertical" if position.startswith(("left", "right")) else "horizontal"
+    if not theme_mode:
+        try:
+            from desktop.theme import current_mode
+            theme_mode = current_mode()
+        except Exception:
+            theme_mode = "light"
     return {
+        "theme_mode": theme_mode,
         "title_size": typography.get("header_size", 20),
         "title_align": typography.get("header_align", "left"),
         "title_weight": 700 if "bold" in str(typography.get("header_font_style", "")).lower() else 600,
-        "text_color": typography.get("axis_tick_color", "#e2e8f0"),
+        "text_color": typography.get("axis_tick_color", "auto"),
         "palette": palette,
         "chart_background": "transparent",
         # Charts sharing the categorical family (bars, statistical bars) DO
@@ -1930,16 +2110,19 @@ def _categorical_display(layout: Optional[dict], typography: Optional[dict],
                    "item_color": typography.get("legend_item_color", ""),
                    "title_color": typography.get("legend_title_color", ""),
                    "click": layout.get("legend_itemclick", "toggle") != "none"},
-        "labels": {"show": bool(layout.get("show_value_labels", True)),
+        "labels": {"show": bool(layout.get("show_value_labels", False)),
                    "position": str(layout.get("label_position", "outside")).lower(),
                    "font_size": typography.get("value_label_size", 11),
-                   "color": layout.get("value_label_color", "#ffffff")},
+                   "color": layout.get("value_label_color", "auto")},
         "bar_mode": str(layout.get("bar_mode", "group")).lower(),
         # Keep these renderer-neutral controls on the model in both the
         # generation and live-preview paths. The ECharts adapter translates
         # bar_gap to category spacing and line_width to lineStyle.width.
         "bar_gap": max(0.0, min(0.9, float(layout.get("bar_gap", 0.28)))),
         "line_width": max(1, min(10, int(layout.get("line_width", 2)))),
+        # Grid on by default and written EXPLICITLY: an undefined display key
+        # forced the renderer to fall back to the saved recipe every time.
+        "show_grid": bool(layout.get("show_grid", True)),
     }
 
 
@@ -1986,26 +2169,6 @@ def build_advanced_chart(dataset: PolarsDataset, config: dict, *,
         metric = None
     palette = _palette(config.get("palette"))
     chart_uid = uid or str(uuid.uuid4())
-
-    if kind == "globe_extruded_map":
-        location = config.get("location_col") or next(iter(roles.get("categorical", [])), None)
-        if location not in schema:
-            return None
-        map_config = {**config, "map_mode": "Choropleth (Location Names)",
-                      "geo_col": location, "value_col": metric,
-                      "agg_func": operation}
-        model = build_map_plot_chart(dataset, map_config, roles=roles,
-                                     layout=layout, typography=typography, uid=chart_uid)
-        if model:
-            model["chart_type"] = kind
-            model["recipe"] = {**dict(model.get("recipe") or {}), "chart_type": kind,
-                               "config": config, "layout": layout, "typography": typography}
-            # ECharts core has no WebGL globe renderer. Until the optional
-            # ECharts-GL bundle is included, render the same offline boundary
-            # map with an explicit capability note instead of a blank chart.
-            model["display"] = {**dict(model.get("display") or {}),
-                                "map_notice": "Interactive 3D globe requires the optional ECharts-GL runtime; showing offline 2D map."}
-        return model
 
     def agg_expr(col):
         if col is None:
@@ -2112,6 +2275,15 @@ def apply_chart_model_display_options(model: dict, layout: dict,
     """Apply live display controls for migrated native chart families."""
     model = validate_chart_model(model)
     typography = dict(typography or {})
+    layout = dict(layout or {})
+    previous_display = dict(model.get("display") or {})
+    theme_mode = previous_display.get("theme_mode")
+    if not theme_mode:
+        try:
+            from desktop.theme import current_mode
+            theme_mode = current_mode()
+        except Exception:
+            theme_mode = "light"
     try:
         from font_bundle import resolve
         for key in ("family", "header_family"):
@@ -2127,9 +2299,10 @@ def apply_chart_model_display_options(model: dict, layout: dict,
             result["recipe"] = {**dict(result.get("recipe") or {}),
                                 "layout": dict(layout or {}),
                                 "typography": dict(typography or {})}
+        result["display"]["theme_mode"] = theme_mode
         return validate_chart_model(result)
     if model.get("chart_type") in {"sankey", "sunburst", "calendar_heatmap",
-                                   "waterfall", "funnel", "globe_extruded_map"}:
+                                   "waterfall", "funnel", }:
         result = dict(model)
         previous = dict(model.get("display") or {})
         result["display"] = {
@@ -2154,7 +2327,7 @@ def apply_chart_model_display_options(model: dict, layout: dict,
             "funnel_max_size": max(1, min(100, int((layout or {}).get("funnel_max_size", previous.get("funnel_max_size", 100))))),
             "map_projection": str((layout or {}).get("map_projection", previous.get("map_projection", "natural earth"))),
             "title_size": int((typography or {}).get("header_size", previous.get("title_size", 20))),
-            "text_color": str((typography or {}).get("axis_tick_color", previous.get("text_color", "#263247"))),
+            "text_color": str((typography or {}).get("axis_tick_color", previous.get("text_color", "auto"))),
             "palette": previous.get("palette", _palette(None)),
         }
         title = str((layout or {}).get("title") or "").strip()
@@ -2163,6 +2336,7 @@ def apply_chart_model_display_options(model: dict, layout: dict,
         result["recipe"] = {**dict(model.get("recipe") or {}),
                             "layout": dict(layout or {}),
                             "typography": dict(typography or {})}
+        result["display"]["theme_mode"] = theme_mode
         return validate_chart_model(result)
     if model.get("chart_type") == "map_plot":
         result = dict(model)
@@ -2179,7 +2353,7 @@ def apply_chart_model_display_options(model: dict, layout: dict,
         result["display"] = {
             **previous,
             "text_color": str(typography.get("axis_tick_color",
-                                               previous.get("text_color", "#e2e8f0"))),
+                                               previous.get("text_color", "auto"))),
             "title_size": int(typography.get("header_size", previous.get("title_size", 20))),
             "heatmap_colors": palette,
             "show_colorbar": bool(layout.get("show_colorbar", previous.get("show_colorbar", True))),
@@ -2200,24 +2374,34 @@ def apply_chart_model_display_options(model: dict, layout: dict,
         recipe["layout"] = layout
         recipe["typography"] = typography
         result["recipe"] = recipe
+        result["display"]["theme_mode"] = theme_mode
         return validate_chart_model(result)
     if model.get("chart_type") == "categorical":
         result = dict(model)
         previous = model.get("display") or {}
         result["display"] = _categorical_display(
-            layout, typography, list(previous.get("palette") or _palette(None)))
+            layout, typography, list(previous.get("palette") or _palette(None)), theme_mode=theme_mode)
         result["display"].update({
             "legend": {
                 **result["display"]["legend"],
-                "show": bool((previous.get("legend") or {}).get("show", False)),
+                "show": bool(layout.get("show_legend", (previous.get("legend") or {}).get("show", True))),
             },
             "orientation": previous.get("orientation", "vertical"),
-            "x_title": (layout or {}).get("x_label") or previous.get("x_title", ""),
-            "y_title": (layout or {}).get("y_label") or previous.get("y_title", ""),
+            "x_title": layout["x_label"] if "x_label" in layout else previous.get("x_title", ""),
+            "y_title": layout["y_label"] if "y_label" in layout else previous.get("y_title", ""),
             "dual_axis": bool(previous.get("dual_axis", False)),
             "dual_axis_orientation": previous.get("dual_axis_orientation", "y"),
-            "x2_title": (layout or {}).get("x2_label") or previous.get("x2_title", ""),
-            "y2_title": (layout or {}).get("y2_label") or previous.get("y2_title", ""),
+            "x2_title": layout["x2_label"] if "x2_label" in layout else previous.get("x2_title", ""),
+            "y2_title": layout["y2_label"] if "y2_label" in layout else previous.get("y2_title", ""),
+            "show_grid": bool(layout.get("show_grid", previous.get("show_grid", True))),
+            "primary_show_value_labels": bool(layout.get("primary_show_value_labels",
+                layout.get("show_value_labels", (previous.get("labels") or {}).get("show", False)))),
+            "secondary_show_value_labels": bool(layout.get("secondary_show_value_labels",
+                layout.get("show_value_labels", (previous.get("labels") or {}).get("show", False)))),
+            "show_border": bool(layout.get("show_border", previous.get("show_border", False))),
+            "bar_gap": float(layout.get("bar_gap", previous.get("bar_gap", 0.28))),
+            "bar_mode": str(layout.get("bar_mode", previous.get("bar_mode", "group"))).lower(),
+            "line_width": int(layout.get("line_width", previous.get("line_width", 2))),
         })
         title = str((layout or {}).get("title") or "").strip()
         if title:
@@ -2225,6 +2409,7 @@ def apply_chart_model_display_options(model: dict, layout: dict,
         result["recipe"] = {**dict(model.get("recipe") or {}),
                             "layout": dict(layout or {}),
                             "typography": dict(typography or {})}
+        result["display"]["theme_mode"] = theme_mode
         return validate_chart_model(result)
     if model.get("chart_type") == "data_table":
         result = dict(model)
@@ -2232,6 +2417,7 @@ def apply_chart_model_display_options(model: dict, layout: dict,
         layout, typography = dict(layout or {}), dict(typography or {})
         result["display"] = {
             **previous,
+            "theme_mode": theme_mode,
             "table_font_size": int(layout.get("table_font_size", previous.get("table_font_size", 11))),
             "table_header_font_size": int(layout.get("table_header_font_size", previous.get("table_header_font_size", 12))),
             "table_row_height": int(layout.get("table_row_height", previous.get("table_row_height", 26))),
@@ -2239,14 +2425,19 @@ def apply_chart_model_display_options(model: dict, layout: dict,
             "table_index_align": str(layout.get("table_index_align", previous.get("table_index_align", "left"))),
             "table_data_align": str(layout.get("table_data_align", previous.get("table_data_align", "right"))),
             "table_number_format": str(layout.get("table_number_format", previous.get("table_number_format", ",.2f"))),
-            "table_font_color": str(layout.get("table_font_color", previous.get("table_font_color", "#f1f5f9"))),
+            "table_font_color": str(layout.get("table_font_color", previous.get("table_font_color", "auto"))),
             "table_header_color": str(layout.get("table_header_color", previous.get("table_header_color", "#6163df"))),
-            "table_stripe_even_color": str(layout.get("table_stripe_even_color", previous.get("table_stripe_even_color", "#1e293b"))),
-            "table_stripe_odd_color": str(layout.get("table_stripe_odd_color", previous.get("table_stripe_odd_color", "#0f172a"))),
+            "table_stripe_even_color": str(layout.get("table_stripe_even_color", previous.get("table_stripe_even_color", "auto"))),
+            "table_stripe_odd_color": str(layout.get("table_stripe_odd_color", previous.get("table_stripe_odd_color", "auto"))),
+            "table_heat_enabled": bool(layout.get("table_heat_enabled", previous.get("table_heat_enabled", True))),
+            "table_heat_color": str(layout.get("table_heat_color", previous.get("table_heat_color", "#1e40af"))),
             "table_font_family": str(typography.get("family", previous.get("table_font_family", "Inter"))),
             "table_header_font_family": str(typography.get("header_family", typography.get("family", previous.get("table_header_font_family", "Inter")))),
             "title_size": int(typography.get("header_size", previous.get("title_size", 14))),
-            "text_color": str(typography.get("axis_tick_color", previous.get("text_color", "#e2e8f0"))),
+            "title_font_style": str(typography.get("header_font_style", previous.get("title_font_style", "Bold"))),
+            "title_align": str(typography.get("header_align", previous.get("title_align", "left"))),
+            "title_color": str(typography.get("header_color", previous.get("title_color", "auto"))),
+            "text_color": str(typography.get("axis_tick_color", previous.get("text_color", "auto"))),
         }
         title = str(layout.get("title") or "").strip()
         if title:
@@ -2264,7 +2455,7 @@ def apply_chart_model_display_options(model: dict, layout: dict,
         result["display"] = dict(previous)
         result["display"].update({
             "text_color": (typography or {}).get(
-                "axis_tick_color", previous.get("text_color", "#263247")),
+                "axis_tick_color", previous.get("text_color", "auto")),
         })
         # The SAME helper the generation path uses -- one definition, so the
         # two paths cannot drift apart again.
@@ -2276,23 +2467,26 @@ def apply_chart_model_display_options(model: dict, layout: dict,
         result["recipe"] = {**dict(model.get("recipe") or {}),
                             "layout": dict(layout or {}),
                             "typography": dict(typography or {})}
+        result["display"]["theme_mode"] = theme_mode
         return validate_chart_model(result)
     if model.get("chart_type") == "time_series":
         result = dict(model)
         previous = model.get("display") or {}
         result["display"] = _categorical_display(
-            layout, typography, list(previous.get("palette") or _palette(None)))
+            layout, typography, list(previous.get("palette") or _palette(None)), theme_mode=theme_mode)
         result["display"].update({
             # A single time-series line has no legend; only the dual-axis
             # overlay showed one at build time, so live edits keep whatever
             # the model had instead of the categorical family default.
             "legend": {**(result["display"].get("legend") or {}),
-                       "show": bool((previous.get("legend") or {}).get("show", False))},
+                       "show": bool(layout.get("show_legend", (previous.get("legend") or {}).get("show", False)))},
             "orientation": "vertical",
-            "x_title": (layout or {}).get("x_label") or previous.get("x_title", ""),
-            "y_title": (layout or {}).get("y_label") or previous.get("y_title", ""),
+            "x_title": layout["x_label"] if "x_label" in layout else previous.get("x_title", ""),
+            "y_title": layout["y_label"] if "y_label" in layout else previous.get("y_title", ""),
             "dual_axis": bool(previous.get("dual_axis", False)),
-            "y2_title": (layout or {}).get("y2_label") or previous.get("y2_title", ""),
+            "y2_title": layout["y2_label"] if "y2_label" in layout else previous.get("y2_title", ""),
+            "show_grid": bool(layout.get("show_grid", previous.get("show_grid", True))),
+            "show_border": bool(layout.get("show_border", previous.get("show_border", False))),
             "line_width": int((layout or {}).get("line_width", previous.get("line_width", 2))),
             "markers": bool((layout or {}).get("show_markers", previous.get("markers", True))),
             "marker_size": int((layout or {}).get("marker_size", previous.get("marker_size", 6))),
@@ -2301,6 +2495,7 @@ def apply_chart_model_display_options(model: dict, layout: dict,
             "smooth": str((layout or {}).get(
                 "line_shape", previous.get("line_shape", "linear"))) == "spline",
             "line_fill": (layout or {}).get("line_fill", previous.get("line_fill", "none")),
+            "theme_mode": theme_mode,
         })
         title = str((layout or {}).get("title") or "").strip()
         if title:
@@ -2308,21 +2503,25 @@ def apply_chart_model_display_options(model: dict, layout: dict,
         result["recipe"] = {**dict(model.get("recipe") or {}),
                             "layout": dict(layout or {}),
                             "typography": dict(typography or {})}
+        result["display"]["theme_mode"] = theme_mode
         return validate_chart_model(result)
     if model.get("chart_type") == "distribution":
         result = dict(model)
         previous = model.get("display") or {}
         display = _categorical_display(
-            layout, typography, list(previous.get("palette") or _palette(None)))
+            layout, typography, list(previous.get("palette") or _palette(None)), theme_mode=theme_mode)
         display["legend"]["show"] = bool(
             (previous.get("legend") or {}).get("show", False))
         display["orientation"] = "vertical"
-        display["x_title"] = (layout or {}).get("x_label") or previous.get("x_title", "")
-        display["y_title"] = (layout or {}).get("y_label") or previous.get("y_title", "Count")
+        display["x_title"] = layout["x_label"] if "x_label" in layout else previous.get("x_title", "")
+        display["y_title"] = layout["y_label"] if "y_label" in layout else previous.get("y_title", "Count")
+        display["show_grid"] = bool(layout.get("show_grid", previous.get("show_grid", True)))
+        display["show_border"] = bool(layout.get("show_border", previous.get("show_border", False)))
         display["histogram_bins"] = int((layout or {}).get(
             "histogram_bins", previous.get("histogram_bins", 35)))
         display["histogram_opacity"] = float((layout or {}).get(
             "histogram_opacity", previous.get("histogram_opacity", 0.75)))
+        display["theme_mode"] = theme_mode
         result["display"] = display
         title = str((layout or {}).get("title") or "").strip()
         if title:
@@ -2330,25 +2529,37 @@ def apply_chart_model_display_options(model: dict, layout: dict,
         result["recipe"] = {**dict(model.get("recipe") or {}),
                             "layout": dict(layout or {}),
                             "typography": dict(typography or {})}
+        result["display"]["theme_mode"] = theme_mode
         return validate_chart_model(result)
     if model.get("chart_type") == "scatter_plot":
         result = dict(model)
         previous = model.get("display") or {}
         display = _categorical_display(
-            layout, typography, list(previous.get("palette") or _palette(None)))
+            layout, typography, list(previous.get("palette") or _palette(None)), theme_mode=theme_mode)
         display.update({
             "orientation": "vertical",
-            "x_title": (layout or {}).get("x_label") or previous.get("x_title", ""),
-            "y_title": (layout or {}).get("y_label") or previous.get("y_title", ""),
+            "x_title": layout["x_label"] if "x_label" in layout else previous.get("x_title", ""),
+            "y_title": layout["y_label"] if "y_label" in layout else previous.get("y_title", ""),
+            "show_grid": bool(layout.get("show_grid", previous.get("show_grid", True))),
+            "show_border": bool(layout.get("show_border", previous.get("show_border", False))),
             "symbol_size": int((layout or {}).get("marker_size", previous.get("symbol_size", 6))),
             "symbol_opacity": float((layout or {}).get("marker_opacity", previous.get("symbol_opacity", 0.8))),
+            "line_width": int((layout or {}).get("line_width", previous.get("line_width", 2))),
+            "line_shape": str((layout or {}).get("line_shape", previous.get("line_shape", "linear"))),
+            "line_fill": str((layout or {}).get("line_fill", previous.get("line_fill", "none"))),
             "renderer": ("svg" if str((layout or {}).get(
                 "render_mode", previous.get("renderer", "canvas"))).lower() == "svg"
                 else "canvas"),
             "size_by_value": previous.get("size_by_value", False),
-            "large": bool(previous.get("large", False)),
+            # Canvas mode is the dense/progressive path; svg is the crisp
+            # path for small charts. Live edits have to follow the SAME
+            # render_mode the user just picked, not the value the chart was
+            # born with -- otherwise the dropdown looks dead on re-render.
+            "large": str((layout or {}).get(
+                "render_mode", previous.get("renderer", "canvas"))).lower() != "svg",
             "legend": {**display["legend"],
-                       "show": bool((previous.get("legend") or {}).get("show", False))},
+                       "show": bool(layout.get("show_legend", (previous.get("legend") or {}).get("show", False)))},
+            "theme_mode": theme_mode,
         })
         title = str((layout or {}).get("title") or "").strip()
         if title:
@@ -2357,15 +2568,23 @@ def apply_chart_model_display_options(model: dict, layout: dict,
         result["recipe"] = {**dict(model.get("recipe") or {}),
                             "layout": dict(layout or {}),
                             "typography": dict(typography or {})}
+        result["display"]["theme_mode"] = theme_mode
         return validate_chart_model(result)
     result = dict(model)
     previous = dict(model.get("display") or {})
     layout, typography = dict(layout or {}), dict(typography or {})
     result["display"] = {
         **previous,
+        "theme_mode": theme_mode,
         "title_size": int(typography.get("header_size", previous.get("title_size", 20))),
-        "text_color": str(typography.get("axis_tick_color", previous.get("text_color", "#263247"))),
+        "text_color": str(typography.get("axis_tick_color", previous.get("text_color", "auto"))),
+        "show_grid": bool(layout.get("show_grid", previous.get("show_grid", True))),
+        "show_border": bool(layout.get("show_border", previous.get("show_border", False))),
     }
+    if "x_label" in layout:
+        result["display"]["x_title"] = layout["x_label"]
+    if "y_label" in layout:
+        result["display"]["y_title"] = layout["y_label"]
     title = str(layout.get("title") or "").strip()
     if title:
         result["title"] = title
@@ -2448,7 +2667,7 @@ def build_time_series_chart(dataset: PolarsDataset, config: dict, *,
     part = part_map.get(str(config.get("date_part", "None")),
                         config.get("date_part"))
     date_expr = _parse_dates(dataset, date_col)
-    metric_expr = pl.col(metric).cast(pl.Float64, strict=False).fill_nan(None)
+    metric_expr = _numeric_values_expr(metric, schema)
     base = (dataset.frame.select(pl.col(dataset.row_id), date_expr.alias("__date"),
                                  metric_expr.alias("__metric"))
             .filter(pl.col("__date").is_not_null()))
@@ -2507,9 +2726,14 @@ def build_time_series_chart(dataset: PolarsDataset, config: dict, *,
             title = f"Time Series: {metric}"
         else:
             title = f"{operation.title()} {metric} by {x_title}"
-    if part in (None, "", "None"):
-        values = [(_json_scalar(date), value) for date, value in rows]
-    values = [[x, _json_scalar(y)] for x, y in values if y is not None]
+    if part in (None, "", "None") or (isinstance(part, str) and part not in
+            {"year", "quarter", "month", "day", "hour", "month_name", "weekday_name"}):
+        # Both raw paths hold (datetime, metric) tuples; build the final
+        # [x, y] pairs in ONE pass instead of staging an intermediate list.
+        values = [[_json_scalar(date), _json_scalar(value)]
+                  for date, value in rows if value is not None]
+    else:
+        values = [[x, _json_scalar(y)] for x, y in values if y is not None]
     if not values:
         return None
 
@@ -2577,7 +2801,7 @@ def build_distribution_charts(dataset: PolarsDataset, config: dict, *,
     palette = _palette(config.get("palette"))
     models = []
     for metric in metrics:
-        values_expr = pl.col(metric).cast(pl.Float64, strict=False).fill_nan(None)
+        values_expr = _numeric_values_expr(metric, schema)
         base = dataset.frame.select(
             values_expr.alias("__value"),
             (pl.col(color_col).cast(pl.String, strict=False)
@@ -2670,8 +2894,8 @@ def build_scatter_chart(dataset: PolarsDataset, config: dict, *,
     max_points = 3500
     select = [
         pl.col(dataset.row_id),
-        pl.col(x_col).cast(pl.Float64, strict=False).fill_nan(None).alias("__x"),
-        pl.col(y_col).cast(pl.Float64, strict=False).fill_nan(None).alias("__y"),
+        _numeric_values_expr(x_col, schema).alias("__x"),
+        _numeric_values_expr(y_col, schema).alias("__y"),
     ]
     if color_col:
         select.append(pl.col(color_col).cast(pl.String, strict=False)
@@ -2679,8 +2903,7 @@ def build_scatter_chart(dataset: PolarsDataset, config: dict, *,
     else:
         select.append(pl.lit("__all__").alias("__group"))
     if size_col:
-        select.append(pl.col(size_col).cast(pl.Float64, strict=False)
-                      .fill_nan(None).alias("__size"))
+        select.append(_numeric_values_expr(size_col, schema).alias("__size"))
     base = (dataset.frame.select(select)
             .filter(pl.col("__x").is_not_null() & pl.col("__y").is_not_null()))
     row_count = int(base.select(pl.len()).collect().item())
@@ -2788,8 +3011,15 @@ def build_scatter_chart(dataset: PolarsDataset, config: dict, *,
                    "show": bool(color_col or trend not in {"", "none"})},
         "symbol_size": int(layout.get("marker_size", 6)),
         "symbol_opacity": float(layout.get("marker_opacity", 0.8)),
-        "renderer": "canvas",
-        "large": str(config.get("render_mode", "svg")).lower() == "webgl",
+        "renderer": ("svg" if str((layout or {}).get("render_mode",
+                                      config.get("render_mode", "canvas"))).lower() == "svg" else "canvas"),
+        # ECharts-GL is not bundled; canvas progressive rendering is the
+        # offline-safe high-volume mode and is exposed as such in the UI.
+        "large": str((layout or {}).get("render_mode",
+                       config.get("render_mode", "canvas"))).lower() in {"canvas", "webgl"},
+        "line_width": int((layout or {}).get("line_width", 2)),
+        "line_shape": str((layout or {}).get("line_shape", "linear")),
+        "line_fill": str((layout or {}).get("line_fill", "none")),
         "size_by_value": bool(size_col and size_max > size_min),
         "sampled": sampled, "sample_count": frame.height,
     })

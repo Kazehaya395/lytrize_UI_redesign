@@ -74,6 +74,8 @@ class PolarsDataset:
         _require_polars()
         if frame is None:
             raise PolarsEngineError("Cannot create a Polars dataset from None")
+        if isinstance(frame, (pl.DataFrame, pl.LazyFrame)):
+            return cls.from_polars(frame, source=source, revision=revision)
         eager = pl.from_pandas(frame, include_index=False)
         row_id = ROW_ID
         names = set(eager.columns)
@@ -83,6 +85,43 @@ class PolarsDataset:
         if revision is None:
             revision = hashlib.sha256(
                 f"{id(frame)}:{frame.shape}:{tuple(frame.columns)}".encode()
+            ).hexdigest()
+        return cls(eager.lazy(), str(source), str(revision), row_id)
+
+    @classmethod
+    def from_polars(cls, frame, *, source: str = "compatibility-boundary",
+                   revision: Optional[str] = None) -> "PolarsDataset":
+        """Create a lazy Polars snapshot from an existing Polars frame.
+
+        This is the native counterpart of :meth:`from_pandas`: after a data
+        edit the live frame is already Polars, so there is no reason to round
+        trip through pandas to rebuild the snapshot.
+        """
+        _require_polars()
+        if frame is None:
+            raise PolarsEngineError("Cannot create a Polars dataset from None")
+        if isinstance(frame, cls):
+            return frame
+        if isinstance(frame, pl.LazyFrame):
+            names = set(frame.collect_schema().names())
+            row_id = ROW_ID
+            while row_id in names:
+                row_id = "_" + row_id
+            lazy = frame.with_row_index(row_id, offset=0)
+            if revision is None:
+                revision = hashlib.sha256(
+                    f"{id(frame)}:{tuple(sorted(names))}".encode()
+                ).hexdigest()
+            return cls(lazy, str(source), str(revision), row_id)
+        eager = frame
+        row_id = ROW_ID
+        names = set(eager.columns)
+        while row_id in names:
+            row_id = "_" + row_id
+        eager = eager.with_row_index(row_id, offset=0)
+        if revision is None:
+            revision = hashlib.sha256(
+                f"{id(frame)}:{eager.shape}:{tuple(eager.columns)}".encode()
             ).hexdigest()
         return cls(eager.lazy(), str(source), str(revision), row_id)
 
@@ -345,6 +384,22 @@ def _json_scalar(value: Any) -> Any:
     return str(value)
 
 
+def compute_file_signature(path: str | Path) -> str:
+    """Compute a fast deterministic signature from file size, mtime, and 64KB head+tail."""
+    file_path = Path(path).expanduser().resolve()
+    stat = file_path.stat()
+    h = hashlib.sha256()
+    h.update(f"{stat.st_size}:{stat.st_mtime_ns}:".encode("utf-8"))
+    with file_path.open("rb") as f:
+        head = f.read(65536)
+        h.update(head)
+        if stat.st_size > 131072:
+            f.seek(max(0, stat.st_size - 65536))
+            tail = f.read(65536)
+            h.update(tail)
+    return h.hexdigest()
+
+
 def open_csv(path: str | Path, *, separator: str = ",",
              schema_overrides: Optional[dict] = None) -> PolarsDataset:
     """Open CSV lazily and attach deterministic source-order row IDs."""
@@ -352,10 +407,7 @@ def open_csv(path: str | Path, *, separator: str = ",",
     file_path = Path(path).expanduser().resolve()
     if not file_path.is_file():
         raise FileNotFoundError(file_path)
-    digest = hashlib.sha256()
-    with file_path.open("rb") as source_file:
-        for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
-            digest.update(chunk)
+    sig = compute_file_signature(file_path)
     lazy = pl.scan_csv(
         file_path,
         separator=separator,
@@ -371,7 +423,24 @@ def open_csv(path: str | Path, *, separator: str = ",",
     while row_id in names:
         row_id = "_" + row_id
     lazy = lazy.with_row_index(row_id, offset=0)
-    return PolarsDataset(lazy, str(file_path), digest.hexdigest(), row_id)
+    return PolarsDataset(lazy, str(file_path), sig, row_id)
+
+
+def ensure_dataset(data: Any, *, source: str = "compatibility-boundary",
+                   revision: Optional[str] = None) -> PolarsDataset:
+    """Polymorphically convert data to a PolarsDataset without unnecessary re-collection."""
+    _require_polars()
+    if data is None:
+        raise PolarsEngineError("Cannot create a PolarsDataset from None")
+    if isinstance(data, PolarsDataset):
+        return data
+    if isinstance(data, pl.LazyFrame):
+        return PolarsDataset.from_polars(data, source=source, revision=revision)
+    if isinstance(data, pl.DataFrame):
+        return PolarsDataset.from_polars(data, source=source, revision=revision)
+    if hasattr(data, "to_numpy") or hasattr(data, "columns"):
+        return PolarsDataset.from_pandas(data, source=source, revision=revision)
+    raise TypeError(f"Cannot construct PolarsDataset from {type(data).__name__}")
 
 
 _BIN_OPS = {ast.Add: operator.add, ast.Sub: operator.sub,
@@ -565,7 +634,10 @@ def calc_polars_kpi(dataset: PolarsDataset, kpi_type: str, col: Optional[str] = 
         elif key == "date_range":
             name = require(col, "Pick a date column")
             dates = _parse_dates(dataset, name)
-            low, high = dataset.frame.select(dates.min(), dates.max()).collect().row(0)
+            # Alias both bounds: dates.min() and dates.max() default to the
+            # source column name, and select() rejects duplicate output names.
+            low, high = dataset.frame.select(
+                dates.min().alias("__min"), dates.max().alias("__max")).collect().row(0)
             rendered = (f"{low.strftime('%d %b %y')} → {high.strftime('%d %b %y')}"
                         if low is not None and high is not None else "--")
             result = (rendered, label or f"Range of {name}", "", "", None)

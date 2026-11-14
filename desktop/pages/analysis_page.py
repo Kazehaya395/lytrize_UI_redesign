@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-import pandas as pd
+import polars as pl
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -39,8 +39,8 @@ log = logging.getLogger(__name__)
 # they stay coalesced; a combo box is one deliberate pick and must feel
 # instant. Both apply the same ~40ms Plotly layout rebuild on the GUI thread,
 # so the short path is safe -- there is no flood behind it to coalesce.
-_PREVIEW_DEBOUNCE_MS = 300
-_PREVIEW_FAST_MS = 40
+_PREVIEW_DEBOUNCE_MS = 120
+_PREVIEW_FAST_MS = 25
 
 # id -> friendly display name, built from the same list the analysis-type
 # picker on the left already uses -- so tab labels ("Pie Chart 1") stay
@@ -407,7 +407,7 @@ class AnalysisPage(QWidget):
         self._cat = cat_cols(df, roles=roles)
         self._dt = dt_cols(df, roles=roles)
         self._dims = dim_cols(df, roles=roles)
-        self._all_cols = df.columns.tolist()
+        self._all_cols = df.columns
 
         opt = next((o for o in ANALYSIS_OPTIONS if o["id"] == aid), None)
         name = opt["name"] if opt else aid
@@ -489,9 +489,17 @@ class AnalysisPage(QWidget):
             return
         meta = self._chart_settings_meta(uid)
         self._settings_target_uid = uid
-        self.config_panel.prefill(meta.get("config") or {})
-        self.config_panel.prefill_layout(meta.get("layout") or {})
-        self.config_panel.prefill_typography(meta.get("typography") or {})
+        self._preview_timer.stop()
+        self._preview_fast_timer.stop()
+        self._suppress_preview = True
+        try:
+            self.config_panel.prefill(meta.get("config") or {})
+            self.config_panel.prefill_layout(meta.get("layout") or {})
+            self.config_panel.prefill_typography(meta.get("typography") or {})
+        finally:
+            self._suppress_preview = False
+            self._preview_timer.stop()
+            self._preview_fast_timer.stop()
         self.config_panel.reset_dirty()
         self._update_config_chart_no()
         self._update_regen_state()
@@ -677,7 +685,7 @@ class AnalysisPage(QWidget):
         deliberate click, so there is no flood to coalesce and no reason to
         make the user wait out the slider debounce before the chart updates.
         """
-        if kind in ("layout", "typography") and self._settings_target_uid:
+        if kind in ("layout", "typography") and self._settings_target_uid and not getattr(self, "_suppress_preview", False):
             if payload.get("discrete"):
                 self._preview_timer.stop()      # cancel a pending slow pass
                 self._preview_fast_timer.start()
@@ -709,9 +717,24 @@ class AnalysisPage(QWidget):
             # Native chart families update their renderer-neutral display
             # contract directly; no Plotly figure is created for live preview.
             try:
-                from services.polars_chart_service import apply_chart_model_display_options
-                new_model = apply_chart_model_display_options(
-                    card._chart_model, layout, typo)
+                from services.polars_chart_service import (
+                    apply_chart_model_display_options, build_distribution_charts)
+                old_model = card._chart_model
+                if (old_model.get("chart_type") == "distribution" and
+                        int(layout.get("histogram_bins", (old_model.get("display") or {}).get("histogram_bins", 35))) !=
+                        int((old_model.get("display") or {}).get("histogram_bins", 35))):
+                    dataset = self.bridge.polars_dataset(create_if_missing=False)
+                    config = dict((old_model.get("recipe") or {}).get("config") or {})
+                    rebuilt = build_distribution_charts(
+                        dataset, config, layout=layout, typography=typo)
+                    metric = ((old_model.get("data") or {}).get("dimensions") or [None])[0]
+                    new_model = next((item for item in rebuilt
+                                      if metric in ((item.get("data") or {}).get("dimensions") or [])), None)
+                    if new_model is None:
+                        raise ValueError("The selected distribution chart has no valid values to bin")
+                    new_model["uid"] = uid
+                else:
+                    new_model = apply_chart_model_display_options(old_model, layout, typo)
             except Exception:
                 log.exception("native chart preview failed for %s", uid)
                 return
@@ -719,7 +742,7 @@ class AnalysisPage(QWidget):
             new_model["title"] = new_title
             self._bridge_write_guard = True
             try:
-                self.bridge.replace_chart(uid, new_model, new_title)
+                self.bridge.replace_chart(uid, new_model, new_title, emit_signal=False)
                 recipe = dict(new_model.get("recipe") or {})
                 self.bridge.set_chart_meta(
                     uid, config=dict(recipe.get("config") or {}),
@@ -788,7 +811,7 @@ class AnalysisPage(QWidget):
             self._active_analysis, df, self._collect_at_generate, self,
             layout_opts=self._collect_layout,
             typography_opts=self._collect_typo,
-            roles=self._roles,
+            roles=getattr(self, "_roles", None),
             polars_dataset=self.bridge.polars_dataset(create_if_missing=False),
         )
         self._gen_worker.finished_ok.connect(self._on_generate_finished)
@@ -1186,7 +1209,7 @@ class AnalysisPage(QWidget):
         dashboard rebuilds itself when it sees ``state_changed("slicers")``.
         """
         df = self.bridge.df
-        if df is None or df.empty:
+        if df is None or df.is_empty:
             QMessageBox.warning(self, "No Data",
                                 "Load a dataset before adding slicers.")
             return

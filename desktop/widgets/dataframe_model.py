@@ -1,16 +1,15 @@
-"""desktop/widgets/dataframe_model.py -- QAbstractTableModel for pandas DataFrames.
+"""desktop/widgets/dataframe_model.py -- QAbstractTableModel for Polars DataFrames.
 
-Provides a lazy, model-backed view of a pandas DataFrame for QTableView.
+Provides a lazy, model-backed view of a Polars DataFrame for QTableView.
 Large datasets stay responsive because only the visible rows are fetched
 from the DataFrame on demand.
 """
-
 from __future__ import annotations
 
 import logging
 from typing import Any, Optional
 
-import pandas as pd
+import polars as pl
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QColor, QFont
 
@@ -20,15 +19,20 @@ log = logging.getLogger(__name__)
 
 
 class DataFrameModel(QAbstractTableModel):
-    """A QAbstractTableModel that wraps a pandas DataFrame.
+    """A QAbstractTableModel that wraps a Polars DataFrame.
 
     The model reads rows lazily from the DataFrame, so large datasets
     (hundreds of thousands of rows) remain responsive in a QTableView.
     """
 
-    def __init__(self, df: Optional[pd.DataFrame] = None, parent=None) -> None:
+    def __init__(self, df: Optional[pl.DataFrame] = None, parent=None) -> None:
         super().__init__(parent)
-        self._df = df if df is not None else pd.DataFrame()
+        if df is not None and not isinstance(df, pl.DataFrame):
+            try:
+                df = pl.from_pandas(df)
+            except Exception:
+                pass
+        self._df = df if df is not None else pl.DataFrame()
         self._row_limit: Optional[int] = None
         self._colors_cache: dict = {}
         self._colors_cache_mode: str = ""
@@ -37,10 +41,15 @@ class DataFrameModel(QAbstractTableModel):
 
     # -- Public API ---------------------------------------------------------
 
-    def set_dataframe(self, df: pd.DataFrame) -> None:
+    def set_dataframe(self, df: pl.DataFrame) -> None:
         """Replace the underlying DataFrame and notify views."""
         self.beginResetModel()
-        self._df = df if df is not None else pd.DataFrame()
+        if df is not None and not isinstance(df, pl.DataFrame):
+            try:
+                df = pl.from_pandas(df)
+            except Exception:
+                pass
+        self._df = df if df is not None else pl.DataFrame()
         self._row_limit = None
         self.endResetModel()
 
@@ -71,7 +80,7 @@ class DataFrameModel(QAbstractTableModel):
         self.beginResetModel()
         self.endResetModel()
 
-    def dataframe(self) -> pd.DataFrame:
+    def dataframe(self) -> pl.DataFrame:
         """Return the underlying DataFrame."""
         return self._df
 
@@ -80,7 +89,9 @@ class DataFrameModel(QAbstractTableModel):
     def rowCount(self, parent=QModelIndex()) -> int:  # noqa: N802
         if parent.isValid():
             return 0
-        n = len(self._df)
+        n = getattr(self._df, "height", None)
+        if n is None:
+            n = len(self._df)
         if self._row_limit is not None and self._row_limit < n:
             return self._row_limit
         return n
@@ -90,30 +101,35 @@ class DataFrameModel(QAbstractTableModel):
             return 0
         return len(self._df.columns)
 
-    def data(self, index: QModelIndex, role: int = Qt.DisplayRole) -> Any:
+    def data(self, index: QModelIndex, role: int = Qt.DisplayRole) -> Any:  # noqa: N802
         if not index.isValid():
             return None
-
         row = index.row()
         col = index.column()
-
-        if row < 0 or row >= len(self._df) or col < 0 or col >= len(self._df.columns):
+        if row >= self._df.height or col >= len(self._df.columns):
             return None
 
-        if role == Qt.DisplayRole or role == Qt.EditRole:
-            try:
-                value = self._df.iat[row, col]
-                if pd.isna(value):
-                    return ""
-                return str(value)
-            except Exception:
+        col_name = self._df.columns[col]
+        try:
+            value = self._df.item(row, col)
+        except Exception:
+            return None
+
+        if role == Qt.DisplayRole:
+            if value is None:
                 return ""
+            return str(value)
+
+        if role == Qt.EditRole:
+            if value is None:
+                return ""
+            return str(value)
 
         if role == Qt.TextAlignmentRole:
             # Right-align numeric columns
             try:
-                col_name = self._df.columns[col]
-                if pd.api.types.is_numeric_dtype(self._df[col_name]):
+                dtype = self._df.schema[col_name]
+                if dtype.is_numeric():
                     return int(Qt.AlignRight | Qt.AlignVCenter)
             except Exception:
                 pass
@@ -134,7 +150,7 @@ class DataFrameModel(QAbstractTableModel):
             if orientation == Qt.Horizontal and role in (Qt.FontRole, Qt.ForegroundRole):
                 if 0 <= section < len(self._df.columns):
                     if role == Qt.FontRole:
-                        return QFont("", 10, QFont.Weight.Bold)
+                        return QFont("Inter", 10, QFont.Weight.Bold)
                     return colors.get("header_text")
             elif orientation == Qt.Vertical:
                 if role == Qt.ForegroundRole:
@@ -142,7 +158,7 @@ class DataFrameModel(QAbstractTableModel):
                 if role == Qt.BackgroundRole:
                     return colors.get("index_bg")
                 if role == Qt.FontRole:
-                    return QFont("", 10, QFont.Weight.Bold)
+                    return QFont("Inter", 10, QFont.Weight.Bold)
         if role != Qt.DisplayRole:
             return None
 
@@ -177,7 +193,7 @@ class DataFrameModel(QAbstractTableModel):
 
         self.beginResetModel()
         try:
-            self._df = self._df.sort_values(by=col_name, ascending=ascending, kind="mergesort")
+            self._df = self._df.sort(col_name, descending=not ascending)
         except Exception as exc:
             log.warning("DataFrameModel.sort failed: %s", exc)
         self.endResetModel()

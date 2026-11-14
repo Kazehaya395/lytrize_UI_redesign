@@ -1,66 +1,75 @@
-"""modules/utils/perf.py -- Performance utilities for large dataset handling."""
+"""modules/utils/perf.py -- Performance utilities for large dataset handling.
+
+Polars-native implementation. All data reading, sampling, and dtype
+optimisation now runs through Polars (Rust-backed) for best-in-class
+performance and memory efficiency. A thin pandas compatibility shim is
+kept only for legacy Excel reading (polars has no native Excel reader).
+"""
+from __future__ import annotations
+
 import logging
-
-
-import pandas as pd
-import numpy as np
-import os
 from pathlib import Path
-from typing import Union
+from typing import Any, Optional
 
+import polars as pl
 
+log = logging.getLogger(__name__)
 
-
-def mem_mb(df: pd.DataFrame) -> float:
-    """Return total DataFrame memory usage in megabytes (deep=True)."""
-    return df.memory_usage(deep=True).sum() / 1_048_576
-
-
-
+# ── Polars-native helpers ─────────────────────────────────────────────────
 
 _CAT_THRESHOLD = 0.50
-_CAT_MAX_UNIQ  = 1_000
+_CAT_MAX_UNIQ = 1_000
 
 
+def mem_mb(df: Any) -> float:
+    """Return total DataFrame memory usage in megabytes.
+
+    Accepts either a Polars DataFrame or a pandas DataFrame (legacy shim).
+    """
+    if isinstance(df, pl.DataFrame):
+        return df.estimated_size() / 1_048_576
+    # pandas fallback
+    try:
+        return df.memory_usage(deep=True).sum() / 1_048_576  # type: ignore[attr-defined]
+    except Exception:
+        return 0.0
 
 
-def optimize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
-    """Shrink a DataFrame's memory footprint without losing precision or data."""
-    modified = {}
+def optimize_dtypes(df: pl.DataFrame) -> pl.DataFrame:
+    """Downcast numeric types and cast low-cardinality strings to Categorical.
 
-
+    Polars already stores strings efficiently; this cast is mainly for
+    downstream code that expects Categorical dtype for grouping.
+    """
+    exprs = []
     for col in df.columns:
-        series = df[col]
-        dtype = series.dtype
-
-
-        if pd.api.types.is_integer_dtype(dtype):
-            opt_series = pd.to_numeric(series, downcast="integer")
-            if opt_series.dtype != dtype:
-                modified[col] = opt_series
-
-
-        elif dtype == np.float64:
-            opt_series = pd.to_numeric(series, downcast="float")
-            if opt_series.dtype != dtype:
-                modified[col] = opt_series
-
-
-        elif dtype == object:
-            n_uniq = series.nunique()
-            n_rows = len(df)
-            ratio  = n_uniq / n_rows if n_rows else 0
-            if n_uniq <= _CAT_MAX_UNIQ and ratio < _CAT_THRESHOLD:
-                modified[col] = series.astype("category")
-
-
-    if not modified:
-        return df
-
-
-    return df.assign(**modified)
-
-
+        dtype = df[col].dtype
+        if dtype.is_numeric():
+            if dtype.is_integer():
+                try:
+                    mn = df[col].min()
+                    mx = df[col].max()
+                    if mn is not None and mx is not None:
+                        if mn >= -128 and mx <= 127:
+                            exprs.append(pl.col(col).cast(pl.Int8))
+                        elif mn >= -32768 and mx <= 32767:
+                            exprs.append(pl.col(col).cast(pl.Int16))
+                        elif mn >= -2147483648 and mx <= 2147483647:
+                            exprs.append(pl.col(col).cast(pl.Int32))
+                except Exception:
+                    pass
+        elif dtype == pl.String:
+            try:
+                n_uniq = df[col].n_unique()
+                n_rows = df.height
+                ratio = n_uniq / n_rows if n_rows else 0
+                if n_uniq <= _CAT_MAX_UNIQ and ratio < _CAT_THRESHOLD:
+                    exprs.append(pl.col(col).cast(pl.Categorical))
+            except Exception:
+                pass
+    if exprs:
+        return df.with_columns(exprs)
+    return df
 
 
 _SAMPLE_NOTE = (
@@ -69,19 +78,15 @@ _SAMPLE_NOTE = (
 )
 
 
-
-
 def sample_for_plot(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     n: int = 50_000,
     random_state: int = 42,
-) -> tuple[pd.DataFrame, bool]:
-    """Return a representative random sample of at most n rows for Plotly rendering."""
-    if len(df) <= n:
+) -> tuple[pl.DataFrame, bool]:
+    """Return a representative random sample of at most n rows for ECharts rendering."""
+    if df.height <= n:
         return df, False
-    return df.sample(n=n, random_state=random_state).reset_index(drop=True), True
-
-
+    return df.sample(n=n, seed=random_state), True
 
 
 def sample_note(n: int, total: int) -> str:
@@ -89,40 +94,25 @@ def sample_note(n: int, total: int) -> str:
     return _SAMPLE_NOTE.format(n=n, total=total)
 
 
+def read_csv_fast(file, **kwargs) -> pl.DataFrame:
+    """Read a CSV file lazily via Polars scan_csv and return a DataFrame.
 
+    Polars scan_csv is lazy and memory-mapped -- no full materialisation
+    until .collect() is called. For UI preview we collect only what we need.
+    """
+    from services.polars_engine import open_csv, PolarsDataset
 
-def read_csv_fast(file, **kwargs) -> pd.DataFrame:
-    """Read a CSV file and return a dtype-optimised DataFrame."""
-    kwargs.setdefault("low_memory", False)
-    if hasattr(file, "seek"):
-        file.seek(0)
-    
+    path = file
+    if hasattr(file, "read"):
+        import tempfile
+        import shutil
+        suffix = Path(file.name).suffix if hasattr(file, "name") else ".csv"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            shutil.copyfileobj(file, tmp)
+            path = tmp.name
 
-    file_size = 0
-    if hasattr(file, "size"):
-        file_size = file.size
-    elif hasattr(file, "getvalue"):
-        try:
-            file_size = len(file.getvalue())
-        except Exception as exc:
-            logging.getLogger(__name__).debug("Suppressed error: %s", exc, exc_info=True)
-            pass
-    elif isinstance(file, (str, Path)):
-        try:
-            file_size = os.path.getsize(file)
-        except Exception as exc:
-            logging.getLogger(__name__).debug("Suppressed error: %s", exc, exc_info=True)
-            pass
-
-
-    if file_size > 30 * 1024 * 1024:
-        return read_csv_chunked(file, **kwargs)
-
-
-    df = pd.read_csv(file, **kwargs)
-    return optimize_dtypes(df)
-
-
+    ds: PolarsDataset = open_csv(path)
+    return ds.frame.collect()
 
 
 def read_csv_chunked(
@@ -130,138 +120,124 @@ def read_csv_chunked(
     chunksize: int = 200_000,
     max_rows: int | None = None,
     **kwargs,
-) -> pd.DataFrame:
-    """Read a large CSV in chunks and concatenate, applying dtype optimisation"""
-    kwargs.setdefault("low_memory", False)
-    if hasattr(file, "seek"):
-        file.seek(0)
+) -> pl.DataFrame:
+    """Read a large CSV via Polars lazy scan (single pass, memory efficient)."""
+    from services.polars_engine import open_csv
 
+    path = file
+    if hasattr(file, "read"):
+        import tempfile
+        import shutil
+        suffix = Path(file.name).suffix if hasattr(file, "name") else ".csv"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            shutil.copyfileobj(file, tmp)
+            path = tmp.name
 
-    chunks = []
-    rows_read = 0
-
-
-    for chunk in pd.read_csv(file, chunksize=chunksize, **kwargs):
-        chunk = optimize_dtypes(chunk)
-        chunks.append(chunk)
-        rows_read += len(chunk)
-        if max_rows is not None and rows_read >= max_rows:
-            break
-
-
-    if not chunks:
-        return pd.DataFrame()
-
-
-    return pd.concat(chunks, ignore_index=True)
-
-
+    ds: PolarsDataset = open_csv(path)
+    df = ds.frame.collect()
+    if max_rows is not None and df.height > max_rows:
+        df = df.head(max_rows)
+    return df
 
 
 def get_sheet_names(file) -> list[str]:
-    """Return the list of sheet names without loading any cell data."""
+    """Return the list of sheet names without loading any cell data.
+
+    Polars has no native Excel reader; pandas is kept as a bare-minimum
+    legacy shim for Excel metadata only.
+    """
+    import pandas as pd  # legacy shim for Excel metadata only
     if hasattr(file, "seek"):
         file.seek(0)
     with pd.ExcelFile(file) as xl:
         return xl.sheet_names
 
 
+def read_excel_sheet(file, sheet_name: Any = 0) -> pl.DataFrame:
+    """Read a SINGLE sheet from an Excel file via Polars.
 
-
-def read_excel_sheet(file, sheet_name: Union[str, int] = 0) -> pd.DataFrame:
-    """Read a SINGLE sheet from an Excel file with dtype optimisation."""
+    Polars has no native Excel reader; pandas is used as a thin shim then
+    converted to Polars immediately.
+    """
+    import pandas as pd  # legacy shim for Excel only
     if hasattr(file, "seek"):
         file.seek(0)
-    df = pd.read_excel(file, sheet_name=sheet_name)
-    return optimize_dtypes(df)
+    pdf = pd.read_excel(file, sheet_name=sheet_name)
+    return pl.from_pandas(pdf)
 
 
-
-
-def _pivot_impl(df: pd.DataFrame, index: str, columns: str,
-                values: str, aggfunc: str) -> pd.DataFrame:
-    """Inner implementation kept at module level so the cache is shared across calls."""
-    return pd.pivot_table(
-        df, index=index, columns=columns, values=values,
-        aggfunc=aggfunc, observed=True,
+def _pivot_impl(df: pl.DataFrame, index: str, columns: str,
+                values: str, aggfunc: str) -> pl.DataFrame:
+    """Polars-native pivot table."""
+    agg_map = {
+        "sum": pl.sum,
+        "mean": pl.mean,
+        "min": pl.min,
+        "max": pl.max,
+        "count": pl.count,
+    }
+    agg_fn = agg_map.get(aggfunc, pl.sum)
+    return df.pivot(
+        index=index,
+        columns=columns,
+        values=values,
+        aggregate_function=agg_fn,
     )
 
 
-
-
-try:
-    import streamlit as _st
-    _pivot_impl = _st.cache_data(show_spinner=False, ttl=300)(_pivot_impl)
-except Exception as exc:
-    logging.getLogger(__name__).debug("Suppressed error: %s", exc, exc_info=True)
-    pass
-
-
-
-
 def cached_pivot(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     index: str,
     columns: str,
     values: str,
     aggfunc: str,
-) -> pd.DataFrame:
-    """Cached pd.pivot_table wrapper."""
+) -> pl.DataFrame:
+    """Polars pivot table wrapper (no Streamlit cache; caller manages caching)."""
     return _pivot_impl(df, index, columns, values, aggfunc)
-
-
 
 
 _HIST_SAMPLE = 50_000
 
 
-
-
 def sample_for_histogram(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     n: int = _HIST_SAMPLE,
     random_state: int = 42,
-) -> tuple[pd.DataFrame, bool]:
+) -> tuple[pl.DataFrame, bool]:
     """Sample for histogram / distribution charts."""
     return sample_for_plot(df, n=n, random_state=random_state)
-
-
 
 
 _CAT_MAX_BARS = 50
 
 
-
-
 def top_n_with_other(
-    series: pd.Series,
+    series: pl.Series,
     n: int = _CAT_MAX_BARS,
     other_label: str = "Other",
-) -> pd.Series:
+) -> pl.Series:
     """Keep the top-n most frequent categories and replace the rest with 'Other'."""
-    top = series.value_counts().nlargest(n).index
-    return series.where(series.isin(top), other=other_label)
-
-
+    top = series.value_counts().sort("count", descending=True).head(n)
+    top_col = "series" if "series" in top.columns else top.columns[0]
+    top_vals = set(top[top_col].to_list())
+    return pl.when(series.is_in(list(top_vals))).then(series).otherwise(pl.lit(other_label))
 
 
 RENDER_LIMITS = {
-    "scatter":     8_000,
-    "histogram":  50_000,
-    "map":        10_000,
-    "line":       50_000,
-    "bar":         5_000,
-    "heatmap":       500,
+    "scatter": 8_000,
+    "histogram": 50_000,
+    "map": 10_000,
+    "line": 50_000,
+    "bar": 5_000,
+    "heatmap": 500,
 }
 
 
-
-
 def enforce_render_limit(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     chart_type: str,
     random_state: int = 42,
-) -> tuple[pd.DataFrame, bool]:
+) -> tuple[pl.DataFrame, bool]:
     """Sample df to the render budget for chart_type."""
     limit = RENDER_LIMITS.get(chart_type, 50_000)
     return sample_for_plot(df, n=limit, random_state=random_state)

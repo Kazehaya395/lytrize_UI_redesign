@@ -228,24 +228,33 @@ class AnalysisConfigPanel(QFrame):
 
     def prefill(self, values: dict) -> None:
         if self._builder is not None:
+            self._suppress_signals = True
             try:
                 self._builder.prefill(values)
             except Exception:
                 log.exception("prefill failed")
+            finally:
+                self._suppress_signals = False
 
     def prefill_layout(self, values: dict) -> None:
         if self._builder is not None:
+            self._suppress_signals = True
             try:
                 self._builder.prefill_layout(values)
             except Exception:
                 log.exception("prefill_layout failed")
+            finally:
+                self._suppress_signals = False
 
     def prefill_typography(self, values: dict) -> None:
         if self._builder is not None:
+            self._suppress_signals = True
             try:
                 self._builder.prefill_typography(values)
             except Exception:
                 log.exception("prefill_typography failed")
+            finally:
+                self._suppress_signals = False
 
     def is_dirty(self) -> bool:
         if self._builder is not None:
@@ -383,7 +392,7 @@ class AnalysisConfigPanel(QFrame):
 
     def _on_builder_values(self, payload: dict) -> None:
         """Relay a builder's values_changed payload with its kind."""
-        if not isinstance(payload, dict):
+        if getattr(self, "_suppress_signals", False) or not isinstance(payload, dict):
             return
         if "layout" in payload:
             kind = "layout"

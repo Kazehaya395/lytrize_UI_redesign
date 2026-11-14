@@ -162,7 +162,7 @@ THEMES = {
     },
 }
 
-_DEFAULT_MODE = "dark"
+_DEFAULT_MODE = "light"
 _current_mode = _DEFAULT_MODE
 _last_applied_font = None
 _last_applied_qss_mode = None
@@ -174,7 +174,17 @@ TITLE_FONT_PT = 14
 
 
 def app_font() -> QFont:
-    return QFont("", BASE_FONT_PT)
+    # Bundled Inter (registered by register_qt_fonts before the theme is
+    # applied). The previous empty family meant every machine resolved the
+    # UI font independently -- on some Windows 10 installs that lands on a
+    # legacy bitmap-style face with no curly quotes/em dash and no smoothing,
+    # which is what made the app look like it was from the XP era.
+    font = QFont("Inter", BASE_FONT_PT)
+    try:
+        font.setStyleStrategy(QFont.PreferAntialias)
+    except Exception:
+        pass
+    return font
 
 
 def current_mode() -> str:
@@ -241,7 +251,7 @@ def build_qss(mode=None):
     qss = f"""
 /* ---- Window shell ---- */
 QMainWindow, QStackedWidget#stack {{ background: palette(window); }}
-QWidget {{ color: palette(window-text); font-weight: 600; }}
+QWidget {{ color: palette(window-text); font-weight: 600; font-family: 'Inter'; }}
 /* ---- Sidebar ---- */
 QFrame#sidebar {{ background: palette(window); border-right: 1px solid palette(midlight); }}
 QLabel#brand {{ font-size: 20px; font-weight: 700; color: palette(window-text); }}

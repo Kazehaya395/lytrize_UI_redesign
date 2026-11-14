@@ -120,7 +120,8 @@ def build_report_payload(df, recipes: dict, slicers: Optional[list],
     """
     empty = {"columns": [], "rows": [], "dtypes": {},
              "truncated": False, "total_rows": 0}
-    if df is None or getattr(df, "empty", True):
+    is_empty = df is None or (df.is_empty() if hasattr(df, "is_empty") else (getattr(df, "empty", False) or len(df) == 0))
+    if is_empty:
         return empty
     try:
         cols = payload_columns(recipes, slicers, kpis)
@@ -134,9 +135,14 @@ def build_report_payload(df, recipes: dict, slicers: Optional[list],
         for col in cols:
             try:
                 series = frame[col]
-                if str(series.dtype) == "category":
-                    series = series.astype(str)
-                rows.append([_json_cell(v) for v in series.tolist()])
+                if str(series.dtype).lower() in ("category", "categorical"):
+                    if hasattr(series, "cast"):
+                        import polars as pl
+                        series = series.cast(pl.String)
+                    elif hasattr(series, "astype"):
+                        series = series.astype(str)
+                vals = series.to_list() if hasattr(series, "to_list") else series.tolist()
+                rows.append([_json_cell(v) for v in vals])
             except Exception:
                 log.debug("build_report_payload: column %r skipped", col,
                           exc_info=True)
@@ -144,16 +150,27 @@ def build_report_payload(df, recipes: dict, slicers: Optional[list],
         dtypes = {}
         for col in cols:
             try:
-                import pandas as pd
                 dt = df[col].dtype
-                if pd.api.types.is_numeric_dtype(dt):
-                    dtypes[col] = "number"
-                elif pd.api.types.is_datetime64_any_dtype(dt):
-                    dtypes[col] = "datetime"
-                elif pd.api.types.is_bool_dtype(dt):
-                    dtypes[col] = "boolean"
+                if hasattr(dt, "is_numeric"):
+                    import polars as pl
+                    if dt.is_numeric():
+                        dtypes[col] = "number"
+                    elif dt.is_temporal():
+                        dtypes[col] = "datetime"
+                    elif dt == pl.Boolean:
+                        dtypes[col] = "boolean"
+                    else:
+                        dtypes[col] = "string"
                 else:
-                    dtypes[col] = "string"
+                    import pandas as pd
+                    if pd.api.types.is_numeric_dtype(dt):
+                        dtypes[col] = "number"
+                    elif pd.api.types.is_datetime64_any_dtype(dt):
+                        dtypes[col] = "datetime"
+                    elif pd.api.types.is_bool_dtype(dt):
+                        dtypes[col] = "boolean"
+                    else:
+                        dtypes[col] = "string"
             except Exception:
                 dtypes[col] = "string"
         return {"columns": cols, "rows": rows, "dtypes": dtypes,

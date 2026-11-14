@@ -37,7 +37,6 @@ _REGISTRY['sunburst'] = SunburstSettings
 _REGISTRY['calendar_heatmap'] = CalendarHeatmapSettings
 _REGISTRY['waterfall'] = WaterfallSettings
 _REGISTRY['funnel'] = FunnelSettings
-_REGISTRY['globe_extruded_map'] = GlobeMapSettings
 def register(aid: str, cls: Type[AnalysisSettingsBase]) -> None:
     _REGISTRY[aid] = cls
 def get_builder(aid: str, parent: QWidget | None = None, **ctx):

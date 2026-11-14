@@ -1,15 +1,35 @@
-# Direct runtime dependencies used by the Qt desktop app and data engine.
-# Keep this file as the install source of truth
-# for development and Linux packages.
+# Lytrize runtime dependencies (Qt desktop app + Polars data engine).
+# Single install source of truth for development, uv venvs and the
+# frozen Windows build (build_exe.ps1).
+# Python 3.11+ is required (not enforceable from this file -- the
+# dev launch flow / installer checks for it).
+
+# --- Data engine -------------------------------------------------------------
 numpy>=1.26.0,<3.0.0
-pyarrow>=18.0.0
 pandas>=2.2.0,<3.0.0
-# Pinned during the pandas-to-Polars pilot for repeatable dtype/null behavior.
-polars==1.44.2
-# ECharts is bundled locally in backend/assets/echarts; no chart Python package
-# or network access is required at runtime.
-# pandas uses openpyxl to read .xlsx workbooks.
+# Needed at runtime by pandas' parquet path (session_bundle / excel_loader_panel /
+# workers.py read_parquet) and by the pandas -> Polars bridge (pl.from_pandas).
+# polars' own parquet is native and does not use this.
+pyarrow>=18.0.0
+# Pinned during the pandas-to-Polars migration for repeatable dtype/null behavior.
+# The [rtcompat] extra also installs polars-runtime-compat (SSE4.2-class baseline,
+# no AVX2/FMA/BMI requirement). Polars prefers that runtime at import, which keeps
+# the app alive on CPUs/VMs without those AVX-class features (the default x86-64
+# runtime hard-crashes there with a native access violation and no traceback).
+# POLARS_SKIP_CPU_CHECK=1 is NOT a substitute -- it only silences the warning.
+polars[rtcompat]==1.44.2
+
+# --- Excel import --------------------------------------------------------------
+# Imported lazily by pandas for .xlsx read/write (never imported directly in
+# app code), but the Excel workflows require it at runtime.
+# parquet goes through pyarrow above.
 openpyxl>=3.1.0,<4.0.0
-scipy>=1.12.0,<2.0.0
+
+# --- UI toolkit ----------------------------------------------------------------
+# The PySide6 meta package pulls in Essentials + Addons + WebEngine + Pdf
+# automatically; QtWebEngine is what paints the ECharts charts, so no separate
+# PySide6-WebEngine/Addons lines are needed.
 PySide6>=6.11.0,<7.0.0
-PySide6-Addons>=6.11.0,<7.0.0
+
+# ECharts itself is bundled locally in backend/assets/echarts -- no chart
+# Python package (and no plotly) is required at runtime.

@@ -39,18 +39,29 @@ class AdvancedChartSettings(CategoricalSettings):
                      nums[0] if nums else "Row count")]
         return []
 
-    def build_generate(self):
-        root = super().build_generate()
-        if self.family in {"sankey", "sunburst", "calendar_heatmap", "globe_extruded_map",
-                           "waterfall", "funnel"}:
-            self._mask_rows(root, {"Dimension", "Metric", "📊 Direction", "Top N",
-                                   "Secondary Y-Axis", "Secondary Agg"})
-        if self.family in {"sankey", "sunburst", "calendar_heatmap", "waterfall", "funnel"}:
-            self._combo_agg.setCurrentText("Sum")
-        self._extra_fields = {}
-        if not self._choices():
-            return root
+    def _build_advanced_generate(self):
+        """Build a compact FlowGrid with only family-specific fields for
+        advanced chart types (sankey, sunburst, calendar_heatmap,
+        waterfall, funnel, globe, extruded map).
+
+        Uses the same page_root/hint/stretch shell as the categorical and
+        statistical templates so this tab matches their margins, spacing and
+        section geometry exactly -- the advanced forms used to carry their own
+        bare layout, which rendered wider and cramped against the pane edge.
+        """
+        from .base import page_root
+        root, rl = page_root()
+        rl.addWidget(hint_label('Pick the columns below. Charts are live -- Generate re-renders with the current selection.'))
         flow = FlowGrid()
+        labels = {
+            'source_col': ('Source column', 'Where the flow starts (e.g. from-region)'),
+            'target_col': ('Target column', 'Where the flow goes (e.g. to-region)'),
+            'value_col': ('Value column', 'What the flow carries (Row count = link count)'),
+            'path_cols': ('Hierarchy columns', 'Outer-most to inner-most grouping'),
+            'date_col': ('Date column', 'The calendar axis for the cells'),
+            'location_col': ('Location column', 'Column holding the place names'),
+            'x': ('Category column', 'Column to split the data by'),
+        }
         for key, choices, default in self._choices():
             if key == "path_cols":
                 widget = multi_select_combo(choices)
@@ -69,10 +80,22 @@ class AdvancedChartSettings(CategoricalSettings):
             lay.setContentsMargins(0, 0, 0, 0)
             lay.setSpacing(HINT_GAP)
             lay.addWidget(widget)
-            flow.add_section(section_box(key.replace("_", " ").title(), body,
-                "Choose fields for this visual"))
+            lay.addStretch()
+            title, hint = labels.get(key, (key.replace("_", " ").title(), 'Choose fields for this visual'))
+            flow.add_section(section_box(title, body, hint))
             self._pending[key] = list(default) if key == "path_cols" else default
-        root.layout().insertWidget(max(1, root.layout().count() - 1), flow)
+        rl.addWidget(flow)
+        rl.addStretch()
+        return root
+
+    def build_generate(self):
+        # These families have a different semantic field set from a
+        # categorical bar. Building the inherited eight-field form and hiding
+        # it leaves stale controls in the object tree and makes collect/prefill
+        # disagree with what the user sees.
+        self._build()
+        self._extra_fields = {}
+        root = self._build_advanced_generate()
         return root
 
     def _on_extra(self, key, value):
@@ -93,14 +116,28 @@ class AdvancedChartSettings(CategoricalSettings):
         values = dict(values or {})
         for key, widget in self._extra_fields.items():
             selected = values.get(key)
-            if key == "path_cols":
-                if selected:
-                    widget.set_selection(selected)
-                self._pending[key] = widget.current_selected()
-            else:
-                if selected and widget.findText(str(selected)) >= 0:
-                    widget.setCurrentText(str(selected))
-                self._pending[key] = widget.currentText()
+            try:
+                if widget is None:
+                    continue
+                widget.blockSignals(True)
+                if key == "path_cols":
+                    if selected:
+                        widget.set_selection(selected)
+                    self._pending[key] = widget.current_selected()
+                else:
+                    if selected and widget.findText(str(selected)) >= 0:
+                        widget.setCurrentText(str(selected))
+                    self._pending[key] = widget.currentText()
+            except RuntimeError:
+                # The Generate page was rebuilt and the widget's C++ object is
+                # gone (Qt deletes the old tree). The fresh build already seeded
+                # itself from _pending, so there is nothing to push.
+                continue
+            finally:
+                try:
+                    widget.blockSignals(False)
+                except Exception:
+                    pass
 
     def prefill_layout(self, values):
         super().prefill_layout(values)
@@ -145,9 +182,6 @@ class AdvancedChartSettings(CategoricalSettings):
             "funnel": {"X-axis", "Y-axis", "Legend title", "Legend position",
                        "Legend layout", "Click", "Label pos", "Bar mode", "Bar gap",
                        "Show grid", "Show border"},
-            "globe_extruded_map": {"X-axis", "Y-axis", "Legend title", "Legend position",
-                                   "Legend layout", "Click", "Show value labels", "Label pos",
-                                   "Bar mode", "Bar gap", "Show grid"},
         }
         self._mask_rows(root, irrelevant.get(self.family, set()))
         extras = {
@@ -169,7 +203,6 @@ class AdvancedChartSettings(CategoricalSettings):
                        ("funnel_gap", "Stage gap (px)", []),
                        ("funnel_min_size", "Minimum width (%)", []),
                        ("funnel_max_size", "Maximum width (%)", [])],
-            "globe_extruded_map": [("map_projection", "Map projection", ["natural earth", "mercator"])],
             "nightingale_rose": [("rose_type", "Rose mode", ["area", "radius"])],
         }.get(self.family, [])
         if not extras:
@@ -213,7 +246,7 @@ class AdvancedChartSettings(CategoricalSettings):
             lay.setContentsMargins(0, 0, 0, 0)
             lay.addWidget(widget)
             flow.add_section(section_box(label, body, "Family-specific display control"))
-        root.layout().insertWidget(max(1, root.layout().count() - 1), flow)
+        root.layout().insertWidget(max(0, root.layout().count() - 1), flow)
         return root
 
     def build_typography(self):
@@ -226,6 +259,19 @@ class AdvancedChartSettings(CategoricalSettings):
         self._layout_opts[key] = value
         self._dirty = True
         self.values_changed.emit({"layout": dict(self._layout_opts)})
+
+    def collect_layout(self):
+        opts = super().collect_layout()
+        for key, widget in getattr(self, "_extra_layout_fields", {}).items():
+            try:
+                if isinstance(widget, QSpinBox):
+                    opts[key] = widget.value()
+                else:
+                    opts[key] = str(widget.currentText() or "").strip()
+            except Exception:
+                pass
+        self._layout_opts.update(opts)
+        return dict(self._layout_opts)
 
 
 class SankeySettings(AdvancedChartSettings): family = "sankey"
@@ -251,15 +297,29 @@ class RoseSettings(PieChartSettings):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(widget)
         flow.add_section(section_box("Rose mode", body, "Area = equal angle; Radius = value-scaled radius"))
-        root.layout().insertWidget(max(1, root.layout().count() - 1), flow)
+        root.layout().insertWidget(max(0, root.layout().count() - 1), flow)
         self._rose_mode = widget
         return root
 
     def prefill_layout(self, values):
         super().prefill_layout(values)
         mode = str((values or {}).get("rose_type", "area"))
-        if getattr(self, "_rose_mode", None):
-            self._rose_mode.blockSignals(True)
-            self._rose_mode.setCurrentText(mode)
-            self._rose_mode.blockSignals(False)
+        w = getattr(self, "_rose_mode", None)
+        if w is not None:
+            try:
+                w.blockSignals(True)
+                w.setCurrentText(mode)
+                w.blockSignals(False)
+            except Exception:
+                pass
         self._layout_opts["rose_type"] = mode
+
+    def collect_layout(self):
+        opts = super().collect_layout()
+        if getattr(self, "_rose_mode", None) is not None:
+            try:
+                opts["rose_type"] = str(self._rose_mode.currentText() or "").strip()
+            except Exception:
+                pass
+        self._layout_opts.update(opts)
+        return dict(self._layout_opts)

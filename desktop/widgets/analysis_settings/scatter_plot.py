@@ -32,7 +32,7 @@ from .time_series import TimeSeriesSettings
 # The scatter runner picks this at generation time, so the Layout row records
 # that choice rather than re-rendering the existing figure -- Plotly cannot
 # switch renderer on a live figure without rebuilding it.
-RENDER_MODES = ["svg", "webgl"]
+RENDER_MODES = ["svg", "canvas"]
 
 # Trendline kinds, from the old scatter panel. The regression methods map onto
 # Plotly's px.scatter_trendline names; "None" disables the overlay.
@@ -157,7 +157,8 @@ class ScatterPlotSettings(TimeSeriesSettings):
         to the service, which is the only place ``render_mode`` is honoured.
         Setting only the layout value is what left the control dead.
         """
-        self._layout_opts['render_mode'] = str(text)
+        text = "canvas" if str(text).lower() == "webgl" else str(text).lower()
+        self._layout_opts['render_mode'] = text
         self._pending['render_mode'] = str(text)
         self._mark_dirty(emit=True)
 
@@ -234,12 +235,30 @@ class ScatterPlotSettings(TimeSeriesSettings):
         self._cb_rmode = QComboBox()
         cap_widget(self._cb_rmode, 200)
         self._cb_rmode.addItems(RENDER_MODES)
-        self._cb_rmode.setCurrentText(str(self._layout_opts.get("render_mode", "svg")))
+        saved_mode = str(self._layout_opts.get("render_mode", "svg")).lower()
+        self._cb_rmode.setCurrentText("canvas" if saved_mode == "webgl" else saved_mode)
         self._cb_rmode.currentTextChanged.connect(self._on_render_mode)
         self._add_option_row(root, grid_row('Render mode', self._cb_rmode))
 
     def build_layout(self):
-        """The inherited line Layout tab plus the scatter-specific rows."""
+        """The inherited line Layout tab plus the scatter-specific rows.
+
+        A scatter draws bare points: the inherited "Show value labels" and
+        "Label pos" rows configure a label pass that does not exist, so they
+        are removed rather than left looking connected. "Markers" is the
+        line-family row for symbol-on-line; the scatter's data IS the points
+        (the renderer never reads show_markers for a scatter), so a checkbox
+        here could only lie about what it does. Removed for the same reason.
+        """
         root = super().build_layout()
+        self._mask_rows(root, ("Show value labels", "Label pos", "Markers"))
         self._add_scatter_rows(root)
+        return root
+
+    def build_typography(self):
+        root = super().build_typography()
+        # Scatter has no value labels; its point colour comes from the series
+        # palette/Colour by field and its point size from Layout's M. size.
+        # Keep tooltip color because hover is active.
+        self._mask_rows(root, ("Value color", "Value Color", "Value size"))
         return root

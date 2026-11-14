@@ -23,9 +23,13 @@ from pathlib import Path
 # The backend package is imported as top-level ``modules.*`` throughout this
 # codebase (that is how export.py, export_service.py and the page reach it), so
 # reach it the same way instead of assuming the repo root is on sys.path.
-_BACKEND = str(Path(__file__).resolve().parents[2] / "backend")
-if _BACKEND not in sys.path:
-    sys.path.insert(0, _BACKEND)
+_BACKEND_PATH = Path(__file__).resolve().parents[2] / "backend"
+# In a frozen build the backend dir does not exist on disk (its modules are in
+# the PYZ archive); inserting it would only add a dead entry to sys.path.
+if _BACKEND_PATH.exists():
+    _BACKEND = str(_BACKEND_PATH)
+    if _BACKEND not in sys.path:
+        sys.path.insert(0, _BACKEND)
 
 from modules.canvas_geometry import (  # noqa: E402,F401
     DEFAULT_H,

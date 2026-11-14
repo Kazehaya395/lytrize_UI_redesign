@@ -1,0 +1,68 @@
+Lytrize — edited files bundle, 2026-11-14
+
+Extract into your D:\My_codes\lytrize_UI_redesign\ so paths line up
+(e.g. backend\services\kpi_service.py overwrites <repo>\backend\services\kpi_service.py).
+
+Files (30):
+  - Lytrize.iss
+  - MANIFEST.txt
+  - backend/__pycache__/font_bundle.cpython-313.pyc
+  - backend/assets/echarts/lytrize_adapter.js
+  - backend/assets/echarts/lytrize_live_filter.js
+  - backend/font_bundle.py
+  - backend/modules/__pycache__/echarts_export.cpython-313.pyc
+  - backend/modules/__pycache__/legacy_plotly_adapter.cpython-313.pyc
+  - backend/modules/__pycache__/report_editor.cpython-313.pyc
+  - backend/modules/__pycache__/runtime_paths.cpython-313.pyc
+  - backend/modules/echarts_export.py
+  - backend/modules/legacy_plotly_adapter.py
+  - backend/modules/report_editor.py
+  - backend/modules/runtime_paths.py
+  - backend/services/__pycache__/kpi_service.cpython-313.pyc
+  - backend/services/__pycache__/polars_chart_service.cpython-313.pyc
+  - backend/services/__pycache__/polars_engine.cpython-313.pyc
+  - backend/services/kpi_service.py
+  - backend/services/polars_chart_service.py
+  - backend/services/polars_engine.py
+  - build_exe.ps1
+  - desktop/__pycache__/main_window.cpython-313.pyc
+  - desktop/__pycache__/theme.cpython-313.pyc
+  - desktop/main_window.py
+  - desktop/pages/__pycache__/dashboard_page.cpython-313.pyc
+  - desktop/pages/__pycache__/home_page.cpython-313.pyc
+  - desktop/pages/dashboard_page.py
+  - desktop/pages/home_page.py
+  - desktop/theme.py
+  - desktop/widgets/__pycache__/dataframe_model.cpython-313.pyc
+  - desktop/widgets/__pycache__/echarts_web_view.cpython-313.pyc
+  - desktop/widgets/__pycache__/native_table_view.cpython-313.pyc
+  - desktop/widgets/__pycache__/tile_geometry.cpython-313.pyc
+  - desktop/widgets/analysis_settings/__pycache__/advanced.cpython-313.pyc
+  - desktop/widgets/analysis_settings/__pycache__/base.cpython-313.pyc
+  - desktop/widgets/analysis_settings/__pycache__/categorical.cpython-313.pyc
+  - desktop/widgets/analysis_settings/__pycache__/correlation.cpython-313.pyc
+  - desktop/widgets/analysis_settings/__pycache__/distribution.cpython-313.pyc
+  - desktop/widgets/analysis_settings/__pycache__/matrix_table.cpython-313.pyc
+  - desktop/widgets/analysis_settings/__pycache__/scatter_plot.cpython-313.pyc
+  - desktop/widgets/analysis_settings/__pycache__/statistical.cpython-313.pyc
+  - desktop/widgets/analysis_settings/advanced.py
+  - desktop/widgets/analysis_settings/base.py
+  - desktop/widgets/analysis_settings/categorical.py
+  - desktop/widgets/analysis_settings/correlation.py
+  - desktop/widgets/analysis_settings/distribution.py
+  - desktop/widgets/analysis_settings/matrix_table.py
+  - desktop/widgets/analysis_settings/scatter_plot.py
+  - desktop/widgets/analysis_settings/statistical.py
+  - desktop/widgets/dataframe_model.py
+  - desktop/widgets/echarts_web_view.py
+  - desktop/widgets/native_table_view.py
+  - desktop/widgets/tile_geometry.py
+  - requirements.txt
+  - scripts/__pycache__/smoke_test_fixes.cpython-313.pyc
+  - scripts/smoke_test_fixes.py
+
+DELETED from the repo this session (do not expect them): run_dev.ps1, run_dev.sh, requirements-dev.txt
+
+requirements.txt is the current full dependency list incl. polars[rtcompat]==1.44.2.
+build_exe.ps1 gains -MakeInstaller (Inno Setup auto-detect: C:\Program Files\Inno Setup 7\ISCC.exe).
+Lytrize.iss is the matching installer script (per-user, no admin).

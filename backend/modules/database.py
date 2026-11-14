@@ -53,10 +53,25 @@ def _ttl_cache(ttl_seconds: float):
 
 
 import pathlib as _pathlib
-_default_db = str(
-    _pathlib.Path.home() / ".local" / "share" / "lytrize" / "lytrize.db"
-)
-DB_PATH = os.environ.get("LYTRIZE_DB_PATH") or _default_db
+import tempfile as _tempfile
+
+def _resolve_db_path() -> str:
+    env_path = os.environ.get("LYTRIZE_DB_PATH")
+    if env_path:
+        return env_path
+    home_dir = _pathlib.Path.home() / ".local" / "share" / "lytrize"
+    try:
+        home_dir.mkdir(parents=True, exist_ok=True)
+        return str(home_dir / "lytrize.db")
+    except Exception:
+        fallback = _pathlib.Path(_tempfile.gettempdir()) / "lytrize"
+        try:
+            fallback.mkdir(parents=True, exist_ok=True)
+            return str(fallback / "lytrize.db")
+        except Exception:
+            return "lytrize.db"
+
+DB_PATH = _resolve_db_path()
 
 
 
@@ -70,7 +85,7 @@ def _connect():
     try:
         db_path.parent.mkdir(parents=True, exist_ok=True)
     except Exception:
-        log.exception("_connect: failed to create parent directory %s", db_path.parent)
+        pass
 
 
     if not db_path.parent.is_dir():

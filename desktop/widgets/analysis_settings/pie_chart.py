@@ -300,19 +300,9 @@ class PieChartSettings(StatisticalSettings):
             lambda t: self._set_layout(pie_direction=t))
         self._add_option_row(root, grid_row('Direction', self._cb_pdir))
 
-        pvs = slider_with_readout(6, 24, int(self._layout_opts.get("pie_value_size", 11)))
-        self._pvs_spin = pvs._as_spin
-        try:
-            self._pvs_spin.valueChanged.connect(
-                lambda v: self._set_layout(pie_value_size=int(v)))
-        except Exception:
-            pass
-        self._add_option_row(root, grid_row('Value size', pvs))
-
-        self._sw_pvc = color_swatch(
-            str(self._layout_opts.get("pie_value_color", "#e2e8f0")),
-            lambda c: self._set_layout(pie_value_color=c))
-        self._add_option_row(root, grid_row('Value color', self._sw_pvc))
+        # Slice typography belongs in Typography, not Layout. Keep old saved
+        # layout keys as migration fallbacks in the renderer.
+        self._mask_rows(root, ("Show border",))
 
     def _sync_center_total_enabled(self, *_args):
         """Only offer the center-total toggle while the chart has a hole."""
@@ -330,7 +320,7 @@ class PieChartSettings(StatisticalSettings):
         root = super().build_layout()
         # A pie has no axes and no bars, so those controls are removed rather
         # than left in place doing nothing.
-        self._mask_rows(root, ("X-axis", "Y-axis", "Bar mode", "Bar gap", "Show grid"))
+        self._mask_rows(root, ("X-axis", "Y-axis", "Bar mode", "Bar gap", "Show grid", "Show border"))
         self._add_pie_rows(root)
         return root
 
@@ -344,5 +334,62 @@ class PieChartSettings(StatisticalSettings):
         """
         root = super().build_typography()
         self._mask_rows(root, ("Title size", "Title color", "Axis size", "Axis color"))
+        from .base import grid_row, slider_with_readout
+        from PySide6.QtWidgets import QLabel
+        label = QLabel("Slice values")
+        label.setProperty("theme_role", "section")
+        # Typography controls live in the first option column, alongside the
+        # inherited slice Value size/color controls. Inserting into page_root's
+        # outer layout puts them beside the columns and can target a zero-count
+        # layout after Qt reparents the column widget.
+        column = next((child for child in root.findChildren(QWidget)
+                       if child.property('option_column') is True), None)
+        layout = column.layout() if column is not None else None
+        if layout is None:
+            return root
+        # Append them to the column: Qt's layout can be temporarily empty
+        # while the tab is being rebuilt, so positional insertion is invalid.
+        layout.addWidget(label)
+        center_size = slider_with_readout(8, 28, int(self._typo_opts.get(
+            "pie_center_total_size", self._layout_opts.get("pie_value_size", 12))))
+        self._pie_center_size = center_size._as_spin
+        self._pie_center_size.valueChanged.connect(
+            lambda value: self._set_typo(pie_center_total_size=int(value)))
+        center_color = color_swatch(str(self._typo_opts.get(
+            "pie_center_total_color", self._layout_opts.get("pie_value_color", "auto"))),
+            lambda color: self._set_typo(pie_center_total_color=color))
+        self._pie_center_color = center_color
+        layout.addWidget(grid_row("Donut total size", center_size))
+        layout.addWidget(grid_row("Donut total color", center_color))
         return root
+
+    def prefill_typography(self, values):
+        super().prefill_typography(values)
+        values = dict(values or {})
+        size = getattr(self, "_pie_center_size", None)
+        if size is not None:
+            try:
+                size.blockSignals(True)
+                size.setValue(int(values.get("pie_center_total_size",
+                                             self._layout_opts.get("pie_value_size", 12))))
+                size.blockSignals(False)
+            except RuntimeError:
+                pass
+        swatch = getattr(self, "_pie_center_color", None)
+        if swatch is not None and hasattr(swatch, "_retint"):
+            swatch._retint(str(values.get("pie_center_total_color",
+                                          self._layout_opts.get("pie_value_color", "auto"))))
+
+    def collect_typography(self):
+        opts = super().collect_typography()
+        size = getattr(self, "_pie_center_size", None)
+        if size is not None:
+            try:
+                opts["pie_center_total_size"] = int(size.value())
+            except RuntimeError:
+                pass
+        swatch = getattr(self, "_pie_center_color", None)
+        if swatch is not None:
+            opts["pie_center_total_color"] = str(getattr(swatch, "_color_value", "auto"))
+        return opts
 

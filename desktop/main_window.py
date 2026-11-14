@@ -77,7 +77,11 @@ class MainWindow(QMainWindow):
     def _load_logo(self) -> "QPixmap | None":
         """Return a scaled ``QPixmap`` of the app logo for the sidebar brand,
         or ``None`` if the asset is missing."""
-        assets = Path(__file__).resolve().parent.parent / "backend" / "assets"
+        try:
+            from modules.runtime_paths import assets_root
+            assets = assets_root()
+        except Exception:  # backend not importable yet: source-tree answer
+            assets = Path(__file__).resolve().parent.parent / "backend" / "assets"
         pixmap = QPixmap()
         for name in ("lytrize.png", "Lytrize.png", "lytrize.ico", "Lytrize.ico"):
             candidate = assets / name

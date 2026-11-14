@@ -31,15 +31,39 @@ Nothing here imports Qt or Plotly, so it is testable without a display.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import uuid
 from typing import Any, Optional
 
-import pandas as pd
+import polars as pl
 
 from services.filter_service import apply_specs, describe_spec
 
 log = logging.getLogger(__name__)
+
+
+def _to_datetime(value: Any):
+    """Parse *value* as a timestamp, or return None when it is not one.
+
+    Datetime slider bounds arrive as ISO strings, so the two bounds have to be
+    parsed before they can be compared. A bound that cannot be parsed yields
+    None, which makes the bounds degenerate -- an unmovable handle is not a
+    control, so the caller drops the slider option rather than offering one
+    that cannot work.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value
+    try:
+        parsed = pl.Series([str(value)]).str.to_datetime(strict=False)
+    except Exception as exc:
+        log.debug("could not parse %r as a timestamp: %s", value, exc)
+        return None
+    if parsed.null_count():
+        return None
+    return parsed.item()
 
 # How a slicer presents its values. Each maps to a filter kind in
 # filter_service, so the widget is a RENDERING choice, not a semantic one: a
@@ -109,7 +133,7 @@ def bounds_are_degenerate(bounds: dict) -> bool:
 
     if bounds.get("kind") == "datetime":
         try:
-            same = pd.to_datetime(low) == pd.to_datetime(high)
+            same = _to_datetime(low) == _to_datetime(high)
         except (ValueError, TypeError):
             return True
         return bool(same)
@@ -154,8 +178,9 @@ def available_widgets(df, column: str, roles: Optional[dict] = None) -> list:
     # dimension by dtype but has a real temporal range, so it must also offer
     # the slider -- the "slicer missing slider for continuous & date" report.
     from services.filter_service import numeric_bounds, _series_is_datetime_text
-    is_datetime = (bool(pd.api.types.is_datetime64_any_dtype(df[column]))
-                   or _series_is_datetime_text(df[column]))
+    series = df[column]
+    is_datetime = (series.dtype in (pl.Date, pl.Datetime, pl.Time)
+                   or _series_is_datetime_text(series))
     is_measure = str(column) in measures or is_datetime
 
     kinds = list(_WIDGETS_FOR_MEASURE if is_measure
@@ -427,6 +452,8 @@ def apply_selection(slicer: dict, role: str, raw: Any) -> dict:
         except (TypeError, ValueError):
             return slicer
         spec["n"] = max(1, number)
+    elif role == "mode" and kind == "top_n":
+        spec["least"] = str(raw or "").strip().lower().startswith("small")
     else:
         return slicer
 

@@ -17,9 +17,17 @@ log = logging.getLogger(__name__)
 
 
 class ImportWorker(QThread):
-    """Load a CSV/XLSX file in a background thread."""
+    """Load a CSV/XLSX file in a background thread.
 
-    finished_ok = Signal(object)      # emits pd.DataFrame
+    The result is a **Polars** DataFrame: the whole application downstream of
+    the import is Polars-native, so handing it a pandas frame would mean
+    converting the data twice (once here, once at every consumer). pandas is
+    still used to READ Excel, because Polars cannot parse ``.xlsx`` -- that
+    frame is converted to Polars immediately, at this boundary, and never
+    travels further as pandas.
+    """
+
+    finished_ok = Signal(object)      # emits pl.DataFrame
     polars_ready = Signal(object)     # emits optional PolarsDataset snapshot
     failed = Signal(str)              # emits error message
 
@@ -30,7 +38,6 @@ class ImportWorker(QThread):
     def run(self) -> None:
         try:
             from pathlib import Path
-            from modules.utils.perf import read_csv_fast
 
             path = Path(self._file_path)
             if path.suffix.lower() == ".csv":
@@ -40,38 +47,74 @@ class ImportWorker(QThread):
                 try:
                     from services.polars_engine import open_csv
                     polars_data = open_csv(path)
-                    # Emit the lazy dataset as the primary result; downstream
-                    # consumers that need a pandas frame can call .to_pandas().
-                    self.finished_ok.emit(polars_data.frame.collect().to_pandas())
+                    self.finished_ok.emit(self._user_frame(polars_data))
                     self.polars_ready.emit(polars_data)
                     return
                 except Exception:
-                    # Polars path failed (e.g., missing extension, corrupted file);
-                    # fall back to Pandas read_csv_fast.
+                    # Polars path failed (e.g., missing extension, corrupted
+                    # file); fall back to Pandas read_csv_fast and convert at
+                    # the boundary.
+                    from modules.utils.perf import read_csv_fast
                     df = read_csv_fast(path)
-                    self.finished_ok.emit(df)
-                    # Derive a Polars snapshot from the Pandas frame for downstream use.
-                    try:
-                        from services.polars_engine import PolarsDataset
-                        polars_data = PolarsDataset.from_pandas(df, source=str(path))
-                    except Exception:
-                        polars_data = None
+                    polars_data = self._dataset_from_pandas(df, path)
+                    self.finished_ok.emit(
+                        self._user_frame(polars_data)
+                        if polars_data is not None else _to_polars(df))
                     self.polars_ready.emit(polars_data)
                     return
             else:
+                # Excel: pandas is the only reader available, so it is used
+                # here and ONLY here. The frame is converted to Polars
+                # immediately -- no pandas object escapes this method.
                 df = pd.read_excel(path)
-                try:
-                    from services.polars_engine import PolarsDataset
-                    polars_data = PolarsDataset.from_pandas(
-                        df, source=str(path))
-                except Exception as exc:
-                    log.info("Polars Excel compatibility conversion unavailable: %s", exc)
-                    polars_data = None
-            self.finished_ok.emit(df)
-            self.polars_ready.emit(polars_data)
+                polars_data = self._dataset_from_pandas(df, path)
+                self.finished_ok.emit(
+                    self._user_frame(polars_data)
+                    if polars_data is not None else _to_polars(df))
+                self.polars_ready.emit(polars_data)
         except Exception as exc:
             log.error("ImportWorker failed: %s", exc)
             self.failed.emit(str(exc))
+
+    @staticmethod
+    def _dataset_from_pandas(df, path):
+        """Build the lazy Polars snapshot for a pandas frame, or None."""
+        try:
+            from services.polars_engine import PolarsDataset
+            return PolarsDataset.from_pandas(df, source=str(path))
+        except Exception as exc:
+            log.info("Polars compatibility conversion unavailable: %s", exc)
+            return None
+
+    @staticmethod
+    def _user_frame(dataset):
+        """The dataset's rows WITHOUT the internal row-id column.
+
+        ``PolarsDataset`` carries a ``__ly_row_id`` column so the native
+        query engine can rank and join rows stably. That column is an
+        implementation detail and must not appear in the user's table, the
+        column-role drop-downs, or the exported CSV.
+        """
+        import polars as pl
+        frame = dataset.frame.collect()
+        row_id = getattr(dataset, "row_id", None)
+        if row_id and row_id in frame.columns:
+            frame = frame.drop(row_id)
+        return frame
+
+
+def _to_polars(df) -> "pl.DataFrame":
+    """Convert a pandas frame to Polars, tolerating an unusable input."""
+    import polars as pl
+    if df is None:
+        return pl.DataFrame()
+    if isinstance(df, pl.DataFrame):
+        return df
+    try:
+        return pl.from_pandas(df, include_index=False)
+    except Exception as exc:
+        log.error("could not convert the imported frame to Polars: %s", exc)
+        return pl.DataFrame()
 
 
 class ChartGenerationWorker(QThread):
@@ -122,13 +165,17 @@ class ChartGenerationWorker(QThread):
                 model, self._layout_opts or {}, self._typo_opts or {}))
         return result
 
+    def _get_dataset(self):
+        if self._polars_dataset is not None:
+            return self._polars_dataset
+        from services.polars_engine import ensure_dataset
+        return ensure_dataset(self._df)
+
     def run(self) -> None:
         try:
             if self._aid == "descriptive":
-                from services.polars_engine import PolarsDataset
                 from services.polars_chart_service import build_descriptive_table_chart
-                dataset = (self._polars_dataset or
-                           PolarsDataset.from_pandas(self._df))
+                dataset = self._get_dataset()
                 model = build_descriptive_table_chart(
                     dataset, roles=self._roles, layout=self._layout_opts,
                     typography=self._typo_opts,
@@ -143,10 +190,8 @@ class ChartGenerationWorker(QThread):
                 # aggregation, ChartModel carries the result, and the Analysis
                 # page displays it with ECharts. This path does not construct
                 # a Plotly figure or pass through the legacy chart runner.
-                from services.polars_engine import PolarsDataset
                 from services.polars_chart_service import build_pie_chart
-                dataset = (self._polars_dataset or
-                           PolarsDataset.from_pandas(self._df))
+                dataset = self._get_dataset()
                 model = build_pie_chart(
                     dataset, self._widget_values, roles=self._roles,
                     layout=self._layout_opts, typography=self._typo_opts,
@@ -157,10 +202,8 @@ class ChartGenerationWorker(QThread):
                 return
 
             if self._aid == "categorical":
-                from services.polars_engine import PolarsDataset
                 from services.polars_chart_service import build_categorical_charts
-                dataset = (self._polars_dataset or
-                           PolarsDataset.from_pandas(self._df))
+                dataset = self._get_dataset()
                 models = build_categorical_charts(
                     dataset, self._widget_values, roles=self._roles,
                     layout=self._layout_opts, typography=self._typo_opts,
@@ -172,10 +215,8 @@ class ChartGenerationWorker(QThread):
                 return
 
             if self._aid == "statistical":
-                from services.polars_engine import PolarsDataset
                 from services.polars_chart_service import build_statistical_charts
-                dataset = (self._polars_dataset or
-                           PolarsDataset.from_pandas(self._df))
+                dataset = self._get_dataset()
                 models = build_statistical_charts(
                     dataset, self._widget_values, roles=self._roles,
                     layout=self._layout_opts, typography=self._typo_opts,
@@ -187,10 +228,8 @@ class ChartGenerationWorker(QThread):
                 return
 
             if self._aid == "correlation":
-                from services.polars_engine import PolarsDataset
                 from services.polars_chart_service import build_correlation_chart
-                dataset = (self._polars_dataset or
-                           PolarsDataset.from_pandas(self._df))
+                dataset = self._get_dataset()
                 model = build_correlation_chart(
                     dataset, self._widget_values, roles=self._roles,
                     layout=self._layout_opts, typography=self._typo_opts,
@@ -201,10 +240,8 @@ class ChartGenerationWorker(QThread):
                 return
 
             if self._aid == "matrix_heatmap":
-                from services.polars_engine import PolarsDataset
                 from services.polars_chart_service import build_matrix_heatmap_chart
-                dataset = (self._polars_dataset or
-                           PolarsDataset.from_pandas(self._df))
+                dataset = self._get_dataset()
                 model = build_matrix_heatmap_chart(
                     dataset, self._widget_values, roles=self._roles,
                     layout=self._layout_opts, typography=self._typo_opts,
@@ -215,10 +252,8 @@ class ChartGenerationWorker(QThread):
                 return
 
             if self._aid == "matrix_table":
-                from services.polars_engine import PolarsDataset
                 from services.polars_chart_service import build_matrix_table_chart
-                dataset = (self._polars_dataset or
-                           PolarsDataset.from_pandas(self._df))
+                dataset = self._get_dataset()
                 model = build_matrix_table_chart(
                     dataset, self._widget_values, roles=self._roles,
                     layout=self._layout_opts, typography=self._typo_opts,
@@ -229,10 +264,8 @@ class ChartGenerationWorker(QThread):
                 return
 
             if self._aid == "time_series":
-                from services.polars_engine import PolarsDataset
                 from services.polars_chart_service import build_time_series_chart
-                dataset = (self._polars_dataset or
-                           PolarsDataset.from_pandas(self._df))
+                dataset = self._get_dataset()
                 model = build_time_series_chart(
                     dataset, self._widget_values, roles=self._roles,
                     layout=self._layout_opts, typography=self._typo_opts,
@@ -243,10 +276,8 @@ class ChartGenerationWorker(QThread):
                 return
 
             if self._aid == "distribution":
-                from services.polars_engine import PolarsDataset
                 from services.polars_chart_service import build_distribution_charts
-                dataset = (self._polars_dataset or
-                           PolarsDataset.from_pandas(self._df))
+                dataset = self._get_dataset()
                 models = build_distribution_charts(
                     dataset, self._widget_values, roles=self._roles,
                     layout=self._layout_opts, typography=self._typo_opts,
@@ -258,10 +289,8 @@ class ChartGenerationWorker(QThread):
                 return
 
             if self._aid == "scatter_plot":
-                from services.polars_engine import PolarsDataset
                 from services.polars_chart_service import build_scatter_chart
-                dataset = (self._polars_dataset or
-                           PolarsDataset.from_pandas(self._df))
+                dataset = self._get_dataset()
                 model = build_scatter_chart(
                     dataset, self._widget_values, roles=self._roles,
                     layout=self._layout_opts, typography=self._typo_opts,
@@ -272,10 +301,8 @@ class ChartGenerationWorker(QThread):
                 return
 
             if self._aid == "outlier":
-                from services.polars_engine import PolarsDataset
                 from services.polars_chart_service import build_outlier_charts
-                dataset = (self._polars_dataset or
-                           PolarsDataset.from_pandas(self._df))
+                dataset = self._get_dataset()
                 columns = (self._widget_values.get("x_cols")
                            or self._widget_values.get("columns")
                            or (self._roles or {}).get("numeric")
@@ -292,10 +319,8 @@ class ChartGenerationWorker(QThread):
                 return
 
             if self._aid == "data_quality":
-                from services.polars_engine import PolarsDataset
                 from services.polars_chart_service import build_data_quality_charts
-                dataset = (self._polars_dataset or
-                           PolarsDataset.from_pandas(self._df))
+                dataset = self._get_dataset()
                 models = build_data_quality_charts(dataset)
                 self.finished_ok.emit([
                     (model["uid"], model["title"], model)
@@ -304,10 +329,8 @@ class ChartGenerationWorker(QThread):
                 return
 
             if self._aid == "map_plot":
-                from services.polars_engine import PolarsDataset
                 from services.polars_chart_service import build_map_plot_chart
-                dataset = (self._polars_dataset or
-                           PolarsDataset.from_pandas(self._df))
+                dataset = self._get_dataset()
                 model = build_map_plot_chart(
                     dataset, self._widget_values, layout=self._layout_opts,
                     typography=self._typo_opts,
@@ -315,6 +338,19 @@ class ChartGenerationWorker(QThread):
                 # Map Plot is an offline native route. Unsupported or empty
                 # spatial input reports no chart instead of silently calling
                 # the old network-backed Plotly basemap runner.
+                self.finished_ok.emit(
+                    [(item["uid"], item["title"], item)
+                     for item in self._with_display_options([model])])
+                return
+            if self._aid == "sankey":
+                from services.polars_chart_service import build_advanced_chart
+                dataset = self._get_dataset()
+                config = dict(self._widget_values or {})
+                config["chart_type"] = "sankey"
+                model = build_advanced_chart(
+                    dataset, config, roles=self._roles,
+                    layout=self._layout_opts, typography=self._typo_opts,
+                )
                 self.finished_ok.emit(
                     [(item["uid"], item["title"], item)
                      for item in self._with_display_options([model])])
@@ -575,8 +611,9 @@ class ReportInputsWorker(QThread):
             # state + does a grid-blob migration; duplicating it here would
             # drift). The worker returns filtered charts + payload; the page
             # merges its cheap geometry maps afterwards.
+            has_df = df is not None and not (df.is_empty() if hasattr(df, "is_empty") else len(df) == 0)
             if (not has_live_data and charts and active_slicers(slicers)
-                    and df is not None and not df.empty and recipes):
+                    and has_df and recipes):
                 try:
                     hit = set(affected_charts(recipes, slicers))
                     # Each chart re-runs against only the slicers that

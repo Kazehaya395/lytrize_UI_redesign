@@ -28,7 +28,7 @@ table's own header/body font sizes and colours are Layout options instead, which
 is where ``_apply_table_options`` reads them.
 """
 from __future__ import annotations
-from PySide6.QtWidgets import QComboBox
+from PySide6.QtWidgets import QCheckBox, QComboBox
 from .base import cap_widget, color_swatch, slider_with_readout, grid_row
 from .matrix_heatmap import MatrixHeatmapSettings
 
@@ -41,6 +41,8 @@ TABLE_NUM_FORMATS = [",.2f", ",.1f", ",.0f", ".2f", ".1f", ".0f"]
 class MatrixTableSettings(MatrixHeatmapSettings):
     """Generate + Layout + Typography settings for the Pivot Table type."""
 
+    supports_row_hierarchy = True
+
     def _build(self):
         super()._build()
         for attr in ('_cb_ialign', '_cb_dalign', '_cb_numfmt', '_rqh_spin',
@@ -50,11 +52,15 @@ class MatrixTableSettings(MatrixHeatmapSettings):
                 setattr(self, attr, None)
 
     def _add_table_rows(self, root):
-        """Append the twelve table styling rows to the Layout option column.
+        """Append the twelve table styling rows, split across the columns.
 
-        Grouped the way the old main view / popover split them, so the four
-        always-visible controls read together and the eight that were behind
-        "Advanced" follow.
+        The inherited Layout tab leaves its left column with only "Chart
+        title" once the heatmap rows are masked, so appending every table
+        row to the right column produced one starved column beside one
+        overflowing one (the reported spacing bug). The body/colour rows go
+        under "Chart title" in the left column; the header/alignment/format
+        and heat rows continue the right column, which keeps its inherited
+        "Show border" row.
         """
         # -- Main view in the old app: the two font sizes + the row height ----
         for attr, key, lo, hi, dflt, label, cast in (
@@ -69,18 +75,18 @@ class MatrixTableSettings(MatrixHeatmapSettings):
                     lambda v, k=key, c=cast: self._set_layout(**{k: c(v)}))
             except Exception:
                 pass
-            self._add_option_row(root, grid_row(label, sl))
+            self._add_option_row(root, grid_row(label, sl), column_index=0)
 
         # -- The four colour rows --------------------------------------------
         for attr, key, dflt, label in (
-                ('_sw_tfc', 'table_font_color', '#f1f5f9', 'Font color'),
+                ('_sw_tfc', 'table_font_color', 'auto', 'Font color'),
                 ('_sw_thc', 'table_header_color', '#6163df', 'Hdr color'),
-                ('_sw_tsec', 'table_stripe_even_color', '#1e293b', 'Even stripe'),
-                ('_sw_tsoc', 'table_stripe_odd_color', '#0f172a', 'Odd stripe')):
+                ('_sw_tsec', 'table_stripe_even_color', 'auto', 'Even stripe'),
+                ('_sw_tsoc', 'table_stripe_odd_color', 'auto', 'Odd stripe')):
             sw = color_swatch(str(self._layout_opts.get(key, dflt)),
                               lambda c, k=key: self._set_layout(**{k: c}))
             setattr(self, attr, sw)
-            self._add_option_row(root, grid_row(label, sw))
+            self._add_option_row(root, grid_row(label, sw), column_index=0)
 
         # -- The old "Advanced" popover, in its order ------------------------
         thh = slider_with_readout(16, 60,
@@ -107,6 +113,17 @@ class MatrixTableSettings(MatrixHeatmapSettings):
             setattr(self, attr, cb)
             self._add_option_row(root, grid_row(label, cb))
 
+        # -- Conditional heat coloring -----------------------------------------
+        heat_cb = QCheckBox("Heat coloring")
+        heat_cb.setChecked(bool(self._layout_opts.get("table_heat_enabled", True)))
+        heat_sw = color_swatch(str(self._layout_opts.get("table_heat_color", "#1e40af")),
+                               lambda c: self._set_layout(table_heat_color=c))
+        heat_cb.toggled.connect(lambda checked: self._set_layout(table_heat_enabled=bool(checked)))
+        self._heat_cb = heat_cb
+        self._sw_heat = heat_sw
+        self._add_option_row(root, grid_row("Heat color on", heat_cb))
+        self._add_option_row(root, grid_row("Heat accent", heat_sw))
+
     def build_layout(self):
         """The shared Layout tab with the heatmap rows replaced by table rows.
 
@@ -120,6 +137,7 @@ class MatrixTableSettings(MatrixHeatmapSettings):
                                "CB tick clr", "CB title sz", "CB title clr",
                                "Colorbar pos", "Annotations", "Ann size",
                                "Precision", "Ann color", "Label pos"))
+        self._drop_empty_option_columns(root)
         self._add_table_rows(root)
         return root
 
@@ -132,6 +150,8 @@ class MatrixTableSettings(MatrixHeatmapSettings):
         """
         root = super().build_typography()
         self._mask_rows(root, ("Title size", "Title color", "Axis size",
-                               "Axis color", "Legend size", "Legend color"))
+                               "Axis color", "Legend size", "Legend color",
+                               "Tooltip size", "Tooltip color"))
+        self._drop_empty_option_columns(root)
         return root
 

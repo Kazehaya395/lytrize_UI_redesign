@@ -2026,7 +2026,7 @@ def test_draft_restore_survives_corrupt_row():
 def test_crasher_font_guard():
     """The app must not segfault on startup while shaping UI text.
 
-    Regression: ``run_dev.sh`` died with SIGSEGV before its first frame. The
+    Regression: the old dev launcher (run_dev.sh, since removed) died with SIGSEGV before its first frame. The
     stack was ``QPushButton::sizeHint -> QFontMetrics::boundingRect ->
     QTextEngine::shapeText -> FcCharSetHasChar`` -- a crash inside fontconfig
     while Qt probed the fallback chain for a glyph. Two offenders on this

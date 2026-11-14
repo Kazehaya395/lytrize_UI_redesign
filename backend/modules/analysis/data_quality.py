@@ -41,7 +41,7 @@ def duplicate_rows(df: pd.DataFrame, pk_col: str = None) -> pd.DataFrame:
     """Return all rows involved in a duplicate group, optionally scoped to *pk_col*."""
     subset = [pk_col] if pk_col else None
     mask = df.duplicated(subset=subset, keep=False)
-    return df[mask].sort_values(by=df.columns.tolist())
+    return df[mask].sort_values(by=list(df.columns))
 
 
 # ── Pure cleaning actions (return a NEW DataFrame; caller applies it) ──

@@ -61,7 +61,7 @@ the Streamlit grouping):
     ``is_dual_axis_chart(fig)``); the third field writes ``y2_label``.
 """
 from __future__ import annotations
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QComboBox, QLineEdit, QSpinBox, QLabel
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QComboBox, QLineEdit, QSpinBox, QLabel, QCheckBox
 from .base import (hint_label, cap_widget, slider_with_readout, GEN_W,
                    HINT_GAP, page_root, section_box, grid_row, FlowGrid)
 from .statistical import StatisticalSettings, NONE_SENTINEL
@@ -77,6 +77,7 @@ except Exception:  # pragma: no cover - fallback keeps the form buildable
 # flow grid's minimum column width cannot drift from it.
 # The old panel's Direction choices (verbatim labels).
 DIRECTIONS = ['Vertical (Column chart)', 'Horizontal (Bar chart)']
+SORTS = ['Value (Desc)', 'Value (Asc)', 'Category (A-Z)', 'Category (Z-A)']
 
 class CategoricalSettings(StatisticalSettings):
     """Generate + Layout + Typography settings for the categorical type."""
@@ -87,9 +88,14 @@ class CategoricalSettings(StatisticalSettings):
         # dimension and the metric are each a single column (the runner still
         # receives one-element lists, per WIDGET_SPEC), and the scalar
         # controls have no template equivalent at all.
-        self._pending = {'x': [], 'y': [], 'agg': AGGS[0], 'top_n': 0,
-                         'direction': DIRECTIONS[0], 'dual_y': '',
+        self._pending = {'x': [], 'y': [], 'agg': AGGS[0], 'sort_by': SORTS[0],
+                         'top_n': 0, 'direction': DIRECTIONS[0], 'dual_y': '',
                          'dual_y_agg': AGGS[0], 'palette': None}
+        # New categorical charts default value labels OFF (the shared
+        # template defaults them on for every type; this type opts out).
+        # A saved recipe's stored choice is restored by prefill_layout,
+        # so forcing the default here only affects brand-new charts.
+        self._layout_opts['show_value_labels'] = False
 
     # -- Generate ----------------------------------------------------------
     def _combo_section(self, title, hint, items, current, on_change):
@@ -138,10 +144,14 @@ class CategoricalSettings(StatisticalSettings):
             AGGS, AGGS[0], self._on_agg)
         flow.add_section(box)
 
-        # -- Slots 4-6: Direction | Top N | Secondary Y-Axis ----------------
+        # -- Slots 4-6: Direction | Sort by | Top N | Secondary Y-Axis ------
         box, self._combo_dir = self._combo_section(
             '\U0001f4ca Direction', 'Vertical = column chart. Horizontal = bar chart.',
             DIRECTIONS, DIRECTIONS[0], self._on_direction)
+        flow.add_section(box)
+        box, self._combo_sort = self._combo_section(
+            'Sort by', 'Order categories by value or name',
+            SORTS, self._pending.get('sort_by') or SORTS[0], self._on_sort)
         flow.add_section(box)
         tbox = QWidget()
         tl = QVBoxLayout(tbox)
@@ -186,6 +196,8 @@ class CategoricalSettings(StatisticalSettings):
             self._on_metric(self._combo_metric.currentText())
             self._on_agg(self._combo_agg.currentText())
             self._on_direction(self._combo_dir.currentText())
+            if hasattr(self, '_combo_sort'):
+                self._on_sort(self._combo_sort.currentText())
             self._on_topn(int(self._spin_topn.value()))
             self._on_dual_y(self._combo_dual.currentText())
             self._on_dual_agg(self._combo_dual_agg.currentText())
@@ -206,6 +218,10 @@ class CategoricalSettings(StatisticalSettings):
         self._pending['agg'] = text if text in AGGS else AGGS[0]
         self._mark_dirty(emit=True)
 
+    def _on_sort(self, text):
+        self._pending['sort_by'] = text if text in SORTS else SORTS[0]
+        self._mark_dirty(emit=True)
+
     def _on_topn(self, value):
         self._pending['top_n'] = int(value)
         self._mark_dirty(emit=True)
@@ -216,6 +232,10 @@ class CategoricalSettings(StatisticalSettings):
 
     def _on_dual_y(self, text):
         self._pending['dual_y'] = text if text else ''
+        visible = bool(self._pending['dual_y'])
+        row = getattr(self, '_row_secondary_labels', None)
+        if row is not None:
+            row.setVisible(visible)
         self._mark_dirty(emit=True)
 
     def _on_dual_agg(self, text):
@@ -227,6 +247,7 @@ class CategoricalSettings(StatisticalSettings):
         return {'x': list(p.get('x') or []),
                 'y': list(p.get('y') or []),
                 'agg': str(p.get('agg') or AGGS[0]),
+                'sort_by': str(p.get('sort_by') or SORTS[0]),
                 'top_n': int(p.get('top_n') or 0),
                 'direction': str(p.get('direction') or DIRECTIONS[0]),
                 'dual_y': str(p.get('dual_y') or ''),
@@ -254,6 +275,8 @@ class CategoricalSettings(StatisticalSettings):
         d_agg = d_agg if d_agg in AGGS else AGGS[0]
         direction = str(v.get('direction') or '')
         direction = direction if direction in DIRECTIONS else DIRECTIONS[0]
+        sort_by = str(v.get('sort_by') or v.get('sort') or SORTS[0])
+        sort_by = sort_by if sort_by in SORTS else SORTS[0]
         try:
             top_n = int(v.get('top_n') or 0)
         except Exception:
@@ -264,6 +287,7 @@ class CategoricalSettings(StatisticalSettings):
         pal = pal if pal in pals else (pals[0] if pals else None)
         try:
             self._pending.update({'x': x_want, 'y': y_want, 'agg': agg,
+                                  'sort_by': sort_by,
                                   'top_n': top_n, 'direction': direction,
                                   'dual_y': dual, 'dual_y_agg': d_agg,
                                   'palette': pal})
@@ -279,6 +303,7 @@ class CategoricalSettings(StatisticalSettings):
                             ('_combo_metric', y0),
                             ('_combo_agg', self._pending.get('agg')),
                             ('_combo_dir', self._pending.get('direction')),
+                            ('_combo_sort', self._pending.get('sort_by')),
                             ('_combo_dual', self._pending.get('dual_y')),
                             ('_combo_dual_agg', self._pending.get('dual_y_agg')),
                             ('_combo_palette', self._pending.get('palette'))):
@@ -307,6 +332,7 @@ class CategoricalSettings(StatisticalSettings):
         the legend rows and the border toggle (has_legend=False and no
         colour bar, so both would be dead controls)."""
         root = super().build_layout()
+        self._mask_rows(root, ("Show value labels",))
         try:
             self._le_title.setPlaceholderText('Mean <metric> by <dimension>')
         except Exception:
@@ -342,6 +368,21 @@ class CategoricalSettings(StatisticalSettings):
                 pass
             lay_r.insertWidget(lay_r.indexOf(row_bm) + 1,
                                grid_row('Line width', lw))
+        self._ck_primary_values = QCheckBox('Primary Y-axis labels')
+        self._ck_primary_values.setChecked(bool(self._layout_opts.get(
+            'primary_show_value_labels', self._layout_opts.get('show_value_labels', False))))
+        self._ck_primary_values.toggled.connect(lambda value: self._set_layout(
+            primary_show_value_labels=bool(value), show_value_labels=bool(value)))
+        self._ck_secondary_values = QCheckBox('Secondary Y-axis labels')
+        self._ck_secondary_values.setChecked(bool(self._layout_opts.get(
+            'secondary_show_value_labels', self._layout_opts.get('show_value_labels', False))))
+        self._ck_secondary_values.setVisible(bool(self._pending.get('dual_y')))
+        self._ck_secondary_values.toggled.connect(lambda value: self._set_layout(
+            secondary_show_value_labels=bool(value)))
+        lay_r.addWidget(grid_row('Value labels', self._ck_primary_values))
+        self._row_secondary_labels = grid_row('Secondary labels', self._ck_secondary_values)
+        self._row_secondary_labels.setVisible(bool(self._pending.get('dual_y')))
+        lay_r.addWidget(self._row_secondary_labels)
         # Legend title / Legend position / Show border are deliberately NOT
         # masked here. The categorical runner draws a second series (the
         # Secondary Y-Axis overlay) and Plotly legends it, so a legend really
@@ -352,6 +393,16 @@ class CategoricalSettings(StatisticalSettings):
 
     def prefill_layout(self, values):
         super().prefill_layout(values)
+        # Prefill blocks signals on the Generate combo, so synchronize the
+        # secondary-label row explicitly when switching between saved charts.
+        row = getattr(self, '_row_secondary_labels', None)
+        if row is not None:
+            try:
+                row.setVisible(bool(self._pending.get('dual_y')))
+            except RuntimeError:
+                # A rebuilt settings page may leave Python's reference to the
+                # prior Qt widget alive after its C++ object has been deleted.
+                pass
         for attr, key, dflt in (('_le_y2', 'y2_label', ''),
                                 ('_lw_spin', 'line_width', LINE_WIDTH_DEFAULT)):
             try:
@@ -366,6 +417,23 @@ class CategoricalSettings(StatisticalSettings):
                 w.blockSignals(False)
             except Exception:
                 pass
+
+    def collect_layout(self):
+        opts = super().collect_layout()
+        primary = getattr(self, '_ck_primary_values', None)
+        secondary = getattr(self, '_ck_secondary_values', None)
+        try:
+            if primary is not None:
+                opts['primary_show_value_labels'] = bool(primary.isChecked())
+                opts['show_value_labels'] = bool(primary.isChecked())
+        except RuntimeError:
+            pass
+        try:
+            if secondary is not None:
+                opts['secondary_show_value_labels'] = bool(secondary.isChecked())
+        except RuntimeError:
+            pass
+        return opts
 
 # line_width range/default from the old _CONTROL_META (slider 1..10, d=2).
 LINE_WIDTH_RANGE = (1, 10)

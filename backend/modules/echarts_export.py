@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import re
 from html import escape
 from pathlib import Path
 
 from modules.board_model import validate_board
 from modules.chart_model import validate_chart_model
+from modules.runtime_paths import assets_root
 
 
 def _portable_image_uri(value: object) -> str:
@@ -37,14 +39,14 @@ def _script_safe(value: str) -> str:
 
 def _map_geojson_for_models(models) -> dict:
     """Load only allow-listed bundled map assets needed by exported models."""
-    root = Path(__file__).resolve().parents[1] / "assets" / "echarts" / "maps" / "natural-earth"
+    root = assets_root() / "echarts" / "maps" / "natural-earth"
     allowed = {"countries-110m": "countries-110m.geojson",
                "admin1-50m": "admin1-50m.geojson"}
     requested = set()
     for model in models:
         map_data = (model.get("data") or {}).get("map") or {}
         asset = map_data.get("asset")
-        if model.get("chart_type") in {"map_plot", "globe_extruded_map"} and asset in allowed:
+        if model.get("chart_type") in {"map_plot"} and asset in allowed:
             requested.add(asset)
     return {asset: json.loads((root / allowed[asset]).read_text(encoding="utf-8"))
             for asset in sorted(requested)}
@@ -63,13 +65,63 @@ def _map_register_script(assets: dict) -> str:
 
 
 def _map_dataset_notice() -> str:
-    metadata = Path(__file__).resolve().parents[1] / "assets" / "echarts" / "maps" / "natural-earth" / "metadata.json"
+    metadata = assets_root() / "echarts" / "maps" / "natural-earth" / "metadata.json"
     try:
         details = json.loads(metadata.read_text(encoding="utf-8"))
         return (f"Natural Earth Vector {details.get('version', 'unknown')}; "
                 f"{details.get('attribution', 'Public domain')}; generalized cartographic boundaries")
     except Exception:
         return "Natural Earth Vector; generalized cartographic boundaries; public domain"
+
+
+def _kpi_trend_fragment(trend, direction, props):
+    """Pre-render a KPI's trend sparkline and +/- delta for the static file.
+
+    The live-filter worker repaints both from the same fields on every
+    selection change, so a static export and an interactive one agree.
+    Returns ``(sparkline_inner_svg, delta_html, delta_css_class, aria_label)``;
+    callers keep the card readable when there is nothing to draw.
+    """
+    try:
+        values = []
+        for pair in list(trend or []):
+            try:
+                v = float(pair[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if math.isfinite(v):
+                values.append(v)
+        direction = str(direction or "").lower()
+        if len(values) < 2:
+            delta = str(props.get("delta") or "")
+            cls = "up" if (direction == "up" or (delta and delta[0] == "\u25b2")) else (
+                "down" if (direction == "down" or (delta and delta[0] == "\u25bc")) else "")
+            return "", escape(delta), cls, "KPI trend"
+        lo, hi = min(values), max(values)
+        span = (hi - lo) or 1.0
+        n = len(values)
+        pts = " ".join(
+            f"{4 + i * 112 / (n - 1):.1f},{28 - (v - lo) * 22 / span:.1f}"
+            for i, v in enumerate(values))
+        up = (direction == "up") if direction in {"up", "down"} else values[-1] >= values[0]
+        color = "#22c55e" if up else "#ef4444"
+        spark = (f'<polyline points="{pts}" fill="none" stroke="{color}" '
+                 f'stroke-width="2.5" stroke-linecap="round" '
+                 f'stroke-linejoin="round"/>')
+        pct = props.get("trend_change_pct")
+        arrow = "\u25b2" if up else "\u25bc"
+        pct_f = None
+        try:
+            pct_f = abs(float(pct)) if pct is not None else None
+        except (TypeError, ValueError):
+            pct_f = None
+        delta_text = f"{arrow} {pct_f:.1f}%" if pct_f is not None else arrow
+        aria = "Positive trend" if up else "Negative trend"
+        if pct_f is not None:
+            aria += f": {pct_f:.1f} percent"
+        return spark, escape(delta_text), ("up" if up else "down"), aria
+    except Exception:
+        return "", escape(str(props.get("delta") or "")), "", "KPI trend"
 
 
 def _table_model_fragment(model: dict) -> str:
@@ -79,9 +131,26 @@ def _table_model_fragment(model: dict) -> str:
     series = list(data.get("series") or [])
     rows = list(series[0].get("values") or []) if series else []
     display = model.get("display") or {}
+    hierarchy = list(display.get("table_hierarchy") or [])
+
+    theme_mode = str(display.get("theme_mode", "dark")).lower()
 
     def safe_color(key: str, default: str) -> str:
         value = str(display.get(key, default))
+        if value.lower() in {"", "auto", "none"}:
+            return {"table_font_color": "#1f2937" if theme_mode == "light" else "#f1f5f9",
+                    "text_color": "#1f2937" if theme_mode == "light" else "#e2e8f0",
+                    "table_stripe_even_color": "#ffffff" if theme_mode == "light" else "#1e293b",
+                    "table_stripe_odd_color": "#f8fafc" if theme_mode == "light" else "#0f172a"}.get(key, default)
+        if theme_mode == "light":
+            legacy = {"table_font_color": {"#f1f5f9", "#e2e8f0"},
+                      "text_color": {"#f1f5f9", "#e2e8f0"},
+                      "table_stripe_even_color": {"#1e293b"},
+                      "table_stripe_odd_color": {"#0f172a"}}
+            if value.lower() in legacy.get(key, set()):
+                return {"table_font_color": "#1f2937", "text_color": "#1f2937",
+                        "table_stripe_even_color": "#ffffff",
+                        "table_stripe_odd_color": "#f8fafc"}[key]
         return value if re.fullmatch(r"#[0-9a-fA-F]{6}", value) else default
 
     def safe_size(key: str, default: int, low: int, high: int) -> int:
@@ -129,6 +198,20 @@ def _table_model_fragment(model: dict) -> str:
                 pass
         return str(value)
 
+    # Title typography (Typography tab: Header size/color/font/style/align).
+    # Auto colors ride the text_color legacy remap so light/dark stays legible.
+    _raw_title_color = str(display.get("title_color", "auto")).strip().lower()
+    if _raw_title_color in {"", "auto", "none"}:
+        title_color = safe_color("text_color", "#e2e8f0")
+    else:
+        title_color = safe_color("title_color", safe_color("text_color", "#e2e8f0"))
+    _title_style = str(display.get("title_font_style",
+                                   typography.get("header_font_style", "Bold"))).lower()
+    title_weight = "700" if "bold" in _title_style else "600"
+    title_font_style = "italic" if "italic" in _title_style else "normal"
+    title_align = str(display.get("title_align", "left")).strip().lower()
+    if title_align not in {"left", "center", "right"}:
+        title_align = "left"
     title = escape(str(model.get("title") or "Table"))
     head = "".join(
         f'<th scope="col" tabindex="0" data-sort-column="{index}" '
@@ -141,25 +224,36 @@ def _table_model_fragment(model: dict) -> str:
         cells = []
         for column, value in enumerate(row):
             align = align_first if column == 0 else align_data
-            cells.append(
-                f'<td style="text-align:{align};background:{bg};">'
-                f'{escape(cell_text(value))}</td>')
-        body_rows.append("<tr>" + "".join(cells) + "</tr>")
+            content = escape(cell_text(value))
+            if column == 0 and index < len(hierarchy):
+                meta = hierarchy[index]
+                depth = max(0, min(2, int(meta.get("depth", 0))))
+                if meta.get("has_children"):
+                    content = (f'<button type="button" class="tree-toggle" aria-expanded="false" '
+                               f'data-row="{index}" aria-label="Expand {content}">▸</button>') + content
+                cells.append(f'<td class="tree-cell" data-depth="{depth}" style="text-align:{align};background:{bg};">{content}</td>')
+            else:
+                cells.append(f'<td style="text-align:{align};background:{bg};">{content}</td>')
+        depth = int(hierarchy[index].get("depth", 0)) if index < len(hierarchy) else 0
+        hidden = ' hidden' if hierarchy and depth > 0 else ''
+        body_rows.append(f'<tr data-row="{index}" data-depth="{depth}"{hidden}>' + "".join(cells) + "</tr>")
     return (
         f'<div class="table-model" style="color:{font_color};font-size:{font_size}px;font-family:\'{table_font}\',sans-serif">'
-        f'<h2 style="font-size:{safe_size("title_size", 14, 8, 48)}px">{title}</h2>'
+        f'<h2 style="font-size:{safe_size("title_size", 20, 8, 48)}px;text-align:{title_align};color:{title_color};font-family:\'{table_header_font}\',sans-serif;font-weight:{title_weight};font-style:{title_font_style}">{title}</h2>'
         '<div class="table-scroll"><table aria-label="Sortable pivot table"><thead><tr>'
         f'{head}</tr></thead><tbody>{"".join(body_rows)}</tbody></table></div>'
         f'<style>.table-model{{height:100%;display:flex;flex-direction:column;padding:8px;box-sizing:border-box;overflow:hidden}}'
         f'.table-model h2{{margin:0 0 8px;color:{safe_color("text_color", "#e2e8f0")};font-family:\'{table_header_font}\',sans-serif;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}'
         '.table-scroll{overflow:auto;flex:1;min-height:0}table{border-collapse:collapse;min-width:max-content;width:100%}'
         f'th{{position:sticky;top:0;z-index:1;height:{header_height}px;padding:4px 8px;background:{header_color};color:white;font-size:{header_size}px;text-align:left;white-space:nowrap;cursor:pointer;user-select:none}}th:focus-visible{{outline:2px solid #fff;outline-offset:-2px}}.sort-indicator{{display:inline-block;min-width:1em;margin-left:4px}}'
-        f'td{{height:{row_height}px;padding:3px 8px;color:{font_color};white-space:nowrap;border-bottom:1px solid rgba(255,255,255,.06)}}'
+        f'td{{height:{row_height}px;padding:3px 8px;color:{font_color};white-space:nowrap;border-bottom:1px solid rgba(100,116,139,.28)}}'
+        f'.tree-cell{{padding-left:calc(8px + var(--depth,0)*16px)}}.tree-cell[data-depth="1"]{{padding-left:24px}}.tree-cell[data-depth="2"]{{padding-left:40px}}'
+        '.tree-toggle{border:0;background:transparent;color:inherit;cursor:pointer;margin-right:5px;font:inherit}.table-model tr[hidden]{display:none}'
         '</style></div>'
         '<script>(function(){var root=document.currentScript.previousElementSibling;'
         'var table=root&&root.querySelector("table");if(!table)return;'
         'var heads=table.querySelectorAll("th[data-sort-column]");'
-        'function sort(head){var col=Number(head.getAttribute("data-sort-column"));'
+        'function sort(head){if(table.querySelector(".tree-toggle"))return;var col=Number(head.getAttribute("data-sort-column"));'
         'var dir=head.getAttribute("aria-sort")==="ascending"?"descending":"ascending";'
         'heads.forEach(function(h){h.setAttribute("aria-sort","none");'
         'var mark=h.querySelector(".sort-indicator");if(mark)mark.textContent="";});'
@@ -172,7 +266,13 @@ def _table_model_fragment(model: dict) -> str:
         'var cmp=Number.isFinite(nx)&&Number.isFinite(ny)?nx-ny:x.localeCompare(y,undefined,{numeric:true,sensitivity:"base"});'
         'return dir==="ascending"?cmp:-cmp;});rows.forEach(function(row){body.appendChild(row);});}'
         'heads.forEach(function(head){head.addEventListener("click",function(){sort(head);});'
-        'head.addEventListener("keydown",function(event){if(event.key==="Enter"||event.key===" "){event.preventDefault();sort(head);}});});})();</script>')
+        'head.addEventListener("keydown",function(event){if(event.key==="Enter"||event.key===" "){event.preventDefault();sort(head);}});});'
+        'var expanded=new Set();function refreshTree(){var rows=Array.prototype.slice.call(table.tBodies[0].rows),stack=[];'
+        'rows.forEach(function(row,i){var depth=Number(row.getAttribute("data-depth")||0);stack=stack.slice(0,depth);'
+        'row.hidden=!stack.every(function(parent){return expanded.has(parent);});var button=row.querySelector(".tree-toggle");'
+        'if(button){button.setAttribute("aria-expanded",expanded.has(i)?"true":"false");button.textContent=expanded.has(i)?"▾":"▸";}stack[depth]=i;});}'
+        'table.querySelectorAll(".tree-toggle").forEach(function(button){button.addEventListener("click",function(){var i=Number(button.getAttribute("data-row"));'
+        'if(expanded.has(i))expanded.delete(i);else expanded.add(i);refreshTree();});});})();</script>')
 
 
 def chart_model_to_html(model: dict) -> str:
@@ -184,32 +284,35 @@ def chart_model_to_html(model: dict) -> str:
     """
     normalized = validate_chart_model(model)
     online_imagery = (
-        normalized.get("chart_type") in {"map_plot", "globe_extruded_map"} and
+        normalized.get("chart_type") in {"map_plot"} and
         (normalized.get("display") or {}).get("map_basemap") == "satellite")
     image_sources = "data: blob: https://services.arcgisonline.com" if online_imagery else "data: blob:"
     if normalized.get("chart_type") == "data_table":
         title = escape(str(normalized.get("title") or "Lytrize table"))
         return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
                 "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-                "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\">"
-                f"<title>{title}</title><style>html,body{{height:100%;margin:0;background:#0f172a;font-family:Inter,'Noto Sans',sans-serif}}</style>"
+                "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'\">"
+                f"<title>{title}</title><style>html,body{{height:100%;margin:0;background:{'#fff' if str((normalized.get('display') or {}).get('theme_mode','dark')).lower() == 'light' else '#0f172a'};font-family:Inter,'Noto Sans',sans-serif}}</style>"
                 f"</head><body>{_table_model_fragment(normalized)}</body></html>")
-    asset_dir = Path(__file__).resolve().parents[1] / "assets" / "echarts"
+    asset_dir = assets_root() / "echarts"
     echarts_path = asset_dir / "echarts.min.js"
     adapter_path = asset_dir / "lytrize_adapter.js"
+    map3d_path = asset_dir / "lytrize_map_3d.js"
     license_path = asset_dir / "LICENSE"
     notice_path = asset_dir / "NOTICE"
     d3_license_path = asset_dir / "LICENSE-d3"
     if not all(path.is_file() for path in
-               (echarts_path, adapter_path, license_path, notice_path,
+               (echarts_path, adapter_path, map3d_path, license_path, notice_path,
                 d3_license_path)):
         raise FileNotFoundError("The bundled ECharts runtime is incomplete")
 
     echarts_source = echarts_path.read_text(encoding="utf-8")
     adapter_source = adapter_path.read_text(encoding="utf-8")
+    map3d_source = map3d_path.read_text(encoding="utf-8")
     # Script tags below contain only trusted, pinned application assets.
     echarts_source = echarts_source.replace("</script", "<\\/script")
     adapter_source = adapter_source.replace("</script", "<\\/script")
+    map3d_source = map3d_source.replace("</script", "<\\/script")
     payload = _script_safe(json.dumps(normalized, ensure_ascii=False,
                                       separators=(",", ":"), allow_nan=False))
     geojson = _map_geojson_for_models([normalized])
@@ -232,7 +335,7 @@ def chart_model_to_html(model: dict) -> str:
 <style>html,body,#chart{{width:100%;height:100%;margin:0;overflow:hidden;background:transparent}}body{{font-family:Inter,'Noto Sans',sans-serif}}</style>
 </head><body><div id="chart" role="img" aria-label="Interactive chart"></div>
 <template id="open-source-notices"><pre>{notices_html}</pre></template>
-<script>{echarts_source}</script><script>{adapter_source}</script>
+<script>{echarts_source}</script><script>{adapter_source}</script><script>{map3d_source}</script>
 <script>
 (function(){{
   {map_register}
@@ -242,9 +345,16 @@ def chart_model_to_html(model: dict) -> str:
   function draw(){{
     const width=root.clientWidth, height=root.clientHeight;
     if(!width||!height) return;
+    const mapView=String((model.display&&model.display.map_visualization)||'').toLowerCase();
+    if(mapView==='globe'||mapView==='extruded'){{
+      if(chart){{chart.dispose();chart=null;}}
+      const registered=echarts.getMap(model.data.map.id);
+      if(!registered||!window.Lytrize3DMap){{root.textContent='3D map boundary data could not be loaded.';return;}}
+      Lytrize3DMap.render(root,model,registered.geoJSON||registered.geoJson||registered);return;
+    }}
     const renderer=model.display&&model.display.renderer==='svg'?'svg':'canvas';
     if(chart&&chart.__lytrizeRenderer!==renderer){{chart.dispose();chart=null;}}
-    if(!chart){{chart=echarts.init(root,null,{{renderer:renderer,useDirtyRect:true}});chart.__lytrizeRenderer=renderer;}}
+    if(!chart){{chart=echarts.init(root,null,{{renderer:renderer}});chart.__lytrizeRenderer=renderer;}}
     chart.setOption(LytrizeEChartsAdapter.buildOption(model,width,height,root),{{notMerge:true}});
     chart.resize({{width:width,height:height}});
     LytrizeEChartsAdapter.applySatelliteBasemap(chart,model,root);
@@ -303,10 +413,15 @@ self.onmessage=function(event){
     if(LF.activeSlicersForChart(lyMeta.slicers,selection,'__kpi__').length){
       try{var indexes=LF.filterRowIndexes(lyPayload,lyMeta.slicers,selection,'__kpi__',cache);result=LF.recomputeKpi(kpi._recipe||kpi,lyPayload,indexes);}
       catch(error){}
-    }else result={value:kpi.value==null?'--':kpi.value,delta:kpi.delta==null?null:kpi.delta};
+    }else result={value:kpi.value==null?'--':kpi.value,delta:kpi.delta==null?null:kpi.delta,
+      trend:kpi.trend==null?null:kpi.trend,trend_direction:kpi.trend_direction||null,
+      trend_change_pct:kpi.trend_change_pct==null?null:kpi.trend_change_pct};
     kpis.push({index:kpi.index!==undefined&&kpi.index!==null?String(kpi.index):String(index),
       value:result?result.value:'—',delta:result?result.delta:null,
-      prefix:kpi.prefix||'',suffix:kpi.suffix||''});
+      prefix:kpi.prefix||'',suffix:kpi.suffix||'',
+      trend:result&&result.trend?result.trend:null,
+      trend_direction:result?result.trend_direction||null:null,
+      trend_change_pct:result&&result.trend_change_pct!=null?result.trend_change_pct:null});
   });
   var count=0;
   try{count=LF.filterRowIndexes(lyPayload,lyMeta.slicers,selection,'__any__',cache).length;}catch(error){}
@@ -326,10 +441,11 @@ try{worker=new Worker(URL.createObjectURL(new Blob([source],{type:'text/javascri
 var uidByIndex={},ready=false,request=0,timer=0,pendingSelection=null,pendingKpis=null,pendingSlicers=null,slicerSyncRevision=0,hadActiveSelection=false;
 var metaData;try{metaData=JSON.parse(meta.textContent);}catch(error){return;}
 (metaData.slicers||[]).forEach(function(s){var i=s.index!==undefined&&s.index!==null?s.index:String(s.uid||'').replace(/^s_/,'').replace(/^slicer-/,'');if(s.uid)uidByIndex[String(i)]=s.uid;});
-function selection(){var out={};document.querySelectorAll('[data-ly-slicer]').forEach(function(el){var idx=el.getAttribute('data-ly-slicer'),uid=el.getAttribute('data-ly-uid')||uidByIndex[String(idx)]||('slicer-'+idx);if(el.multiple){var values=[];for(var i=0;i<el.options.length;i++)if(el.options[i].selected&&el.options[i].value!=='')values.push(el.options[i].value);out[uid]=values;}else out[uid]=el.value===''?[]:[el.value];});return out;}
+function selection(){var out={},groups={};document.querySelectorAll('[data-ly-slicer]').forEach(function(el){var idx=el.getAttribute('data-ly-slicer'),uid=el.getAttribute('data-ly-uid')||el.dataset.lyUid||uidByIndex[String(idx)]||('slicer-'+idx),g=groups[uid]||(groups[uid]={values:[],low:null,high:null,mode:'largest',n:5,value:''}),role=el.getAttribute('data-ly-role')||'values';if(el.type==='checkbox'){if(el.checked)g.values.push(el.value);}else if(role==='values'){if(el.multiple){for(var i=0;i<el.options.length;i++)if(el.options[i].selected&&el.options[i].value!=='')g.values.push(el.options[i].value);}else if(el.value!=='')g.values=[el.value];}else if(role==='low'||role==='high')g[role]=el.value===''?null:el.value;else if(role==='mode')g.mode=el.value;else if(role==='n')g.n=Math.max(1,parseInt(el.value,10)||5);else if(role==='value')g.value=el.value;});Object.keys(groups).forEach(function(uid){var s=(metaData.slicers||[]).filter(function(x){return String(x.uid)===String(uid);})[0]||{},w=String(s.widget||'dropdown').toLowerCase();if(w==='slider')out[uid]={low:groups[uid].low,high:groups[uid].high};else if(w==='search')out[uid]=groups[uid].value;else if(w==='top_n')out[uid]={mode:groups[uid].mode,n:groups[uid].n};else out[uid]=groups[uid].values;});return out;}
 function update(){pendingSelection=selection();clearTimeout(timer);timer=setTimeout(function(){if(!ready)return;var active=window.LytrizeLiveFilter&&window.LytrizeLiveFilter.hasActiveSlicers(metaData.slicers||[],pendingSelection);if(!active&&!hadActiveSelection){var banner=document.getElementById('ly-live-banner');if(banner)banner.textContent='Interactive: '+(metaData.total_rows||0)+' / '+(metaData.total_rows||0)+' rows in selection';return;}hadActiveSelection=!!active;request++;worker.postMessage({type:'filter',request:request,selection:pendingSelection});},70);}
-function applySlicerOptions(options){Object.keys(options||{}).forEach(function(uid){document.querySelectorAll('select[data-ly-uid]').forEach(function(select){if(select.getAttribute('data-ly-uid')!==uid)return;var selected=[];try{selected=JSON.parse(select.getAttribute('data-ly-selected')||'[]');}catch(error){}var allow=Object.create(null);selected.forEach(function(value){allow[String(value)]=true;});while(select.options.length>1)select.remove(1);(options[uid]||[]).forEach(function(value){var option=document.createElement('option');option.value=String(value);option.textContent=String(value);option.selected=!!allow[String(value)];select.appendChild(option);});select.removeAttribute('data-ly-selected');});});}
-function paint(result){var keys=Object.keys(result.charts||{});requestAnimationFrame(function(){keys.forEach(function(key){var model=result.charts[key],root=document.getElementById('chart-'+key);if(!root||!window.LytrizeEChartsAdapter)return;var chart=echarts.getInstanceByDom(root);if(!chart){var renderer=model.display&&model.display.renderer==='svg'?'svg':'canvas';try{chart=echarts.init(root,null,{renderer:renderer,useDirtyRect:true});}catch(error){return;}}chart.__lytrizeModel=model;try{chart.setOption(window.LytrizeEChartsAdapter.buildOption(model,root.clientWidth||600,root.clientHeight||320,root),{notMerge:true,lazyUpdate:true});chart.resize();window.LytrizeEChartsAdapter.applySatelliteBasemap(chart,model,root);}catch(error){}});(result.kpis||[]).forEach(function(kpi){var card=document.querySelector('[data-ly-kpi="'+kpi.index+'"]');if(!card)return;var value=card.querySelector('.kpi-value');if(value)value.textContent=kpi.prefix+kpi.value+kpi.suffix;var delta=card.querySelector('[data-ly-kpi-delta]');if(delta){delta.textContent=kpi.delta||'';delta.style.color=(kpi.delta&&kpi.delta[0]==='-')?'#f87171':'#34d399';}});var banner=document.getElementById('ly-live-banner');if(banner)banner.textContent='Interactive: '+result.selected+' / '+result.total+' rows in selection';});}
+function applySlicerOptions(options){Object.keys(options||{}).forEach(function(uid){document.querySelectorAll('select[data-ly-uid]').forEach(function(select){if(select.getAttribute('data-ly-uid')!==uid)return;var selected=[];try{selected=JSON.parse(select.getAttribute('data-ly-selected')||'[]');}catch(error){}if(select.multiple)Array.prototype.forEach.call(select.options,function(o){if(o.selected&&o.value!=='')selected.push(o.value);});else if(select.value)selected=[select.value];var allow=Object.create(null);selected.forEach(function(value){allow[String(value)]=true;});while(select.options.length>1)select.remove(1);(options[uid]||[]).forEach(function(item){var value=item&&item.value!==undefined?item.value:item,option=document.createElement('option');option.value=String(value);option.textContent=String(item&&item.label!==undefined?item.label:value);option.selected=!!allow[String(value)];select.appendChild(option);});select.removeAttribute('data-ly-selected');});document.querySelectorAll('input[type="checkbox"][data-ly-uid]').forEach(function(input){if(input.getAttribute('data-ly-uid')!==uid)return;var list=input.closest('.slicer-list');if(!list)return;var selected=[];list.querySelectorAll('input:checked').forEach(function(cb){selected.push(cb.value);});var allow=Object.create(null);selected.forEach(function(v){allow[String(v)]=true;});while(list.firstChild)list.removeChild(list.firstChild);(options[uid]||[]).forEach(function(item){var value=item&&item.value!==undefined?item.value:item,label=item&&item.label!==undefined?item.label:value,row=document.createElement('label'),cb=document.createElement('input'),text=document.createElement('span');cb.type='checkbox';cb.value=String(value);cb.setAttribute('data-ly-slicer',input.getAttribute('data-ly-slicer'));cb.setAttribute('data-ly-uid',uid);cb.setAttribute('data-ly-role','value');cb.checked=!!allow[String(value)];text.textContent=String(label);row.appendChild(cb);row.appendChild(text);list.appendChild(row);});});});}
+function paintKpiTrend(card,trend,delta,direction){var svg=card.querySelector('.kpi-sparkline');if(!svg)return;while(svg.firstChild)svg.removeChild(svg.firstChild);if(!Array.isArray(trend)||trend.length<2){svg.style.display='none';return;}svg.style.display='block';var vals=trend.map(function(p){return Number(p[1]);}),lo=Math.min.apply(null,vals),hi=Math.max.apply(null,vals),span=hi-lo||1;var points=vals.map(function(v,i){return (4+i*112/(vals.length-1))+','+(28-(v-lo)*22/span);}).join(' ');var up=(direction==='up'||direction==='down')?direction==='up':(delta===null||delta===undefined?vals[vals.length-1]>=vals[0]:Number(delta)>=0);var color=up?'#22c55e':'#ef4444';var line=document.createElementNS('http://www.w3.org/2000/svg','polyline');line.setAttribute('points',points);line.setAttribute('fill','none');line.setAttribute('stroke',color);line.setAttribute('stroke-width','2.5');line.setAttribute('stroke-linecap','round');line.setAttribute('stroke-linejoin','round');svg.appendChild(line);svg.setAttribute('aria-label',(up?'Positive':'Negative')+' trend'+(delta==null?'':': '+Number(delta).toFixed(1)+' percent'));}
+function paint(result){var keys=Object.keys(result.charts||{});requestAnimationFrame(function(){keys.forEach(function(key){var model=result.charts[key],root=document.getElementById('chart-'+key);if(!root||!window.LytrizeEChartsAdapter)return;var view=String((model.display&&model.display.map_visualization)||'').toLowerCase();if(view==='globe'||view==='extruded'){root.__lytrize3dModel=model;var old=echarts.getInstanceByDom(root);if(old)old.dispose();var registered=echarts.getMap(model.data.map.id);if(registered&&window.Lytrize3DMap)Lytrize3DMap.render(root,model,registered.geoJSON||registered.geoJson||registered);return;}var oldCanvas=root.querySelector('canvas.lytrize-map-3d');if(oldCanvas){oldCanvas.remove();var oldTip=root.querySelector('.lytrize-map-3d-tip');if(oldTip)oldTip.remove();}var chart=echarts.getInstanceByDom(root);if(!chart){var renderer=model.display&&model.display.renderer==='svg'?'svg':'canvas';try{chart=echarts.init(root,null,{renderer:renderer});}catch(error){return;}}chart.__lytrizeModel=model;try{chart.setOption(window.LytrizeEChartsAdapter.buildOption(model,root.clientWidth||600,root.clientHeight||320,root),{notMerge:true,lazyUpdate:true});chart.resize();window.LytrizeEChartsAdapter.applySatelliteBasemap(chart,model,root);}catch(error){}});(result.kpis||[]).forEach(function(kpi){var card=document.querySelector('[data-ly-kpi="'+kpi.index+'"]');if(!card)return;var value=card.querySelector('.kpi-value');if(value)value.textContent=kpi.prefix+kpi.value+kpi.suffix;var delta=card.querySelector('[data-ly-kpi-delta]');if(delta){delta.textContent=kpi.delta||'';delta.style.color=(kpi.trend_direction==='down'||(kpi.delta&&(String(kpi.delta).indexOf('\u25bc')===0||kpi.delta[0]==='-')))?'#f87171':'#34d399';delta.title=kpi.trend_direction==='down'?'Negative trend':'Positive trend';}paintKpiTrend(card,kpi.trend,kpi.trend_change_pct,kpi.trend_direction);});var banner=document.getElementById('ly-live-banner');if(banner)banner.textContent='Interactive: '+result.selected+' / '+result.total+' rows in selection';});}
 worker.onmessage=function(event){var message=event.data||{};if(message.type==='ready'){ready=true;var hadPending=false;if(pendingSlicers){worker.postMessage({type:'slicers',revision:pendingSlicers.revision,slicers:pendingSlicers.slicers});pendingSlicers=null;hadPending=true;}if(pendingKpis){worker.postMessage({type:'kpis',kpis:pendingKpis});pendingKpis=null;hadPending=true;}if(!hadPending)update();}else if(message.type==='slicers-ready'){if(message.revision===slicerSyncRevision){applySlicerOptions(message.options);update();}}else if(message.type==='kpis-ready'){update();}else if(message.type==='result'&&message.request===request)paint(message);else if(message.type==='error'){var banner=document.getElementById('ly-live-banner');if(banner)banner.textContent=message.message;}};
 worker.onerror=function(){var banner=document.getElementById('ly-live-banner');if(banner)banner.textContent='Interactive filtering is unavailable in this browser.';};
 document.addEventListener('change',function(event){var el=event.target;if(el&&el.matches&&el.matches('[data-ly-slicer]'))update();});
@@ -346,6 +462,16 @@ var models=JSON.parse(document.getElementById('chart-models').textContent),chart
 function draw(){
   Object.keys(models).forEach(function(key){
     var root=document.getElementById('chart-'+key);if(!root)return;
+    var model=models[key],view=String((model.display&&model.display.map_visualization)||'').toLowerCase();
+    if(view==='globe'||view==='extruded'){
+      root.__lytrize3dModel=model;
+      var old=charts[key];if(old){if(old.__lytrizeResizeObserver)old.__lytrizeResizeObserver.disconnect();old.dispose();charts[key]=null;}
+      var registered=echarts.getMap(model.data.map.id);
+      if(registered&&window.Lytrize3DMap)Lytrize3DMap.render(root,model,registered.geoJSON||registered.geoJson||registered);
+      if(!root.__lytrize3dObserver){root.__lytrize3dObserver=new ResizeObserver(function(){var current=root.__lytrize3dModel||models[key],map=echarts.getMap(current.data.map.id);if(map&&window.Lytrize3DMap)Lytrize3DMap.render(root,current,map.geoJSON||map.geoJson||map);});root.__lytrize3dObserver.observe(root);}
+      return;
+    }
+    if(root.querySelector('canvas.lytrize-map-3d')){root.querySelector('canvas.lytrize-map-3d').remove();var tip=root.querySelector('.lytrize-map-3d-tip');if(tip)tip.remove();}
     var wanted=models[key].display&&models[key].display.renderer==='svg'?'svg':'canvas';
     var chart=charts[key];
     if(chart&&chart.__lytrizeRenderer!==wanted){
@@ -353,7 +479,7 @@ function draw(){
       chart.dispose();chart=null;
     }
     if(!chart){
-      chart=charts[key]=echarts.init(root,null,{renderer:wanted,useDirtyRect:true});
+      chart=charts[key]=echarts.init(root,null,{renderer:wanted});
       chart.__lytrizeRenderer=wanted;
       chart.__lytrizeModel=models[key];
       chart.__lytrizeSize={width:0,height:0};
@@ -458,9 +584,10 @@ def board_to_html(document: dict, *, editor: bool = False,
     file and cannot reach a local filesystem path or remote URL.
     """
     board = validate_board(document)
-    asset_dir = Path(__file__).resolve().parents[1] / "assets" / "echarts"
+    asset_dir = assets_root() / "echarts"
     required = ("echarts.min.js", "lytrize_adapter.js", "lytrize_live_filter.js",
                 "LICENSE", "NOTICE", "LICENSE-d3")
+    required = (*required, "lytrize_map_3d.js")
     files = {name: asset_dir / name for name in required}
     missing = [name for name, path in files.items() if not path.is_file()]
     if missing:
@@ -627,37 +754,86 @@ def board_to_html(document: dict, *, editor: bool = False,
             class_name = "chart-card"
         elif kind == "kpi":
             kpi_idx = escape(str(props.get("index", index)))
+            trend = props.get("trend")
+            direction = str(props.get("trend_direction") or "")
+            spark_inner, delta_html, delta_cls, aria = _kpi_trend_fragment(trend, direction, props)
             content = (f'<div class="kpi" data-ly-kpi="{kpi_idx}">'
                        f'<div class="kpi-label">{escape(str(props.get("label", "")))}</div>'
                        f'<strong class="kpi-value">{escape(str(props.get("prefix", "")))}'
                        f'{escape(str(props.get("value", "--")))}'
                        f'{escape(str(props.get("suffix", "")))}</strong>'
-                       f'<div class="kpi-delta" data-ly-kpi-delta="{kpi_idx}"></div></div>')
+                       f'<svg class="kpi-sparkline" viewBox="0 0 120 32" role="img" aria-label="{escape(aria)}">{spark_inner}</svg>'
+                       f'<div class="kpi-delta {delta_cls}" data-ly-kpi-delta="{kpi_idx}">{delta_html}</div></div>')
             class_name = "kpi-card"
         elif kind == "slicer":
             selected = props.get("selected", [])
             if not isinstance(selected, list):
                 selected = [selected]
-            selection = ", ".join(escape(str(value)) for value in selected) or "All"
             label = escape(str(props.get("label", props.get("column", "Filter"))))
-            choices = props.get("values") or props.get("options") or []
+            idx = escape(str(props.get("index", index)))
+            widget = str(props.get("widget", "dropdown") or "dropdown").lower()
+            slicer_uid = escape(str(props.get("uid", "slicer-" + str(props.get("index", index)))))
+            spec = props.get("spec") or {}
+            choices = spec.get("options") or props.get("values") or []
             if not isinstance(choices, list):
                 choices = []
-            idx = escape(str(props.get("index", index)))
-            options = ''.join(
-                f'<option value="{escape(str(value))}"'
-                f'{" selected" if str(value) in {str(v) for v in selected} else ""}>'
-                f'{escape(str(value))}</option>' for value in choices)
-            multi = live and str(props.get("widget", "dropdown")).lower() == "list"
-            multi_attr = ' multiple size="5"' if multi else ''
-            # Static exports are labelled once outside the slicer cards below;
-            # a footer inside a short card consumes the space needed for values.
-            disabled_attr = '' if live else ' disabled aria-disabled="true"'
-            content = ('<div class="slicer"><b class="slicer-title">' + label + '</b>'
-                       + '<div class="slicer-body"><select class="slicer-select" data-ly-slicer="' + idx + '" data-ly-role="values"'
-                       + multi_attr + disabled_attr + '>' + '<option value="">All</option>' + options + '</select>'
-                       + '</div></div>')
-            class_name = "slicer-card"
+            if widget == "list":
+                selected_set = {str(v) for v in selected}
+                options = "".join(
+                    '<label><input type="checkbox" data-ly-slicer="' + idx + '" data-ly-uid="' + slicer_uid + '" data-ly-role="value" value="' + escape(str(value)) + '"' + (' checked' if str(value) in selected_set else '') + '><span>' + escape(str(value)) + '</span></label>'
+                    for value in choices)
+                content = ('<div class="slicer"><b class="slicer-title">' + label + '</b>'
+                           + '<div class="slicer-body"><div class="slicer-list">' + options + '</div>'
+                           + '</div></div>')
+                class_name = "slicer-card"
+            elif widget == "dropdown":
+                options = "".join(
+                    f'<option value="{escape(str(value))}"'
+                    f'{" selected" if str(value) in {str(v) for v in selected} else ""}>'
+                    f'{escape(str(value))}</option>' for value in choices)
+                content = ('<div class="slicer"><b class="slicer-title">' + label + '</b>'
+                           + '<div class="slicer-body"><select class="slicer-select" data-ly-slicer="' + idx + '" data-ly-uid="' + slicer_uid + '" data-ly-role="values"'
+                           + (' disabled aria-disabled="true"' if not live else '') + '>' + '<option value="">All</option>' + options + '</select>'
+                           + '</div></div>')
+                class_name = "slicer-card"
+            elif widget == "slider":
+                low = spec.get("low", selected[0] if isinstance(selected, list) and len(selected) > 0 else spec.get("min", ""))
+                high = spec.get("high", selected[1] if isinstance(selected, list) and len(selected) > 1 else spec.get("max", ""))
+                range_type = "date" if str(spec.get("bounds_kind", "")).lower() == "datetime" else "range"
+                content = ('<div class="slicer"><b class="slicer-title">' + label + '</b>'
+                           + '<div class="slicer-body"><input class="slicer-select" data-ly-slicer="' + idx + '" data-ly-uid="' + slicer_uid + '" data-ly-role="low" type="' + range_type + '" min="' + escape(str(spec.get("min", 0))) + '" max="' + escape(str(spec.get("max", 100))) + '" value="' + escape(str(low if low not in (None, "") else spec.get("min", 0))) + '">'
+                           + '<input class="slicer-select" data-ly-slicer="' + idx + '" data-ly-uid="' + slicer_uid + '" data-ly-role="high" type="' + range_type + '" min="' + escape(str(spec.get("min", 0))) + '" max="' + escape(str(spec.get("max", 100))) + '" value="' + escape(str(high if high not in (None, "") else spec.get("max", 100))) + '">'
+                           + '</div></div>')
+                class_name = "slicer-card"
+            elif widget == "search":
+                value = selected[0] if isinstance(selected, list) and len(selected) > 0 else ""
+                content = ('<div class="slicer"><b class="slicer-title">' + label + '</b>'
+                           + '<div class="slicer-body"><input class="slicer-search" data-ly-slicer="' + idx + '" data-ly-uid="' + slicer_uid + '" data-ly-role="value" type="text" value="' + escape(str(value)) + '">'
+                           + '</div></div>')
+                class_name = "slicer-card"
+            elif widget == "top_n":
+                mode = ""
+                n = 5
+                if isinstance(selected, list):
+                    if len(selected) > 0: mode = str(selected[0])
+                    if len(selected) > 1: n = str(selected[1])
+                content = ('<div class="slicer"><b class="slicer-title">' + label + '</b>'
+                           + '<div class="slicer-body"><select data-ly-slicer="' + idx + '" data-ly-uid="' + slicer_uid + '" data-ly-role="mode">'
+                           + '<option value="largest"' + (' selected' if mode == 'largest' else '') + '>Largest</option>'
+                           + '<option value="smallest"' + (' selected' if mode == 'smallest' or spec.get('least') else '') + '>Smallest</option>'
+                           + '</select><input data-ly-slicer="' + idx + '" data-ly-uid="' + slicer_uid + '" data-ly-role="n" type="number" min="1" value="' + escape(str(spec.get("n", n))) + '">'
+                           + '</div></div>')
+                class_name = "slicer-card"
+            else:
+                options = "".join(
+                    f'<option value="{escape(str(value))}"'
+                    f'{" selected" if str(value) in {str(v) for v in selected} else ""}>'
+                    f'{escape(str(value))}</option>' for value in choices)
+                content = ('<div class="slicer"><b class="slicer-title">' + label + '</b>'
+                           + '<div class="slicer-body"><select class="slicer-select" data-ly-slicer="' + idx + '" data-ly-role="values"'
+                           + (' disabled aria-disabled="true"' if not live else '') + '>' + '<option value="">All</option>' + options + '</select>'
+                           + '</div></div>')
+                class_name = "slicer-card"
         elif kind == "text":
             try:
                 size = max(8, min(96, int(props.get("font_size", 16) or 16)))
@@ -682,7 +858,7 @@ def board_to_html(document: dict, *, editor: bool = False,
     map_register = _map_register_script(map_geojson)
     chart_runtime_script = _chart_runtime_script(map_register)
     online_imagery = any(
-        model.get("chart_type") in {"map_plot", "globe_extruded_map"} and
+        model.get("chart_type") in {"map_plot"} and
         (model.get("display") or {}).get("map_basemap") == "satellite"
         for model in charts.values())
     image_sources = "data: blob: https://services.arcgisonline.com" if online_imagery else "data: blob:"
@@ -695,6 +871,7 @@ def board_to_html(document: dict, *, editor: bool = False,
                                          separators=(",", ":"), allow_nan=False))
     echarts_js = source["echarts.min.js"].replace("</script", "<\\/script")
     adapter_js = source["lytrize_adapter.js"].replace("</script", "<\\/script")
+    map3d_js = source["lytrize_map_3d.js"].replace("</script", "<\\/script")
     livefilter_js = source["lytrize_live_filter.js"].replace("</script", "<\\/script")
     live = bool(report_payload and (report_payload.get("columns") or report_slicers))
     data_json = ""
@@ -771,10 +948,10 @@ def board_to_html(document: dict, *, editor: bool = False,
 .chart{{width:100%;height:100%;min-height:0}}.chart-card{{display:flex;flex-direction:column;padding:8px}}.chart-card .chart{{flex:1;min-height:0}}.notes{{max-height:24%;overflow:auto;padding:4px 8px;font-size:12px}}
 .kpi,.slicer,.text-object{{height:100%;width:100%;padding:14px;display:flex;flex-direction:column;justify-content:center;overflow:hidden;min-width:0;min-height:0}}.title-card .text-object{{padding:8px 14px;font-weight:600}}
 .kpi strong{{font-size:clamp(20px,4vw,52px);color:{accent};overflow-wrap:anywhere}}.slicer{{justify-content:flex-start;padding:10px 12px}}.slicer-title{{display:block;flex:0 0 auto;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.slicer-body{{display:flex;flex:1 1 auto;min-height:0;min-width:0;margin-top:6px;overflow:auto}}.slicer-select{{display:block;width:100%;min-width:0;min-height:30px;max-height:100%;border:1px solid {border};border-radius:5px;padding:5px 8px;background:transparent;color:inherit;font:inherit}}.slicer-select[multiple]{{height:100%;overflow:auto}}.ly-static-status{{position:fixed;left:8px;bottom:8px;z-index:50;padding:4px 8px;border-radius:4px;background:{card_bg};color:{text_color};font-size:11px;opacity:.8}}.image{{display:block;width:100%;height:100%}}</style>
-{f'<style>{editor_css_block}</style>' if editor_css_block else ''}</head>
+{f'<style>{editor_css_block}</style>' if editor_css_block else ''}<style>.kpi-sparkline{{display:block;width:min(150px,45%);height:32px;margin-top:5px;overflow:visible}}.kpi-delta{{font-size:13px;font-weight:700;min-height:1em}}.kpi-delta.up{{color:#34d399}}.kpi-delta.down{{color:#f87171}}.slicer-list{{display:flex;flex-direction:column;gap:4px;overflow:auto;width:100%}}.slicer-list label{{display:flex;gap:7px;align-items:center;min-height:24px;cursor:pointer}}.slicer-list input{{accent-color:{accent}}}</style></head>
 <body{body_class}><main id="board" class="ly-canvas" data-min-height="{canvas_height}" aria-label="Lytrize dashboard">{''.join(tiles)}</main>
 {live_banner}<template id="open-source-notices"><pre>{escape(notices)}</pre></template>
-<script>{echarts_js}</script><script>{adapter_js}</script>
+<script>{echarts_js}</script><script>{adapter_js}</script><script>{map3d_js}</script>
 <script>{livefilter_js}</script>
 {data_block}<script type="application/json" id="chart-models">{model_json}</script>
 {chart_runtime_script}

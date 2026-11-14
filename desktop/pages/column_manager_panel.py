@@ -16,7 +16,7 @@ import logging
 import re
 from typing import Optional
 
-import pandas as pd
+import polars as pl
 from PySide6.QtCore import Qt, Signal, QThread
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
@@ -85,7 +85,7 @@ class ColumnManagerPanel(QWidget):
     def __init__(self, bridge, parent=None) -> None:
         super().__init__(parent)
         self.bridge = bridge
-        self._df: Optional[pd.DataFrame] = None
+        self._df: Optional[pl.DataFrame] = None
         self._worker = None
 
         self._build_ui()
@@ -308,10 +308,12 @@ class ColumnManagerPanel(QWidget):
 
     # -- Public API ---------------------------------------------------------
 
-    def set_dataframe(self, df: pd.DataFrame) -> None:
+    def set_dataframe(self, df: Any) -> None:
         """Load a DataFrame and populate column lists."""
+        if df is not None and not isinstance(df, pl.DataFrame):
+            df = pl.from_pandas(df)
         self._df = df
-        if df is None or df.empty:
+        if df is None or df.height == 0:
             self.list_remove.clear()
             self.cmb_rename_col.clear()
             return
@@ -322,7 +324,7 @@ class ColumnManagerPanel(QWidget):
             self.list_remove.addItem(item)
 
         self.cmb_rename_col.clear()
-        self.cmb_rename_col.addItems(df.columns.tolist())
+        self.cmb_rename_col.addItems(df.columns)
 
         self._on_calc_type_changed(self.cmb_calc_type.currentText())
 
@@ -353,11 +355,11 @@ class ColumnManagerPanel(QWidget):
         """Rebuild the options area based on calculation type."""
         self._clear_layout(self.options_layout)
 
-        if self._df is None or self._df.empty:
+        if self._df is None or self._df.height == 0:
             return
 
-        num_cols = self._df.select_dtypes(include="number").columns.tolist()
-        all_cols = self._df.columns.tolist()
+        num_cols = [name for name, dtype in self._df.schema.items() if dtype in pl.NUMERIC_DTYPES]
+        all_cols = self._df.columns
 
         pass  # combo styling handled by global QSS
 
@@ -522,18 +524,23 @@ class ColumnManagerPanel(QWidget):
         if hasattr(self, "cmb_date_b"):
             self.cmb_date_b.setEnabled(mode != "today")
 
-    def _populate_preview_table(self, df: pd.DataFrame, max_rows: int = 8) -> None:
+    def _populate_preview_table(self, df: pl.DataFrame, max_rows: int = 8) -> None:
         """Fill the right-hand preview table with ``df``."""
         cols = list(df.columns)
         self.table_preview.clear()
         self.table_preview.setColumnCount(len(cols))
         self.table_preview.setHorizontalHeaderLabels(cols)
-        n = min(len(df), max_rows)
+        head = df.head(max_rows)
+        n = head.height
         self.table_preview.setRowCount(n)
-        for r, (_, row) in enumerate(df.head(n).iterrows()):
+        # Read the values column by column rather than row by row: a row-wise
+        # iteration would rebuild a dict per row, which is what made the
+        # preview slow on a wide frame.
+        column_values = {c: head.get_column(c).to_list() for c in cols}
+        for r in range(n):
             for c, col in enumerate(cols):
-                val = row[col]
-                text = "" if pd.isna(val) else str(val)
+                val = column_values[col][r]
+                text = "" if val is None else str(val)
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignCenter)
                 if len(cols) > 1 and c == len(cols) - 1:
@@ -565,7 +572,7 @@ class ColumnManagerPanel(QWidget):
             return "Formula is empty."
 
         # Resolve backtick-quoted columns to aliases the parser can handle.
-        numeric_cols = set(self._df.select_dtypes(include="number").columns)
+        numeric_cols = set(name for name, dtype in self._df.schema.items() if dtype in pl.NUMERIC_DTYPES)
         column_aliases: dict[str, str] = {}
 
         def _replace(match: re.Match) -> str:
@@ -606,7 +613,7 @@ class ColumnManagerPanel(QWidget):
 
     def _on_preview_add(self) -> None:
         """Preview the result of the add column operation."""
-        if self._df is None or self._df.empty:
+        if self._df is None or self._df.height == 0:
             QMessageBox.warning(self, "No Data", "Please upload a dataset first.")
             return
 
@@ -625,7 +632,7 @@ class ColumnManagerPanel(QWidget):
                 formula = _normalize_formula(raw)
                 error = self._validate_formula(formula)
                 if error:
-                    self._populate_preview_table(pd.DataFrame())
+                    self._populate_preview_table(pl.DataFrame())
                     self.lbl_preview_status.setText(f"❌ {error}")
                     QMessageBox.warning(self, "Invalid Formula", error)
                     return
@@ -668,14 +675,14 @@ class ColumnManagerPanel(QWidget):
 
         except Exception as exc:
             msg = str(exc)
-            self._populate_preview_table(pd.DataFrame())
+            self._populate_preview_table(pl.DataFrame())
             self.lbl_preview_status.setText(f"❌ Preview failed: {msg}")
             QMessageBox.critical(self, "Preview Error", msg)
             log.error("Preview failed: %s", exc)
 
     def _on_apply_add(self) -> None:
         """Apply the add column operation in a background thread."""
-        if self._df is None or self._df.empty:
+        if self._df is None or self._df.height == 0:
             return
 
         new_col_name = self.txt_new_col.text().strip()
@@ -727,11 +734,11 @@ class ColumnManagerPanel(QWidget):
 
         return add_derived_column(self._df, new_col_name, result)
 
-    def _on_add_finished(self, new_df: pd.DataFrame) -> None:
+    def _on_add_finished(self, new_df: pl.DataFrame) -> None:
         """Handle successful add column operation."""
         self.bridge.set_df(new_df)
         self.operation_applied.emit(f"Added column '{self.txt_new_col.text().strip()}'")
-        self._populate_preview_table(pd.DataFrame())
+        self._populate_preview_table(pl.DataFrame())
         self.lbl_preview_status.setText(
             "Column added. Click Preview Result again to see a new preview."
         )
@@ -741,7 +748,7 @@ class ColumnManagerPanel(QWidget):
 
     def _on_apply_remove(self) -> None:
         """Remove selected columns in a background thread."""
-        if self._df is None or self._df.empty:
+        if self._df is None or self._df.height == 0:
             return
 
         selected = [item.text() for item in self.list_remove.selectedItems()]
@@ -763,14 +770,14 @@ class ColumnManagerPanel(QWidget):
         self._worker.progress.connect(self.progress.setValue)
         self._worker.start()
 
-    def _compute_remove_column(self, selected: list[str]) -> pd.DataFrame:
+    def _compute_remove_column(self, selected: list[str]) -> pl.DataFrame:
         """Remove selected columns (runs in worker thread)."""
-        new_df = self._df.copy()
+        new_df = self._df.clone()
         for col in selected:
             new_df = remove_column(new_df, col)
         return new_df
 
-    def _on_remove_finished(self, new_df: pd.DataFrame) -> None:
+    def _on_remove_finished(self, new_df: pl.DataFrame) -> None:
         """Handle successful remove column operation."""
         self.bridge.set_df(new_df)
         self.operation_applied.emit("Removed columns")
@@ -781,7 +788,7 @@ class ColumnManagerPanel(QWidget):
 
     def _on_apply_rename(self) -> None:
         """Rename selected column in a background thread."""
-        if self._df is None or self._df.empty:
+        if self._df is None or self._df.height == 0:
             return
 
         old_name = self.cmb_rename_col.currentText()
@@ -802,13 +809,13 @@ class ColumnManagerPanel(QWidget):
         self._worker.progress.connect(self.progress.setValue)
         self._worker.start()
 
-    def _on_rename_finished(self, new_df: pd.DataFrame) -> None:
+    def _on_rename_finished(self, new_df: pl.DataFrame) -> None:
         """Handle successful rename column operation."""
         self.bridge.set_df(new_df)
         self.operation_applied.emit("Renamed column")
         self.txt_rename.clear()
         self.cmb_rename_col.clear()
-        self.cmb_rename_col.addItems(new_df.columns.tolist())
+        self.cmb_rename_col.addItems(new_df.columns)
         self._set_processing(False)
 
     # -- Worker helpers ------------------------------------------------------

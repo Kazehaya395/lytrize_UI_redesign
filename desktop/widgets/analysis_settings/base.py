@@ -660,8 +660,17 @@ def slider_with_readout(minimum, maximum, value, is_int=True, step=1, readout_wi
 def _chip_style(col):
     """Stylesheet for a colour chip: the row shows the COLOUR itself (as in
     chart_designs.pdf) with the hex value kept on the tooltip."""
-    c = QColor(str(col or ''))
-    hexv = c.name() if c.isValid() else '#6163df'
+    raw = str(col or '').strip().lower()
+    if raw in ('', 'auto', 'none'):
+        try:
+            from desktop.theme import current_mode
+            mode = current_mode()
+        except Exception:
+            mode = "light"
+        hexv = '#f8fafc' if mode == 'dark' else '#111827'
+    else:
+        c = QColor(str(col))
+        hexv = c.name() if c.isValid() else '#6163df'
     return ('QPushButton { background: ' + hexv + '; border: 1px solid palette(mid);'
             ' border-radius: 4px; color: transparent; }')
 
@@ -669,16 +678,17 @@ def _chip_style(col):
 def color_swatch(current, on_pick):
     btn = QPushButton()
     btn.setFixedSize(56, 24)
+    btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
     btn.setCursor(Qt.PointingHandCursor)
     btn.setProperty('theme_role', 'swatch')
+    btn._color_value = str(current or 'auto')
     def _retint(col):
         try:
-            # The button's text is the current colour value (kept for
-            # prefill/restyle); it is painted transparently so the chip
-            # itself is what the user sees.
-            btn.setText(str(col))
-            btn.setToolTip(str(col))
-            btn.setStyleSheet(_chip_style(col))
+            val = str(col or 'auto').strip()
+            btn._color_value = val
+            btn.setText(val)
+            btn.setToolTip(val)
+            btn.setStyleSheet(_chip_style(val))
         except Exception:
             pass
     btn._retint = _retint
@@ -689,7 +699,13 @@ def color_swatch(current, on_pick):
         pass
     def _pick():
         try:
-            start = str(btn.text() or current or '#6163df')
+            start = str(getattr(btn, '_color_value', None) or btn.text() or current or '#6163df')
+            if start.lower() in ('auto', 'none', ''):
+                try:
+                    from desktop.theme import current_mode
+                    start = '#f8fafc' if current_mode() == 'dark' else '#111827'
+                except Exception:
+                    start = '#111827'
             col = QColorDialog.getColor(QColor(start))
             if col.isValid():
                 btn._retint(col.name())
@@ -733,8 +749,13 @@ class AnalysisSettingsBase(QWidget):
         self.NONE = 'None'
         self._dirty = False
         self._pending = {}
-        self._layout_opts = {}
-        self._typo_opts = {}
+        try:
+            from chart_display import default_layout_opts, default_typo_opts
+            self._layout_opts = default_layout_opts()
+            self._typo_opts = default_typo_opts()
+        except Exception:
+            self._layout_opts = {}
+            self._typo_opts = {}
         self._suppress = False
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -803,7 +824,7 @@ class AnalysisSettingsBase(QWidget):
         btn.setEnabled(bool(enabled))
     def _mark_dirty(self, emit=True):
         self._dirty = True
-        if emit:
+        if emit and not getattr(self, "_suppress", False):
             try:
                 self.values_changed.emit(dict(self._pending))
             except Exception:
@@ -908,6 +929,45 @@ class AnalysisSettingsBase(QWidget):
         out.sort(key=_x)
         return out
 
+    def _drop_empty_option_columns(self, root):
+        """Remove option columns left with no rows after masking.
+
+        Masking removes rows but leaves the column widget (and its stretch
+        share) behind, so a Typography/Layout tab that inherits the template
+        and then drops every row of a column renders that column as a dead
+        gap consuming a third (or half) of the pane. Detaching empty columns
+        lets the survivors expand into the freed width instead.
+        """
+        try:
+            cols = self._option_columns(root)
+        except Exception:
+            cols = []
+        if len(cols) < 2:
+            return 0
+        removed = 0
+        for col in list(cols):
+            lay = col.layout()
+            if lay is None:
+                continue
+            has_row = False
+            for i in range(lay.count()):
+                item = lay.itemAt(i)
+                if item is None or item.spacerItem() is not None:
+                    continue
+                w = item.widget()
+                if w is not None:
+                    has_row = True
+                    break
+            if has_row:
+                continue
+            parent = col.parentWidget()
+            if parent is not None and parent.layout() is not None:
+                parent.layout().removeWidget(col)
+            col.setParent(None)
+            col.deleteLater()
+            removed += 1
+        return removed
+
     def _layout_option_column(self, root):
         """The right-hand Layout option column -- where extra rows belong."""
         cols = self._option_columns(root)
@@ -946,6 +1006,12 @@ class AnalysisSettingsBase(QWidget):
 
 def restyle_tree(root):
     try:
+        from desktop.theme import current_mode
+        mode = current_mode()
+    except Exception:
+        mode = "light"
+    auto_ink = '#f8fafc' if mode == 'dark' else '#111827'
+    try:
         for w in root.findChildren(QWidget):
             try:
                 role = w.property('theme_role')
@@ -959,7 +1025,11 @@ def restyle_tree(root):
                 try:
                     fn = getattr(w, '_retint', None)
                     if callable(fn):
-                        fn(w.text())
+                        val = str(getattr(w, '_color_value', None) or w.text() or '').strip()
+                        if val.lower() in ('', 'auto', 'none'):
+                            fn('auto')
+                        else:
+                            fn(val)
                 except Exception:
                     pass
     except Exception:

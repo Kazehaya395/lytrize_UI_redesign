@@ -18,23 +18,38 @@ class ChartModelError(ValueError):
     """Raised when a chart model is malformed or cannot be JSON encoded."""
 
 
+_isfinite = math.isfinite
+
+
 def _safe(value: Any, path: str = "model") -> Any:
-    if value is None or isinstance(value, (str, bool, int)):
+    # Fast paths use exact type checks: this walks every point of every chart,
+    # so per-element isinstance() and per-element string building (the old
+    # path embedded f"model[{i}]" into EVERY error path) dominated chart
+    # build, live-edit and export times. Paths are still reported, just not
+    # per-index.
+    if value is None:
         return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
+    t = type(value)
+    if t is str or t is bool or t is int:
+        return value
+    if t is float:
+        if not _isfinite(value):
             raise ChartModelError(f"{path} contains a non-finite number")
         return value
-    if isinstance(value, (list, tuple)):
-        return [_safe(item, f"{path}[{i}]") for i, item in enumerate(value)]
-    if isinstance(value, dict):
+    if t is list or t is tuple:
+        out = []
+        append = out.append
+        for item in value:
+            append(_safe(item, path))
+        return out
+    if t is dict:
         out = {}
         for key, item in value.items():
-            if not isinstance(key, str):
+            if type(key) is not str:
                 raise ChartModelError(f"{path} has a non-string key")
-            out[key] = _safe(item, f"{path}.{key}")
+            out[key] = _safe(item, path)
         return out
-    raise ChartModelError(f"{path} contains unsupported {type(value).__name__}")
+    raise ChartModelError(f"{path} contains unsupported {t.__name__}")
 
 
 def make_chart_model(*, uid: str, chart_type: str, title: str,

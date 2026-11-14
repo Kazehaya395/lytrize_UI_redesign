@@ -15,7 +15,7 @@ import re
 from typing import Optional
 
 import numpy as np
-import pandas as pd
+import polars as pl
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -68,18 +68,20 @@ _APPLY_STATES = {"text": False, "find": False, "validate": False,
                  "string": False, "numeric": False}
 
 
-def count_changed_values(before: pd.Series, after: pd.Series) -> int:
-    """Count values that genuinely differ, treating NaN == NaN as unchanged.
+def count_changed_values(before: pl.Series, after: pl.Series) -> int:
+    """Count values that genuinely differ, treating null == null as unchanged.
 
-    A naive ``(before != after).sum()`` counts NaN-vs-NaN pairs as changes
-    (NaN != NaN is True in pandas), which inflated the "N values will change"
-    labels and could enable Apply even when nothing would actually change.
-    String/NaN rendering via ``astype(str)`` plus an explicit both-null mask
-    keeps the count honest (Issue 14: reliable operation reporting).
+    A naive ``(before != after).sum()`` counts null-vs-null pairs as changes
+    (null != null is True), which inflated the "N values will change" labels
+    and could enable Apply even when nothing would actually change. String
+    rendering plus an explicit both-null mask keeps the count honest (Issue
+    14: reliable operation reporting).
     """
-    differ = before.astype(str) != after.astype(str)
-    both_na = pd.isna(before) & pd.isna(after)
-    return int((differ & ~both_na).sum())
+    before_s = before.cast(pl.Utf8)
+    after_s = after.cast(pl.Utf8)
+    differ = before_s != after_s
+    both_null = before.is_null() & after.is_null()
+    return int((differ & ~both_null).sum())
 
 
 # UI issue: input bars stretched across the full window width look bad on
@@ -148,8 +150,8 @@ class DataCleanerPanel(QWidget):
     def __init__(self, bridge, parent=None) -> None:
         super().__init__(parent)
         self.bridge = bridge
-        self._df: Optional[pd.DataFrame] = None
-        self._preview_df: Optional[pd.DataFrame] = None
+        self._df: Optional[pl.DataFrame] = None
+        self._preview_df: Optional[pl.DataFrame] = None
 
         self._build_ui()
         self._connect_signals()
@@ -499,10 +501,12 @@ class DataCleanerPanel(QWidget):
 
     # -- Public API ---------------------------------------------------------
 
-    def set_dataframe(self, df: pd.DataFrame) -> None:
+    def set_dataframe(self, df: Any) -> None:
         """Load a DataFrame and populate column dropdowns."""
+        if df is not None and not isinstance(df, pl.DataFrame):
+            df = pl.from_pandas(df)
         self._df = df
-        if df is None or df.empty:
+        if df is None or df.height == 0:
             self.cmb_text_col.clear()
             self.cmb_find_col.clear()
             self.cmb_val_col.clear()
@@ -510,7 +514,7 @@ class DataCleanerPanel(QWidget):
             self.cmb_num_col.clear()
             return
 
-        cols = df.columns.tolist()
+        cols = df.columns
         for cmb in (self.cmb_text_col, self.cmb_find_col, self.cmb_val_col,
                     self.cmb_str_col, self.cmb_num_col):
             cmb.clear()
@@ -537,11 +541,11 @@ class DataCleanerPanel(QWidget):
             "empty_to_na": self.chk_emptyna.isChecked(),
         }
         try:
-            result = text_clean_preview(self._df[col].astype(str), ops)
-            n_changed = int((self._df[col].astype(str) != result).sum())
+            src_series = self._df[col].cast(pl.String)
+            result = text_clean_preview(src_series, ops)
+            n_changed = count_changed_values(src_series, result)
             self.lbl_text_preview.setText(f"{n_changed:,} values will change")
-            self._fill_preview_table(self.table_text_preview,
-                                     self._df[col].astype(str), result.astype(str))
+            self._fill_preview_table(self.table_text_preview, src_series, result)
             self.btn_text_apply.setEnabled(n_changed > 0)
             _APPLY_STATES["text"] = n_changed > 0
         except Exception as exc:
@@ -573,10 +577,11 @@ class DataCleanerPanel(QWidget):
 
     def _compute_text_clean(self, col: str, ops: dict):
         """Compute text clean (runs in worker thread)."""
-        result = text_clean_preview(self._df[col].astype(str), ops)
+        src_series = self._df[col].cast(pl.String)
+        result = text_clean_preview(src_series, ops)
         return apply_column_update(self._df, col, result)
 
-    def _on_text_clean_finished(self, new_df: pd.DataFrame) -> None:
+    def _on_text_clean_finished(self, new_df: pl.DataFrame) -> None:
         """Handle successful text clean."""
         self.bridge.set_df(new_df)
         self.operation_applied.emit(f"✅ Cleaned column '{self.cmb_text_col.currentText()}'")
@@ -597,11 +602,11 @@ class DataCleanerPanel(QWidget):
         use_regex = self.chk_find_regex.isChecked()
         ci = self.chk_find_ci.isChecked()
         try:
-            result = find_replace_preview(self._df[col].astype(str), find, replace, use_regex, ci)
-            n_changed = int((self._df[col].astype(str) != result).sum())
+            src_series = self._df[col].cast(pl.String)
+            result = find_replace_preview(src_series, find, replace, use_regex, ci)
+            n_changed = count_changed_values(src_series, result)
             self.lbl_find_preview.setText(f"{n_changed:,} values will change")
-            self._fill_preview_table(self.table_find_preview,
-                                     self._df[col].astype(str), result.astype(str))
+            self._fill_preview_table(self.table_find_preview, src_series, result)
             self.btn_find_apply.setEnabled(n_changed > 0)
             _APPLY_STATES["find"] = n_changed > 0
         except (re.error, ValueError) as e:
@@ -631,10 +636,11 @@ class DataCleanerPanel(QWidget):
 
     def _compute_find_replace(self, col: str, find: str, replace: str, use_regex: bool, ci: bool):
         """Compute find/replace (runs in worker thread)."""
-        result = find_replace_preview(self._df[col].astype(str), find, replace, use_regex, ci)
+        src_series = self._df[col].cast(pl.String)
+        result = find_replace_preview(src_series, find, replace, use_regex, ci)
         return apply_column_update(self._df, col, result)
 
-    def _on_find_replace_finished(self, new_df: pd.DataFrame) -> None:
+    def _on_find_replace_finished(self, new_df: pl.DataFrame) -> None:
         """Handle successful find/replace."""
         self.bridge.set_df(new_df)
         self.operation_applied.emit(f"✅ Find & replace applied to '{self.cmb_find_col.currentText()}'")
@@ -679,7 +685,7 @@ class DataCleanerPanel(QWidget):
             return validate_flag_column(self._df, col, pattern)
         return self._df
 
-    def _on_validate_finished(self, new_df: pd.DataFrame) -> None:
+    def _on_validate_finished(self, new_df: pl.DataFrame) -> None:
         """Handle successful validation action."""
         self.bridge.set_df(new_df)
         col = self.cmb_val_col.currentText()
@@ -717,12 +723,15 @@ class DataCleanerPanel(QWidget):
             _APPLY_STATES["validate"] = result['n_fail'] > 0
 
             # Show failing rows
-            fail_rows = result.get("fail_rows", pd.DataFrame())
-            self.table_failures.setRowCount(min(len(fail_rows), 20))
-            for i, (idx, row) in enumerate(fail_rows.head(20).iterrows()):
-                item = QTableWidgetItem(str(row.iloc[0]))
-                item.setTextAlignment(Qt.AlignCenter)
-                self.table_failures.setItem(i, 0, item)
+            fail_rows = result.get("fail_rows", pl.DataFrame())
+            shown = fail_rows.head(20)
+            self.table_failures.setRowCount(shown.height)
+            column_name = shown.columns[0] if shown.columns else None
+            if column_name is not None:
+                for i, value in enumerate(shown.get_column(column_name).to_list()):
+                    item = QTableWidgetItem("" if value is None else str(value))
+                    item.setTextAlignment(Qt.AlignCenter)
+                    self.table_failures.setItem(i, 0, item)
             # Row count just changed -> re-measure the index gutter.
             auto_fit_index_header(self.table_failures)
         except (re.error, KeyError):
@@ -809,8 +818,8 @@ class DataCleanerPanel(QWidget):
 
         elif text == OP_CONCAT:
             self.str_op_col2 = QComboBox()
-            if self._df is not None and not self._df.empty:
-                self.str_op_col2.addItems(self._df.columns.tolist())
+            if self._df is not None and not self._df.is_empty():
+                self.str_op_col2.addItems(self._df.columns)
             self.str_op_col2.currentTextChanged.connect(self._reset_string_preview)
             self.str_options_layout.addWidget(QLabel("Second column:"))
             self.str_options_layout.addWidget(self.str_op_col2)
@@ -845,54 +854,58 @@ class DataCleanerPanel(QWidget):
             return
         col = self.cmb_str_col.currentText()
         op = self.cmb_str_op.currentText()
-        series = self._df[col].astype(str)
-        new_series = series.copy()
+        series = self._df[col].cast(pl.String)
+        new_series = series.clone()
         new_col_name = None
 
         try:
             if op == OP_TRIM:
                 length = self.str_op_length.value()
                 side = self.str_op_side.currentText()
-                new_series = series.str[:length] if "Left" in side else series.str[-length:]
+                new_series = series.str.slice(0, length) if "Left" in side else series.str.slice(-length)
 
             elif op == OP_PAD:
                 length = self.str_op_padlen.value()
-                char = self.str_op_padchar.text()
+                char = (self.str_op_padchar.text() or " ")[0]
                 side = self.str_op_padside.currentText()
-                if side == "Left" and char == "0":
-                    new_series = series.str.zfill(length)
-                elif side == "Right":
-                    new_series = series.str.ljust(length, char)
+                if side == "Right":
+                    new_series = series.str.pad_end(length, fill_char=char)
                 else:
-                    new_series = series.str.rjust(length, char)
+                    new_series = series.str.pad_start(length, fill_char=char)
 
             elif op == OP_SUBSTRING:
                 start = self.str_op_start.value()
                 end = self.str_op_end.value()
-                new_series = series.str[start: end if end > 0 else None]
+                length = end - start if end > start else None
+                new_series = series.str.slice(start, length)
 
             elif op == OP_SPLIT:
                 delim = self.str_op_delim.text()
                 part_idx = 0 if "First" in self.str_op_part.currentText() else 1
-                new_series = series.str.split(delim, n=1, expand=False).apply(
-                    lambda x: x[part_idx] if isinstance(x, list) and len(x) > part_idx else np.nan
-                )
+                new_series = series.str.split(delim).list.get(part_idx, null_on_oob=True)
                 new_col_name = self.str_op_newcol.text().strip()
 
             elif op == OP_CONCAT:
                 col2 = self.str_op_col2.currentText()
                 sep = self.str_op_sep.text()
-                new_series = series.str.cat(self._df[col2].astype(str), sep=sep)
+                new_series = self._df.select(
+                    pl.concat_str([pl.col(col).cast(pl.String), pl.col(col2).cast(pl.String)],
+                                  separator=sep)
+                ).to_series()
                 new_col_name = self.str_op_concatcol.text().strip()
 
             elif op == OP_REGEX_EXTRACT:
                 pattern = self.str_op_re.text().strip()
-                new_series = series.str.extract(f"({pattern})", expand=False)
+                group_idx = 1 if "(" in pattern and ")" in pattern else 0
+                new_series = series.str.extract(pattern, group_idx)
                 new_col_name = self.str_op_recol.text().strip()
+
+            if isinstance(new_series, pl.Expr):
+                new_series = self._df.select(new_series).to_series()
 
             n_changed = count_changed_values(series, new_series)
             self.lbl_str_preview.setText(f"{n_changed:,} values will change → {new_col_name or col}")
-            self._fill_preview_table(self.table_str_preview, series.head(20).astype(str), new_series.head(20).astype(str))
+            self._fill_preview_table(self.table_str_preview, series.head(20), new_series.head(20))
             self.btn_str_apply.setEnabled(n_changed > 0)
             _APPLY_STATES["string"] = n_changed > 0
         except Exception as exc:
@@ -911,44 +924,47 @@ class DataCleanerPanel(QWidget):
 
     def _compute_str_op(self, col: str, op: str):
         """Compute string operation (runs in worker thread)."""
-        series = self._df[col].astype(str)
-        new_series = series.copy()
+        series = self._df[col].cast(pl.String)
+        new_series = series.clone()
         new_col_name = None
 
         if op == OP_TRIM:
             length = self.str_op_length.value()
             side = self.str_op_side.currentText()
-            new_series = series.str[:length] if "Left" in side else series.str[-length:]
+            new_series = series.str.slice(0, length) if "Left" in side else series.str.slice(-length)
         elif op == OP_PAD:
             length = self.str_op_padlen.value()
-            char = self.str_op_padchar.text()
+            char = (self.str_op_padchar.text() or " ")[0]
             side = self.str_op_padside.currentText()
-            if side == "Left" and char == "0":
-                new_series = series.str.zfill(length)
-            elif side == "Right":
-                new_series = series.str.ljust(length, char)
+            if side == "Right":
+                new_series = series.str.pad_end(length, fill_char=char)
             else:
-                new_series = series.str.rjust(length, char)
+                new_series = series.str.pad_start(length, fill_char=char)
         elif op == OP_SUBSTRING:
             start = self.str_op_start.value()
             end = self.str_op_end.value()
-            new_series = series.str[start: end if end > 0 else None]
+            length = end - start if end > start else None
+            new_series = series.str.slice(start, length)
         elif op == OP_SPLIT:
             delim = self.str_op_delim.text()
             part_idx = 0 if "First" in self.str_op_part.currentText() else 1
-            new_series = series.str.split(delim, n=1, expand=False).apply(
-                lambda x: x[part_idx] if isinstance(x, list) and len(x) > part_idx else np.nan
-            )
+            new_series = series.str.split(delim).list.get(part_idx, null_on_oob=True)
             new_col_name = self.str_op_newcol.text().strip()
         elif op == OP_CONCAT:
             col2 = self.str_op_col2.currentText()
             sep = self.str_op_sep.text()
-            new_series = series.str.cat(self._df[col2].astype(str), sep=sep)
+            new_series = self._df.select(
+                pl.concat_str([pl.col(col).cast(pl.String), pl.col(col2).cast(pl.String)], separator=sep)
+            ).to_series()
             new_col_name = self.str_op_concatcol.text().strip()
         elif op == OP_REGEX_EXTRACT:
             pattern = self.str_op_re.text().strip()
-            new_series = series.str.extract(f"({pattern})", expand=False)
+            group_idx = 1 if "(" in pattern and ")" in pattern else 0
+            new_series = series.str.extract(pattern, group_idx)
             new_col_name = self.str_op_recol.text().strip()
+
+        if isinstance(new_series, pl.Expr):
+            new_series = self._df.select(new_series).to_series()
 
         return new_series, new_col_name, col
 
@@ -956,8 +972,7 @@ class DataCleanerPanel(QWidget):
         """Handle successful string operation."""
         new_series, new_col_name, col = result_tuple
         if new_col_name:
-            new_df = self._df.copy()
-            new_df[new_col_name] = new_series
+            new_df = self._df.with_columns(new_series.alias(new_col_name))
             self.bridge.set_df(new_df)
             self.operation_applied.emit(f"✅ Created column '{new_col_name}'")
         else:
@@ -1044,13 +1059,13 @@ class DataCleanerPanel(QWidget):
             return
 
         try:
-            series = pd.to_numeric(self._df[col], errors="coerce")
+            series = self._df[col].cast(pl.Float64, strict=False)
             result = numeric_clean(series, op_key, **kwargs)
             n_changed = count_changed_values(series.round(8), result.round(8))
             self.lbl_num_preview.setText(f"{n_changed:,} values will change")
             self._fill_preview_table(self.table_num_preview,
-                                 series.head(20).astype(str),
-                                 result.head(20).round(4).astype(str))
+                                     series.head(20).cast(pl.String),
+                                     result.head(20).round(4).cast(pl.String))
             self.btn_num_apply.setEnabled(n_changed > 0)
             _APPLY_STATES["numeric"] = n_changed > 0
         except Exception as exc:
@@ -1083,11 +1098,11 @@ class DataCleanerPanel(QWidget):
 
     def _compute_numeric_clean(self, col: str, op_key: str, kwargs: dict):
         """Compute numeric clean (runs in worker thread)."""
-        series = pd.to_numeric(self._df[col], errors="coerce")
+        series = self._df[col].cast(pl.Float64, strict=False)
         result = numeric_clean(series, op_key, **kwargs)
         return apply_column_update(self._df, col, result)
 
-    def _on_numeric_clean_finished(self, new_df: pd.DataFrame) -> None:
+    def _on_numeric_clean_finished(self, new_df: pl.DataFrame) -> None:
         """Handle successful numeric clean."""
         self.bridge.set_df(new_df)
         self.operation_applied.emit(f"✅ Numeric clean applied to '{self.cmb_num_col.currentText()}'")
@@ -1117,11 +1132,14 @@ class DataCleanerPanel(QWidget):
         self.btn_num_apply.setEnabled(False)
         _APPLY_STATES["numeric"] = False
 
-    def _fill_preview_table(self, table: QTableWidget, before: pd.Series, after: pd.Series) -> None:
+    def _fill_preview_table(self, table: QTableWidget, before: pl.Series, after: pl.Series) -> None:
         """Fill a preview table with before/after values (centered cells)."""
-        table.setRowCount(min(len(before), 20))
-        for i in range(min(len(before), 20)):
-            for j, val in enumerate((str(before.iloc[i]), str(after.iloc[i]))):
+        rows = min(len(before), 20)
+        table.setRowCount(rows)
+        before_vals = before.head(rows).to_list()
+        after_vals = after.head(rows).to_list()
+        for i in range(rows):
+            for j, val in enumerate((str(before_vals[i]), str(after_vals[i]))):
                 item = QTableWidgetItem(val)
                 item.setTextAlignment(Qt.AlignCenter)
                 table.setItem(i, j, item)

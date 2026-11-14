@@ -37,8 +37,13 @@ from typing import Dict, List
 log = logging.getLogger(__name__)
 
 # Keep fonts beside the other shipped assets so source and package layouts
-# resolve to the same location.
-FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
+# resolve to the same location. ``modules.runtime_paths`` is the single
+# source of truth for the frozen (PyInstaller) vs source-tree layout.
+try:
+    from modules.runtime_paths import assets_root as _assets_root
+    FONT_DIR = _assets_root() / "fonts"
+except Exception:  # pragma: no cover - never brick the shell over fonts
+    FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
 
 # Open, metric-compatible stand-ins for the proprietary families the picker
 # used to offer. Keyed by the name the user sees -> the family we ship.

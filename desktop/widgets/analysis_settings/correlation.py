@@ -227,7 +227,7 @@ class CorrelationSettings(StatisticalSettings):
             pass
         ll_.addWidget(grid_row('Ann size', ann))
         self._sw_ann = color_swatch(
-            str(self._layout_opts.get('heatmap_annotation_color', '#ffffff')),
+            str(self._layout_opts.get('heatmap_annotation_color', 'auto')),
             lambda c: self._set_layout(heatmap_annotation_color=c))
         ll_.addWidget(grid_row('Ann color', self._sw_ann))
         prec = slider_with_readout(PRECISION_RANGE[0], PRECISION_RANGE[1],
@@ -268,7 +268,7 @@ class CorrelationSettings(StatisticalSettings):
             pass
         rr.addWidget(grid_row('CB tick sz', cbts))
         self._sw_cbtc = color_swatch(
-            str(self._layout_opts.get('colorbar_tick_color', '#94a3b8')),
+            str(self._layout_opts.get('colorbar_tick_color', 'auto')),
             lambda c: self._set_layout(colorbar_tick_color=c))
         rr.addWidget(grid_row('CB tick clr', self._sw_cbtc))
         cbtsz = slider_with_readout(COLORBAR_TITLE_SIZE_RANGE[0],
@@ -284,7 +284,7 @@ class CorrelationSettings(StatisticalSettings):
             pass
         rr.addWidget(grid_row('CB title sz', cbtsz))
         self._sw_cbtclr = color_swatch(
-            str(self._layout_opts.get('colorbar_title_color', '#cbd5e1')),
+            str(self._layout_opts.get('colorbar_title_color', 'auto')),
             lambda c: self._set_layout(colorbar_title_color=c))
         rr.addWidget(grid_row('CB title clr', self._sw_cbtclr))
         # Shared display rows, in the template's own order. "Show border" is

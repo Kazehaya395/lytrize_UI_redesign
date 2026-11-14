@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from typing import Optional
 
 import pandas as pd
+import polars as pl
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -22,6 +23,24 @@ from PySide6.QtWidgets import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _to_polars(df) -> pl.DataFrame:
+    """Convert a pandas frame to Polars at the Excel boundary.
+
+    Excel is the one format Polars cannot read, so pandas does the parsing
+    and this is where the result is handed over to the Polars-native
+    application. A frame that is already Polars passes straight through.
+    """
+    if df is None:
+        return pl.DataFrame()
+    if isinstance(df, pl.DataFrame):
+        return df
+    try:
+        return pl.from_pandas(df, include_index=False)
+    except Exception as exc:
+        log.error("could not convert the Excel sheet to Polars: %s", exc)
+        return pl.DataFrame()
 
 
 class _LazySheets(Mapping):
@@ -144,10 +163,15 @@ class ExcelLoaderPanel(QWidget):
 
     Emits ``sheet_selected`` when a single sheet is chosen.
     Emits ``merged_table_ready`` when a unified table is built.
+
+    pandas is used INTERNALLY here, and only here, because it is the only
+    reader that can parse ``.xlsx`` (Polars cannot). Everything that leaves
+    this panel is converted to Polars at the boundary, so no pandas frame
+    ever reaches the session.
     """
 
-    sheet_selected = Signal(pd.DataFrame, str)  # emits df, sheet_name
-    merged_table_ready = Signal(pd.DataFrame, str)  # emits merged_df, description
+    sheet_selected = Signal(object, str)      # emits pl.DataFrame, sheet_name
+    merged_table_ready = Signal(object, str)   # emits pl.DataFrame, description
 
     def __init__(self, bridge, parent=None) -> None:
         super().__init__(parent)
@@ -397,7 +421,8 @@ class ExcelLoaderPanel(QWidget):
             QMessageBox.warning(self, "No Sheet Selected", "Please select a sheet first.")
             return
         df = self._sheets[sheet_name]
-        self.sheet_selected.emit(df.copy(), sheet_name)
+        # Convert at the boundary: the session is Polars-native.
+        self.sheet_selected.emit(_to_polars(df), sheet_name)
 
     def _on_fact_changed(self, text: str) -> None:
         """Rebuild join configs when the fact table changes."""
@@ -438,12 +463,12 @@ class ExcelLoaderPanel(QWidget):
 
             # Fact key
             cmb_fact_key = QComboBox()
-            cmb_fact_key.addItems(fact_df.columns.tolist())
+            cmb_fact_key.addItems(list(fact_df.columns))
             layout.addRow("Fact key:", cmb_fact_key)
 
             # Dim key
             cmb_dim_key = QComboBox()
-            cmb_dim_key.addItems(dim_df.columns.tolist())
+            cmb_dim_key.addItems(list(dim_df.columns))
             if common:
                 cmb_dim_key.setCurrentText(common[0])
             layout.addRow("Dim key:", cmb_dim_key)
@@ -557,7 +582,7 @@ class ExcelLoaderPanel(QWidget):
                 f"Final shape: {merged.shape[0]:,} rows × {merged.shape[1]} columns"
             )
 
-            self.merged_table_ready.emit(merged, summary)
+            self.merged_table_ready.emit(_to_polars(merged), summary)
 
         except Exception as exc:
             QMessageBox.critical(self, "Merge Failed", str(exc))

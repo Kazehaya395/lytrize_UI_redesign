@@ -430,9 +430,9 @@ def run_chart_recipe(recipe: dict, df: pd.DataFrame, *,
         # Native descriptive tables are regenerated from their semantic recipe
         # when a dashboard slicer changes. Keep this model path out of the
         # Plotly runner registry, while retaining the saved canvas uid.
-        from services.polars_engine import PolarsDataset
+        from services.polars_engine import ensure_dataset
         from services.polars_chart_service import build_descriptive_table_chart
-        dataset = PolarsDataset.from_pandas(df, source="slicer-rebuild")
+        dataset = ensure_dataset(df, source="slicer-rebuild")
         model = build_descriptive_table_chart(
             dataset, layout=recipe.get("layout"),
             typography=recipe.get("typography"),
@@ -445,7 +445,7 @@ def run_chart_recipe(recipe: dict, df: pd.DataFrame, *,
         # Outlier cards are semantic scatter models. Re-run the IQR query
         # against the filtered frame so dashboard slicers update both points
         # and fences without entering the legacy Plotly runner/display path.
-        from services.polars_engine import PolarsDataset
+        from services.polars_engine import ensure_dataset
         from services.polars_chart_service import build_outlier_charts
         model_recipe = dict(recipe.get("chart_model_recipe") or {})
         config = dict(model_recipe.get("config") or recipe.get("config") or {})
@@ -453,7 +453,7 @@ def run_chart_recipe(recipe: dict, df: pd.DataFrame, *,
         if not column or column not in df.columns:
             log.info("run_chart_recipe: outlier column is absent from filtered frame")
             return None
-        dataset = PolarsDataset.from_pandas(df, source="slicer-rebuild")
+        dataset = ensure_dataset(df, source="slicer-rebuild")
         models = build_outlier_charts(
             dataset, [column], multiplier=config.get("multiplier", 1.5),
             typography=recipe.get("typography"),
@@ -464,11 +464,11 @@ def run_chart_recipe(recipe: dict, df: pd.DataFrame, *,
         model["uid"] = str(recipe.get("uid") or model["uid"])
         return model["uid"], model["title"], model
     if chart_type == "data_quality" and recipe.get("engine") == "polars":
-        from services.polars_engine import PolarsDataset
+        from services.polars_engine import ensure_dataset
         from services.polars_chart_service import build_data_quality_charts
         model_recipe = dict(recipe.get("chart_model_recipe") or {})
         view = dict(model_recipe.get("config") or {}).get("view")
-        dataset = PolarsDataset.from_pandas(df, source="slicer-rebuild")
+        dataset = ensure_dataset(df, source="slicer-rebuild")
         models = build_data_quality_charts(dataset)
         model = next((item for item in models
                       if dict((item.get("recipe") or {}).get("config") or {})
@@ -478,11 +478,11 @@ def run_chart_recipe(recipe: dict, df: pd.DataFrame, *,
         model["uid"] = str(recipe.get("uid") or model["uid"])
         return model["uid"], model["title"], model
     if chart_type == "map_plot":
-        from services.polars_engine import PolarsDataset
+        from services.polars_engine import ensure_dataset
         from services.polars_chart_service import build_map_plot_chart
         model_recipe = dict(recipe.get("chart_model_recipe") or {})
         config = dict(model_recipe.get("config") or recipe.get("config") or {})
-        dataset = PolarsDataset.from_pandas(df, source="slicer-rebuild")
+        dataset = ensure_dataset(df, source="slicer-rebuild")
         model = build_map_plot_chart(
             dataset, config, layout=model_recipe.get("layout") or recipe.get("layout"),
             typography=model_recipe.get("typography") or recipe.get("typography"),
@@ -517,7 +517,8 @@ def _rebuild_one(recipe: dict, chart_type: str, df: pd.DataFrame, *,
         log.debug("run_chart_recipe: no dataset to rebuild against")
         return None
 
-    if getattr(df, "empty", False):
+    is_empty = df.is_empty() if hasattr(df, "is_empty") else (df.empty if hasattr(df, "empty") else len(df) == 0)
+    if is_empty:
         # A filter that removes every row leaves the chart with nothing to
         # draw. Returning None is the honest answer: the caller shows an
         # empty-state card. Handing back the previous figure instead would

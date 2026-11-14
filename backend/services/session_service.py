@@ -1,4 +1,4 @@
-"""services/session_service.py — Headless session state manager.
+"""services/session_service.py — Headless session state manager (Polars-native).
 
 Replaces ``st.session_state``, ``set_df()``, ``update_df()``, and the
 ``session_cached`` decorator with a plain Python ``SessionManager`` class
@@ -9,7 +9,6 @@ can instantiate their own or share one across the application.  The Qt
 integration layer will wrap it in a ``QObject`` that emits signals when
 state changes.
 """
-
 from __future__ import annotations
 
 import logging
@@ -18,10 +17,9 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-import pandas as pd
+import polars as pl
 
 log = logging.getLogger(__name__)
-
 
 # ── Cache keys that must be invalidated when the DataFrame changes ──
 _CACHES_TO_CLEAR: list[str] = [
@@ -57,7 +55,7 @@ class SessionManager:
 
         sm = SessionManager()
         sm.set("user_id", 42)
-        sm.set_df(my_dataframe)
+        sm.set_df(my_polars_df)
         chart = sm.get("charts", [])
     """
 
@@ -65,7 +63,7 @@ class SessionManager:
         # -- Core state dictionary (replaces st.session_state) --
         self._state: dict[str, Any] = {}
 
-        # -- DataFrame version counter --
+        # -- Polars DataFrame version counter --
         self._df_version: int = 0
 
         # -- Derived-cache invalidation --
@@ -75,8 +73,35 @@ class SessionManager:
         self._notes_shadow: dict[str, str] = {}
 
         # -- Callbacks (Qt signals equivalent) --
-        self._df_change_callbacks: list[Callable[[pd.DataFrame], None]] = []
+        self._df_change_callbacks: list[Callable[[pl.DataFrame], None]] = []
         self._state_change_callbacks: list[Callable[[str, Any], None]] = []
+
+    # ── Callback registration (the Qt-signal equivalent) ──────────────
+
+    def on_df_changed(self, callback: Callable[[pl.DataFrame], None]) -> None:
+        """Register a callback fired whenever the DataFrame is replaced.
+
+        The callback receives the new Polars frame. A callback that raises is
+        logged and skipped: one broken subscriber must not stop the others
+        from being told about the new data.
+        """
+        if callback not in self._df_change_callbacks:
+            self._df_change_callbacks.append(callback)
+
+    def on_state_changed(self, callback: Callable[[str, Any], None]) -> None:
+        """Register a callback fired whenever a state key is written."""
+        if callback not in self._state_change_callbacks:
+            self._state_change_callbacks.append(callback)
+
+    def off_df_changed(self, callback: Callable[[pl.DataFrame], None]) -> None:
+        """Remove a previously registered DataFrame callback."""
+        if callback in self._df_change_callbacks:
+            self._df_change_callbacks.remove(callback)
+
+    def off_state_changed(self, callback: Callable[[str, Any], None]) -> None:
+        """Remove a previously registered state callback."""
+        if callback in self._state_change_callbacks:
+            self._state_change_callbacks.remove(callback)
 
     # ── Generic state access (replaces st.session_state[key]) ──────────
 
@@ -109,131 +134,92 @@ class SessionManager:
         """Return an iterator over state (key, value) pairs."""
         return self._state.items()
 
-    def setdefault(self, key: str, default: Any = None) -> Any:
-        """Return the value for *key* if it exists, else set to *default*."""
+    def setdefault(self, key: str, default: Any) -> Any:
+        """Return existing value or set and return *default*."""
         if key not in self._state:
             self._state[key] = default
         return self._state[key]
 
-    # ── DataFrame management (replaces set_df / update_df) ────────────
+    # ── Chart metadata & notes access ─────────────────────────────────
+
+    def get_chart_meta(self, uid: str) -> dict:
+        """Return chart recipe/metadata for *uid*."""
+        meta = self.get(f"chart_meta_{uid}")
+        if meta is None:
+            meta_map = self.get("chart_meta", {})
+            meta = meta_map.get(uid, {}) if isinstance(meta_map, dict) else {}
+        return dict(meta or {})
+
+    def set_chart_meta(self, uid: str, **kwargs) -> None:
+        """Update chart metadata for *uid*."""
+        meta = dict(self.get_chart_meta(uid))
+        meta.update(kwargs)
+        self.set(f"chart_meta_{uid}", meta)
+        meta_map = dict(self.get("chart_meta", {}) or {})
+        meta_map[uid] = meta
+        self.set("chart_meta", meta_map)
+
+    def set_note(self, uid: str, text: str) -> None:
+        """Store user note for chart *uid*."""
+        self.set(f"chart_note_{uid}", str(text or ""))
+        notes = dict(self.get("chart_notes", {}) or {})
+        notes[uid] = str(text or "")
+        self.set("chart_notes", notes)
+
+    def get_note(self, uid: str) -> str:
+        """Retrieve user note for chart *uid*."""
+        note = self.get(f"chart_note_{uid}")
+        if note is None:
+            notes = self.get("chart_notes", {}) or {}
+            note = notes.get(uid, "") if isinstance(notes, dict) else ""
+        return str(note or "")
+
+    # ── DataFrame access (Polars-native) ──────────────────────────────
 
     @property
-    def df(self) -> Optional[pd.DataFrame]:
-        """Return the current DataFrame, or None."""
+    def df(self) -> Optional[pl.DataFrame]:
+        """Return the current Polars DataFrame, or None."""
         return self._state.get("df")
 
     @df.setter
-    def df(self, value: pd.DataFrame) -> None:
-        """Set the DataFrame and bump version (replaces ``set_df``)."""
-        self._state["df"] = value
+    def df(self, value: Optional[pl.DataFrame]) -> None:
+        self.set_df(value)
+
+    def set_df(self, df: Optional[pl.DataFrame]) -> None:
+        """Store a Polars DataFrame and notify callbacks."""
         self._df_version += 1
-        self._state["_df_version"] = self._df_version
-
-        # Invalidate derived caches
-        for key in _CACHES_TO_CLEAR:
-            self._cache.pop(key, None)
-            self._state.pop(key, None)
-
-        # Also wipe preview and dtype keys
-        stale_keys = [
-            k for k in self._state.keys()
-            if k.startswith("_preview_") or k.startswith("_dtype_target_")
-        ]
-        for k in stale_keys:
-            self._state.pop(k, None)
-
-        # Notify callbacks
+        self._state["df"] = df
         for cb in self._df_change_callbacks:
             try:
-                cb(value)
+                cb(df)
             except Exception as exc:
-                log.warning("SessionManager DF callback failed: %s", exc)
+                log.warning("SessionManager df callback failed: %s", exc)
+        for cb in self._state_change_callbacks:
+            try:
+                cb("df", df)
+            except Exception as exc:
+                log.warning("SessionManager state callback failed: %s", exc)
 
-    def update_df(self, df: pd.DataFrame) -> None:
-        """Shallow-copy *df* then store (replaces ``update_df``).
+    # ── Cache management ──────────────────────────────────────────────
 
-        Use this when you have mutated *df* in place so that consumers
-        see a **new object identity** and refresh.
-        """
-        self.df = df.copy(deep=False)
+    def get_cache(self, key: str, default: Any = None) -> Any:
+        return self._cache.get(key, default)
 
-    def on_df_changed(self, callback: Callable[[pd.DataFrame], None]) -> None:
-        """Register a callback invoked when the DataFrame is replaced."""
-        self._df_change_callbacks.append(callback)
+    def set_cache(self, key: str, value: Any) -> None:
+        self._cache[key] = value
 
-    def on_state_changed(self, callback: Callable[[str, Any], None]) -> None:
-        """Register a callback invoked when any state key is set."""
-        self._state_change_callbacks.append(callback)
+    def pop_cache(self, key: str, default: Any = None) -> Any:
+        return self._cache.pop(key, default)
 
-    # ── Notes shadow (replaces _notes_shadow pattern) ────────────────
-
-    def get_note(self, uid: str) -> str:
-        """Return the current note text for a chart uid."""
-        return self._notes_shadow.get(uid, self._state.get(f"desc_{uid}", ""))
-
-    def set_note(self, uid: str, text: str) -> None:
-        """Store a note for a chart uid in both shadow and state."""
-        self._notes_shadow[uid] = text
-        self._state[f"desc_{uid}"] = text
-
-    def pop_note(self, uid: str) -> None:
-        """Remove the note for a chart uid."""
-        self._notes_shadow.pop(uid, None)
-        self._state.pop(f"desc_{uid}", None)
-
-    def sync_notes(self) -> None:
-        """Bidirectional sync: desc_{uid} ↔ _notes_shadow."""
-        for k, v in list(self._state.items()):
-            if k.startswith("desc_") and k not in ("desc_add", "desc_close") and isinstance(v, str):
-                if v:
-                    self._notes_shadow[k[5:]] = v
-                else:
-                    self._notes_shadow.pop(k[5:], None)
-        for uid, note in list(self._notes_shadow.items()):
-            key = f"desc_{uid}"
-            if note and (key not in self._state or not self._state.get(key)):
-                self._state[key] = note
-
-    # ── Cached computation (replaces session_cached decorator) ────────
-
-    def cached(self, key: str, compute: Callable[[], Any], *,
-               invalidate_on_df: bool = False) -> Any:
-        """Return a cached value, computing it if stale.
-
-        Parameters
-        ----------
-        key : str
-            Cache key.
-        compute : callable
-            Function that returns the value to cache.
-        invalidate_on_df : bool
-            If True, the cache is invalidated whenever the DataFrame changes
-            (checked via ``_df_version``).
-        """
-        cache_key = key
-        sig_key = f"{key}_sig"
-
-        current_sig = self._df_version if invalidate_on_df else None
-        cached_sig = self._cache.get(sig_key)
-
-        if cached_sig == current_sig and cache_key in self._cache:
-            return self._cache[cache_key]
-
-        val = compute()
-        self._cache[cache_key] = val
-        if current_sig is not None:
-            self._cache[sig_key] = current_sig
-        return val
-
-    def invalidate_cache(self, key: Optional[str] = None) -> None:
-        """Clear a specific cache entry, or all caches if *key* is None."""
+    def clear_cache(self, key: Optional[str] = None) -> None:
+        """Clear a single cache entry, or all caches if *key* is None."""
         if key is None:
             self._cache.clear()
         else:
             self._cache.pop(key, None)
             self._cache.pop(f"{key}_sig", None)
 
-    # ── DataFrame snapshot persistence (replaces save_df_snapshot) ────
+    # ── DataFrame snapshot persistence (Parquet via Polars) ───────────
 
     def df_cache_path(self, user_id: int) -> Path:
         """Return the path for the per-user DataFrame parquet snapshot."""
@@ -252,8 +238,8 @@ class SessionManager:
 
         return base / f"df_{user_id}.parquet"
 
-    def save_df_snapshot(self, user_id: int, df: Optional[pd.DataFrame] = None) -> None:
-        """Persist a DataFrame to a parquet snapshot."""
+    def save_df_snapshot(self, user_id: int, df: Optional[pl.DataFrame] = None) -> None:
+        """Persist a Polars DataFrame to a parquet snapshot (zstd compressed)."""
         if df is None:
             df = self._state.get("df")
         if df is None:
@@ -261,7 +247,7 @@ class SessionManager:
 
         path = self.df_cache_path(user_id)
         try:
-            df.to_parquet(str(path), index=False, engine="pyarrow", compression="zstd")
+            df.write_parquet(str(path), compression="zstd")
             try:
                 path.chmod(0o600)
             except Exception as exc:
@@ -276,8 +262,8 @@ class SessionManager:
                 exc,
             )
 
-    def load_df_snapshot(self, user_id: int) -> Optional[pd.DataFrame]:
-        """Restore the DataFrame from the parquet snapshot."""
+    def load_df_snapshot(self, user_id: int) -> Optional[pl.DataFrame]:
+        """Restore the DataFrame from the parquet snapshot (Polars)."""
         path = self.df_cache_path(user_id)
         if not path.exists():
             return None
@@ -297,7 +283,7 @@ class SessionManager:
             log.debug("load_df_snapshot: stat failed: %s", exc)
 
         try:
-            return pd.read_parquet(str(path), engine="pyarrow")
+            return pl.read_parquet(str(path))
         except Exception as exc:
             log.warning(
                 "load_df_snapshot: failed to read parquet for user %s "
@@ -310,7 +296,7 @@ class SessionManager:
 
     # ── Thread-safe background snapshot ───────────────────────────────
 
-    def save_df_snapshot_async(self, user_id: int, df: Optional[pd.DataFrame] = None) -> None:
+    def save_df_snapshot_async(self, user_id: int, df: Optional[pl.DataFrame] = None) -> None:
         """Save DataFrame snapshot in a background thread."""
         if df is None:
             df = self._state.get("df")

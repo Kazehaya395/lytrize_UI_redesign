@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-import pandas as pd
+import polars as pl
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QPushButton,
@@ -32,14 +32,18 @@ log = logging.getLogger(__name__)
 # Styling handled by global QSS (theme.py) via kind=primary and objectName selectors
 
 
-def _fill_preview_table(table: QTableWidget, df: pd.DataFrame) -> None:
+def _fill_preview_table(table: QTableWidget, df: pl.DataFrame) -> None:
     table.clear()
     table.setColumnCount(len(df.columns))
-    table.setRowCount(len(df))
+    table.setRowCount(df.height)
     table.setHorizontalHeaderLabels([str(c) for c in df.columns])
-    for r in range(len(df)):
+    # Read the values column by column rather than cell by cell: a cell-wise
+    # lookup would rebuild the frame's index for every single cell.
+    column_values = {c: df.get_column(c).to_list() for c in df.columns}
+    for r in range(df.height):
         for c, col in enumerate(df.columns):
-            table.setItem(r, c, QTableWidgetItem(str(df.iloc[r, c])))
+            value = column_values[col][r]
+            table.setItem(r, c, QTableWidgetItem("" if value is None else str(value)))
     table.resizeColumnsToContents()
 
 
@@ -53,7 +57,7 @@ class _BaseToolTab(QWidget):
         self._get_df = get_df
 
     @property
-    def df(self) -> Optional[pd.DataFrame]:
+    def df(self) -> Optional[pl.DataFrame]:
         return self._get_df()
 
     def _error(self, msg: str) -> None:
@@ -488,10 +492,11 @@ class DataCleanerTab(_BaseToolTab):
                     return
                 ops = {k: cb.isChecked() for k, cb in self.tc_checks.items()}
                 new_series = ts.text_clean_preview(df[col], ops)
-                n_changed = int((df[col].astype(str) != new_series.astype(str)).sum())
-                self.lbl_result.setText(f"{n_changed:,} of {len(df):,} value(s) will change in '{col}'.")
-                _fill_preview_table(self.preview_table, pd.DataFrame({
-                    "Before": df[col].astype(str).head(50), "After": new_series.astype(str).head(50)}))
+                n_changed = int((df[col].cast(pl.Utf8) != new_series.cast(pl.Utf8)).sum())
+                self.lbl_result.setText(f"{n_changed:,} of {df.height:,} value(s) will change in '{col}'.")
+                _fill_preview_table(self.preview_table, pl.DataFrame({
+                    "Before": df[col].cast(pl.Utf8).head(50),
+                    "After": new_series.cast(pl.Utf8).head(50)}))
                 self._pending = {"kind": "column", "col": col, "series": new_series}
 
             elif op == "Find & replace":
@@ -502,10 +507,11 @@ class DataCleanerTab(_BaseToolTab):
                 new_series = ts.find_replace_preview(
                     df[col], self.fr_find.text(), self.fr_replace.text(),
                     use_regex=self.fr_regex.isChecked(), case_insensitive=self.fr_ci.isChecked())
-                n_changed = int((df[col].astype(str) != new_series.astype(str)).sum())
-                self.lbl_result.setText(f"{n_changed:,} of {len(df):,} value(s) will change in '{col}'.")
-                _fill_preview_table(self.preview_table, pd.DataFrame({
-                    "Before": df[col].astype(str).head(50), "After": new_series.astype(str).head(50)}))
+                n_changed = int((df[col].cast(pl.Utf8) != new_series.cast(pl.Utf8)).sum())
+                self.lbl_result.setText(f"{n_changed:,} of {df.height:,} value(s) will change in '{col}'.")
+                _fill_preview_table(self.preview_table, pl.DataFrame({
+                    "Before": df[col].cast(pl.Utf8).head(50),
+                    "After": new_series.cast(pl.Utf8).head(50)}))
                 self._pending = {"kind": "column", "col": col, "series": new_series}
 
             elif op == "Validate column":
@@ -528,30 +534,34 @@ class DataCleanerTab(_BaseToolTab):
                 col = self.so_col.currentText()
                 if not col:
                     return
-                series = df[col].astype(str)
+                series = df[col].cast(pl.Utf8)
                 new_col_name = self.so_new_col.text().strip() or None
                 if m == "Trim to fixed length":
-                    new_series = series.str[: self.so_len.value()]
+                    new_series = series.str.slice(0, self.so_len.value())
                     new_col_name = None
                 elif m == "Extract substring (start, end)":
                     end = self.so_end.value()
-                    new_series = series.str[self.so_start.value(): end if end > 0 else None]
+                    new_series = series.str.slice(self.so_start.value(),
+                                                   None if end <= 0 else end)
                 elif m == "Split column by delimiter":
-                    new_series = series.str.split(self.so_delim.text(), n=1, expand=False).apply(
-                        lambda x: x[0] if isinstance(x, list) and x else None)
+                    new_series = series.str.split(self.so_delim.text()).list.get(0)
                 elif m == "Concatenate two columns":
-                    new_series = series.str.cat(df[self.so_col2.currentText()].astype(str), sep=self.so_sep.text())
+                    new_series = pl.concat_str([
+                        series,
+                        df[self.so_col2.currentText()].cast(pl.Utf8)
+                    ], separator=self.so_sep.text())
                 else:  # regex extract
                     pattern = self.so_regex.text().strip()
                     if not pattern:
                         self._error("Enter a regex pattern.")
                         return
-                    new_series = series.str.extract(f"({pattern.strip('()')})", expand=False)
+                    new_series = series.str.extract(pattern.strip("()"))
 
                 target = new_col_name or col
                 self.lbl_result.setText(f"Preview -> {'new column ' + target if new_col_name else 'column ' + target}")
-                _fill_preview_table(self.preview_table, pd.DataFrame({
-                    "Before": series.head(50), "After": new_series.astype(str).head(50)}))
+                _fill_preview_table(self.preview_table, pl.DataFrame({
+                    "Before": series.head(50),
+                    "After": new_series.cast(pl.Utf8).head(50)}))
                 self._pending = {"kind": "new_col" if new_col_name else "column",
                                   "col": new_col_name or col, "series": new_series}
 
@@ -572,10 +582,12 @@ class DataCleanerTab(_BaseToolTab):
                     "value": self.nc_fill.value(),
                 }
                 new_series = ts.numeric_clean(df[col], op_map[self.nc_op.currentText()], **kwargs)
-                n_changed = int((df[col].round(8) != new_series.round(8)).sum())
-                self.lbl_result.setText(f"{n_changed:,} of {len(df):,} value(s) will change in '{col}'.")
-                _fill_preview_table(self.preview_table, pd.DataFrame({
-                    "Before": df[col].head(50), "After": new_series.round(4).head(50)}))
+                n_changed = int((df[col].cast(pl.Float64, strict=False).round(8)
+                                != new_series.round(8)).sum())
+                self.lbl_result.setText(f"{n_changed:,} of {df.height:,} value(s) will change in '{col}'.")
+                _fill_preview_table(self.preview_table, pl.DataFrame({
+                    "Before": df[col].head(50),
+                    "After": new_series.round(4).head(50)}))
                 self._pending = {"kind": "column", "col": col, "series": new_series}
 
             self.btn_apply.setEnabled(True)
@@ -754,7 +766,7 @@ class OutlierTab(_BaseToolTab):
         total = sum(v["out_count"] for v in results.values())
         self.lbl_result.setText(f"{total:,} outlier value(s) across {len(results)} column(s).")
 
-        summary_df = pd.DataFrame([
+        summary_df = pl.DataFrame([
             {"Column": c, "Outliers": v["out_count"], "% of rows": f"{v['pct']}%",
              "Lower fence": f"{v['lo']:.4g}", "Upper fence": f"{v['hi']:.4g}"}
             for c, v in results.items()

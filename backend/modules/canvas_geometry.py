@@ -302,7 +302,12 @@ def ensure_title_band(geom: Optional[dict], height: float = DEFAULT_TITLE_H,
     shift = band_h + _num(gap_px, GAP_PX)
     out: dict = {}
     for uid, g in clean.items():
-        out[uid] = {"x": g["x"], "y": round(g["y"] + shift, 2),
+        # Preserve any placement already below the title band. Saved free
+        # boards created during the title migration can lack the marker while
+        # carrying valid pixel coordinates; shifting every card on each load
+        # made slicers and charts drift even though their geometry was sound.
+        y = max(g["y"], shift)
+        out[uid] = {"x": g["x"], "y": round(y, 2),
                     "w": g["w"], "h": g["h"]}
     title = {"x": 0.0, "y": 0.0, "w": 1.0, "h": round(band_h, 2)}
     out[TITLE_UID] = title

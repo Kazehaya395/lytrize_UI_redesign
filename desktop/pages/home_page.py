@@ -34,7 +34,11 @@ log = logging.getLogger(__name__)
 #: Where the bundled artwork lives -- the same directory the app icon and the
 #: sidebar logo are resolved from (``desktop/app.py``,
 #: ``desktop/main_window.py``), so the app has one assets location, not three.
-_ASSETS_DIR = Path(__file__).resolve().parent.parent.parent / "backend" / "assets"
+try:
+    from modules.runtime_paths import assets_root as _assets_root
+    _ASSETS_DIR = _assets_root()
+except Exception:  # backend not importable yet: keep the source-tree answer
+    _ASSETS_DIR = Path(__file__).resolve().parent.parent.parent / "backend" / "assets"
 
 
 def _asset_path(name: str) -> Path:

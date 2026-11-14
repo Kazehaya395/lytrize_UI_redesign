@@ -1,0 +1,76 @@
+Cleanup - 
+Windows - 
+1. Delete specific top-level build and cache directories
+Remove-Item -Recurse -Force build, dist, .build, .pytest_cache, .mypy_cache, .ruff_cache, .eggs, htmlcov -EA SilentlyContinue
+# 2. Delete the specific build_hooks pycache folder
+Get-ChildItem -Path ".\" -Filter "__pycache__" -Directory -Recurse | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+# 3. Find and delete all other __pycache__ directories in source/tools
+Get-ChildItem packtoworkeu, tools -Recurse -Directory -Filter __pycache__ -EA SilentlyContinue | Remove-Item -Recurse -Force -EA SilentlyContinue
+# 4. Find and delete leftover compiled files and coverage data
+Get-ChildItem packtoworkeu, tools -Recurse -File -Include *.pyc, *.pyo, .coverage -EA SilentlyContinue | Remove-Item -Force -EA SilentlyContinue
+
+Linux -
+find . -type d \( -name "__pycache__" -o -name ".pytest_cache" -o -name ".mypy_cache" -o -name ".ruff_cache" -o -name "build" -o -name ".build" -o -name "dist" -o -name "*.egg-info" -o -name ".eggs" -o -name "htmlcov" \) -not -path "./venv/*" -prune -exec rm -rf {} + 2>/dev/null
+find . -type f \( -name "*.pyc" -o -name "*.pyo" -o -name ".coverage" \) -not -path "./venv/*" -delete 2>/dev/null
+rm -rf ~/.packtoworkeu
+
+
+Windows — PowerShell 
+
+# 1. Install uv (once)
+winget install --id astral-sh.uv -e
+#   or: powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# 2. One-time setup, in the codebase folder
+cd D:\My_codes\lytrize_UI_redesign
+uv venv venv
+Set-ExecutionPolicy -Scope Process Bypass
+venv\Scripts\Activate.ps1
+uv pip install -r requirements.txt
+# Del - Remove-Item -Recurse -Force ./venv 
+
+# 3. Launch the app
+.\venv\Scripts\python.exe desktop\app.py
+
+
+Linux — bash
+# 1. Install uv (once), then restart your shell
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. One-time setup, in the codebase folder (plus Qt system libs, once per machine)
+sudo apt update && sudo apt install -y \
+  libxkbcommon0 libxkbcommon-x11-0 libgl1 libegl1 libglib2.0-0 libdbus-1-3 \
+  libfontconfig1 libx11-6 libx11-xcb1 libxcb1 libxcb-icccm4 libxcb-image0 \
+  libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 \
+  libxcb-xinerama0 libxcb-xfixes0 libxcb-cursor0 libxcb-xkb1 \
+  libnss3 libasound2 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+  libgbm1 libpango-1.0-0 libcairo2        # Ubuntu 24.04: libasound2t64 instead of libasound2
+
+cd /path/to/lytrize_redesign
+uv venv .venv --python 3.13
+uv pip install --python .venv/bin/python -r requirements.txt
+
+# 3. Launch the app
+.venv/bin/python desktop/app.py
+
+
+Github setup -
+
+git config --global user.name "Kazehaya395"
+git config --global user.email "bantybnath@gmail.com"
+
+# 1. Initialize Git in your local folder (skip if already initialized)
+git init
+
+# 2. Stage and commit your local files
+git add .
+git commit -m "Initial commit"
+
+# 3. Rename your default branch to main
+git branch -M main
+
+# 4. Link your local folder to the GitHub repository
+git remote add origin https://github.com
+
+# 5. Push your code to GitHub and set it as the default upstream branch
+git push -u origin main
