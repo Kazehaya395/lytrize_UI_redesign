@@ -386,18 +386,22 @@ EDITOR_JS = r"""
     });
     if (el) { el.classList.add('ly-selected'); if (el.focus) el.focus(); }
   }
-  /* Refit ECharts after a dashboard card changes size. */
+  /* Refit ECharts after a dashboard card changes size. Single-flight per
+   * card via requestAnimationFrame: called on EVERY pointermove of a resize
+   * drag, an unthrottled chart.resize() here doubled the paint cost on top of
+   * the view's own ResizeObserver and visibly stuttered the drag. */
   function refit(el) {
     var root = el.querySelector('.chart');
     if (!root || !window.echarts) return;
-    try {
-      var chart = window.echarts.getInstanceByDom(root);
-      /* The chart's own ResizeObserver rebuilds its size-sensitive option once
-       * per animation frame. Rebuilding here as well caused two full option
-       * builds per card resize and left the last dimensions dependent on timer
-       * ordering. The editor only asks ECharts to repaint its current canvas. */
-      if (chart) chart.resize();
-    } catch (e) {}
+    if (el.__lyRefitPending) return;
+    el.__lyRefitPending = true;
+    requestAnimationFrame(function () {
+      el.__lyRefitPending = false;
+      try {
+        var chart = window.echarts.getInstanceByDom(root);
+        if (chart) chart.resize();
+      } catch (e) {}
+    });
   }
   /* ---- gestures ------------------------------------------------------- */
   var drag = null;
@@ -769,6 +773,11 @@ EDITOR_JS = r"""
     syncCanvasHeight(host);
   }
   window.__lytrizeSyncKpis = syncKpis;
+  /* Live slicer-card patch path (the counterpart of __lytrizeSyncKpis). This
+   * was missing: every caller guarded on window.__lytrizeSyncSlicers, which
+   * was undefined, so every slicer add/edit/remove silently no-op'd and the
+   * board never showed the card until a full reload. */
+  window.__lytrizeSyncSlicers = syncSlicers;
 
   /* Slicer cards are also content-only board changes. Rebuilding the report
    * for add/edit/remove used to serialize the full data payload and reload all
@@ -912,6 +921,18 @@ EDITOR_JS = r"""
         ctrl.setAttribute('data-ly-uid', uid);
       });
     });
+    /* Remove cards whose slicer was deleted, mirroring syncKpis -- without the
+     * sweep the card lingered forever and its controls kept reporting events
+     * for an index Python no longer had. */
+    Array.prototype.forEach.call(host.querySelectorAll('.slicer-card[data-slicer]'),
+      function (card) {
+        if (!keep[String(card.getAttribute('data-slicer'))]) card.remove();
+      });
+    /* New cards need their controls wired exactly once (idempotent via the
+     * dataset.lyWired flag), and the canvas height must grow when a slicer
+     * sits lower than every chart. */
+    wireSlicers();
+    syncCanvasHeight(host);
   }
 
   /* Slicer controls report their own state back over the bridge. Each control

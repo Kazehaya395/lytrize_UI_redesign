@@ -2479,10 +2479,26 @@ class DashboardPage(QWidget):
         self._persist_geometry(chart_map, kpi_map, cols, regen=False)
         definitions = []
         dataset = self.bridge.polars_dataset(create_if_missing=False)
+        df = self.bridge.df
+        from services.filter_service import distinct_values
         for index, source in enumerate(slicers):
             slicer = dict(source or {})
             spec = dict(slicer.get("spec") or {})
-            if str(slicer.get("widget") or "").lower() == "slider" and dataset is not None:
+            widget = str(slicer.get("widget") or "").lower()
+            if widget in ("list", "dropdown") and not spec.get("options"):
+                # The live control renders its options from spec.options, and
+                # nothing else injected them -- a freshly added list card came
+                # up EMPTY (applySlicerOptions rebuilds an existing checkbox
+                # list, it cannot create one from scratch). Offer the same
+                # distinct values the dialog previewed, capped like the export
+                # path does, so the card is usable the moment it appears.
+                if df is not None:
+                    try:
+                        spec["options"] = [{"value": str(value), "label": str(value)}
+                                           for value in distinct_values(df, slicer.get("column"), limit=500)]
+                    except Exception:
+                        log.debug("could not build options for slicer on %s", slicer.get("column"), exc_info=True)
+            if widget == "slider" and dataset is not None:
                 col = slicer.get("column")
                 try:
                     dtype = dataset.schema.get(col)

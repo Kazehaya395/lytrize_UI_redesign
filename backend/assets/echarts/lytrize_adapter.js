@@ -1032,6 +1032,16 @@
       }
     }
 
+    // Axis titles belong centred on their axis. ECharts defaults
+    // nameLocation to "end", which strands the x-axis title at the extreme
+    // right edge (and clips it on single-axis charts) instead of centring
+    // it under the axis line.
+    [].concat(option.xAxis || []).forEach(function (axis) {
+      if (axis && axis.name && !axis.nameLocation) {
+        axis.nameLocation = "middle";
+        axis.nameGap = Number(axis.nameGap || 26);
+      }
+    });
     if (display.empty_message) {
       option.title = {text: String(display.empty_message), left: "center", top: "middle",
         textStyle: {fontSize: 13, color: display.text_color || "#8b93b5", fontWeight: 400}};

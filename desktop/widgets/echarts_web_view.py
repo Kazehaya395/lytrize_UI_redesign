@@ -105,7 +105,11 @@ body{font-family:Inter,'Noto Sans',sans-serif}
   new ResizeObserver(function(){
     const cw = root.clientWidth, ch = root.clientHeight;
     if (cw === lastW && ch === lastH) return;
-    clearTimeout(resizeTimer);resizeTimer=setTimeout(draw,50);
+    /* Paint at the new size immediately (cheap), but rebuild the option only
+     * once the size settles. A full buildOption+setOption(notMerge) per 50ms
+     * tick is what made canvas drag/resize feel laggy. */
+    if (chart) { try { chart.resize({width: cw, height: ch}); } catch (e) {} }
+    clearTimeout(resizeTimer);resizeTimer=setTimeout(draw, 250);
   }).observe(root);
   document.fonts&&document.fonts.ready.then(draw);
   window.addEventListener('beforeunload',window.lytrizeDispose);
