@@ -13,6 +13,7 @@ from .scatter_plot import ScatterPlotSettings
 from .matrix_heatmap import MatrixHeatmapSettings
 from .matrix_table import MatrixTableSettings
 from .map_plot import MapPlotSettings
+from .outlier import OutlierSettings
 from .advanced import (SankeySettings, SunburstSettings, CalendarHeatmapSettings,
                        GlobeMapSettings, WaterfallSettings, FunnelSettings,
                        RoseSettings)
@@ -37,6 +38,7 @@ _REGISTRY['sunburst'] = SunburstSettings
 _REGISTRY['calendar_heatmap'] = CalendarHeatmapSettings
 _REGISTRY['waterfall'] = WaterfallSettings
 _REGISTRY['funnel'] = FunnelSettings
+_REGISTRY['outlier'] = OutlierSettings
 def register(aid: str, cls: Type[AnalysisSettingsBase]) -> None:
     _REGISTRY[aid] = cls
 def get_builder(aid: str, parent: QWidget | None = None, **ctx):

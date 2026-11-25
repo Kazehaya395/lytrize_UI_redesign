@@ -6,11 +6,14 @@ do not contact a tile service or download geometry.
 
 ## Included boundary coverage
 
-- **Countries:** Natural Earth Vector 1:110m, 177 country features.
-- **Admin-1:** Natural Earth Vector 1:50m, 294 published subdivisions. The
-  resolver supports codes, country-qualified names, and bare names when they
-  are unique in the bundle. US states also accept postal abbreviations. This
-  remains limited to subdivisions Natural Earth publishes in that release.
+- **Countries:** Natural Earth Vector 1:50m, 242 country features.
+- **Admin-1:** Natural Earth Vector 1:10m, 4,589 published subdivisions
+  (Douglas-Peucker simplified to ~0.005 degrees when built with
+  `--admin1-simplify`, i.e. sub-kilometre fidelity). The resolver supports
+  codes (adm1_code, ISO 3166-2 where unique), country-qualified names, and
+  bare names when they are unique in the bundle. US states also accept
+  postal abbreviations. Admin-1 map keys are the stable `adm1_code` because
+  upstream ISO 3166-2 repeats for shared city/province regions.
 - Country/state boundaries are generalized for cartographic display. They are
   not legal, cadastral, or survey boundaries.
 - Natural Earth publishes these files in the public domain. The bundle records

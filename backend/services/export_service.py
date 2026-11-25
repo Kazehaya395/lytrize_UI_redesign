@@ -71,6 +71,12 @@ EXPORT_DEFAULTS = {
     # which is what every report looked like before these existed.
     "ex_kpi_val_color": "", "ex_kpi_label_size": 12,
     "ex_kpi_label_upper": True,
+    # KPI layout: separate horizontal alignment for the value and the label,
+    # the row gap between them (0 = line break only), and the card's inner
+    # padding. Empty/0 here matches the pre-settings rendering as closely as
+    # the old fixed 14px padding is reduced to a tidier 8px default.
+    "ex_kpi_val_align": "left", "ex_kpi_label_align": "left",
+    "ex_kpi_gap": 0, "ex_kpi_pad": 8,
     # Slicer theming (note 3: a slicer has its own design section). Empty
     # means "inherit the KPI chrome", which is what every slicer looked like
     # before these existed -- so a report without slicer colours is unchanged.
@@ -105,9 +111,42 @@ EXPORT_DEFAULTS = {
     "ex_card_image_groups": "charts,kpi,title",
     "ex_title_font": "Inter", "ex_title_style": "Normal",
     "ex_title_size": 28, "ex_title_color": "#6163df",
+    # Title card layout, same model as the KPI: separate text alignment, a
+    # line gap (0 = single line-height for multi-line titles), and the
+    # card's inner padding.
+    "ex_title_align": "left", "ex_title_gap": 0, "ex_title_pad": 8,
     "ex_notes_font": "Inter", "ex_notes_style": "Italic",
     "ex_notes_size": 14, "ex_notes_color": "#f5f7ff",
 }
+
+
+# Light-mode export defaults. Same keys, light values: an UNSTYLED board must
+# follow the app's theme (an always-dark board on a light app was the
+# "permanent dark canvas" report, 2026-11-24). Only the colour/text keys differ;
+# behaviour knobs are shared verbatim. Explicit user choices and quick-theme
+# presets are stored, so they always win over these defaults.
+EXPORT_DEFAULTS_LIGHT = {
+    **EXPORT_DEFAULTS,
+    "ex_bg": "#f3f6fb", "ex_card": "#ffffff", "ex_kpi": "#ffffff",
+    "ex_accent": "#4f46e5", "ex_border": "#b3bfd0", "ex_text": "#0f172a",
+    "ex_not_bg": "#fffbeb", "ex_not_bd": "#f59e0b",
+    "ex_kpi_text_color": "#0f172a",
+    "ex_title_color": "#4f46e5",
+    "ex_notes_color": "#0f172a",
+}
+
+
+def export_defaults_for(mode: Optional[str] = None) -> dict:
+    """Theme-appropriate export defaults (dark stays the historical look)."""
+    try:
+        if mode is None:
+            from desktop.theme import current_mode
+            mode = current_mode()
+    except Exception:
+        mode = "dark"
+    return dict(EXPORT_DEFAULTS_LIGHT if str(mode or "").lower() == "light"
+                else EXPORT_DEFAULTS)
+
 
 _DENSITY = {
     "Compact": {"gap": 14, "padding": 20},
@@ -319,6 +358,294 @@ def build_export_theme(state: dict) -> dict:
     }
 
 
+
+
+def _native_board(*, charts, kpis, slicers, slicer_values,
+                  tile_geometry, kpi_geometry, slicer_geometry,
+                  state, orientation, grid_cols_n, dash_title, geometry_mode):
+    """Build one page's semantic board.
+
+    Exactly the assembly the old single-board path ran inline, extracted so a
+    multi-page export can run it per page and produce one board per page. A
+    one-page export is identical to calling it once and wrapping.
+    """
+    board_w, board_h = 1600.0, 900.0
+    from modules.canvas_geometry import (
+        TITLE_UID, GAP_PX, DEFAULT_H, MIN_W, DEFAULT_W, MIN_H,
+        auto_place, canvas_height, clamp_all, ensure_title_band,
+        from_grid, is_grid_shaped, title_band_height)
+    from modules.board_model import make_board
+
+    gap = GAP_PX
+
+    def _num(value, default):
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        return f if f == f else float(default)  # NaN -> default
+
+    # Free-canvas units: x/w as fractions of the board width, y/h in
+    # logical pixels. Older captures may carry anything; everything is
+    # coerced here and clamped once through clamp_all, so nothing invalid
+    # ever reaches the document.
+    def _placement(raw):
+        raw = dict(raw or {})
+        x = _num(raw.get("x"), 0.0)
+        w = _num(raw.get("w"), DEFAULT_W)
+        y = _num(raw.get("y"), 0.0)
+        h = _num(raw.get("h"), DEFAULT_H)
+        if abs(x) > 1.0 or abs(w) > 1.0:
+            # stored as pixels rather than fractions: pull back into range
+            x, w = x / board_w, w / board_w
+        return {"x": x, "y": max(0.0, y), "w": w, "h": h}
+
+    def _collect(source, prefix=None):
+        out = {}
+        for uid, geom in (source or {}).items():
+            g = _placement(geom)
+            if g is None:
+                continue
+            out[str(prefix) + str(uid) if prefix is not None else str(uid)] = g
+        return out
+
+    tile_geom = _collect(tile_geometry)
+    kpi_geom = _collect(kpi_geometry, "kpi-")
+    slicer_geom = _collect(slicer_geometry, "slicer-")
+    # Sessions saved before the free canvas hold grid cells, not free
+    # units. Convert once here, exactly as the live canvas converts on
+    # load, rather than dropping the board on the floor.
+    if tile_geom and (geometry_mode == "grid"
+                      or is_grid_shaped(tile_geom, grid_cols_n)):
+        tile_geom = from_grid(tile_geom, cols=grid_cols_n)
+
+    theme = dict(state or {})
+    title_size = int((state or {}).get("ex_title_size", 28) or 28)
+    band = title_band_height(title_size, True)
+    merged = {}
+    merged.update(tile_geom)
+    merged.update(kpi_geom)
+    merged.update(slicer_geom)
+    # The title band: an existing saved one is kept exactly where the user
+    # put it; a board without one shifts its cards down by one band, once.
+    merged, title_geom = ensure_title_band(merged, height=band, gap_px=gap)
+    # Auto-place anything with no saved geometry yet: below whatever is
+    # already placed, two across, never on top of the title band.
+    slicer_uids = [f"slicer-{i}" for i in range(len(slicers or []))]
+    kpi_uids = [f"kpi-{i}" for i in range(len(kpis or []))]
+    chart_uids = [str(chart[0]) for chart in charts]
+    merged = auto_place([u for u in slicer_uids if u not in merged],
+                        existing=merged, gap_px=gap, h=max(MIN_H, 100.0),
+                        floor_px=canvas_height(merged, gap))
+    merged = auto_place([u for u in kpi_uids if u not in merged],
+                        existing=merged, gap_px=gap, h=120.0,
+                        floor_px=canvas_height(merged, gap))
+    merged = auto_place([u for u in chart_uids if u not in merged],
+                        existing=merged, gap_px=gap, h=DEFAULT_H,
+                        floor_px=canvas_height(merged, gap))
+    merged = clamp_all(merged)
+
+    def final(uid):
+        g = merged[uid]
+        # fraction x/w -> board pixels for the board model
+        return {"x": g["x"] * board_w, "y": g["y"],
+                "w": g["w"] * board_w, "h": g["h"]}
+
+    objects = []
+    objects.append({"id": TITLE_UID, "kind": "text",
+                    "geometry": final(TITLE_UID),
+                    "properties": {"text": dash_title, "role": "title",
+                                   "font_size": title_size,
+                                   "color": (state or {}).get("ex_title_color", "#6163df"),
+                                   "visible": True}})
+    for index, chart in enumerate(charts):
+        uid, title, model = chart[:3]
+        props = {"chart_model": model, "visible": True, "z_index": index + 1}
+        chart_image_overrides = theme.get("ex_chart_image_overrides") or {}
+        if isinstance(chart_image_overrides, dict):
+            image_override = chart_image_overrides.get(str(uid))
+            if isinstance(image_override, dict):
+                props["card_image_override"] = image_override
+        note = chart[3] if len(chart) > 3 else ""
+        if note:
+            props["notes"] = str(note)
+        objects.append({"id": str(uid), "kind": "chart",
+                        "geometry": final(str(uid)),
+                        "properties": props})
+
+    for index, kpi in enumerate(kpis or []):
+        if not isinstance(kpi, dict):
+            continue
+        label = str(kpi.get("label", kpi.get("name", "KPI")))
+        objects.append({"id": f"kpi-{index}", "kind": "kpi",
+                        "geometry": final(f"kpi-{index}"),
+                        "properties": {**kpi, "index": index, "label": label,
+                                       "visible": True}})
+
+    for index, slicer in enumerate(slicers or []):
+        if not isinstance(slicer, dict):
+            continue
+        props = dict(slicer)
+        props["index"] = index
+        props["values"] = [str(value) for value in
+                            (slicer_values or {}).get(str(index), [])]
+        spec = props.get("spec") if isinstance(props.get("spec"), dict) else {}
+        selected = props.get(
+            "selected", props.get("value", spec.get("values", [])))
+        props["selected"] = ([str(value) for value in selected]
+                             if isinstance(selected, list) else
+                             [str(selected)] if selected not in (None, "") else [])
+        objects.append({"id": f"slicer-{index}", "kind": "slicer",
+                        "geometry": final(f"slicer-{index}"),
+                        "properties": props})
+
+    board_h = max([900.0] + [obj["geometry"]["y"] + obj["geometry"]["h"]
+                             for obj in objects]) + 32.0
+    board = make_board(objects,
+        style={"background": theme.get("ex_bg", "#121a2e"),
+               "card": theme.get("ex_card", "#1b2245"),
+               "border": theme.get("ex_border", "#2c3564"),
+               "text": theme.get("ex_text", "#f5f7ff"),
+               "accent": theme.get("ex_accent", "#6163df"),
+               "card_image": theme.get("ex_card_image", ""),
+               "card_image_opacity": theme.get("ex_card_image_opacity", 35),
+               "card_image_groups": theme.get("ex_card_image_groups", "charts,kpi,title"),
+               # Dashboard style state uses one explicit family of keys
+               # per card type. The HTML board model uses a compact
+               # ``card_images`` mapping. Passing only an unrelated
+               # legacy ``card_images`` key here silently dropped every
+               # newly selected card image on first render and restore.
+               "card_images": {
+                   "charts": {
+                       "image": theme.get("ex_chart_image", ""),
+                       "opacity": theme.get("ex_chart_image_opacity", 35),
+                       "blend": theme.get("ex_chart_blend", "normal"),
+                       "fit": theme.get("ex_chart_image_fit", "cover"),
+                       "position": theme.get("ex_chart_image_position", "center"),
+                   },
+                   "kpi": {
+                       "image": theme.get("ex_kpi_image", ""),
+                       "opacity": theme.get("ex_kpi_image_opacity", 35),
+                       "blend": theme.get("ex_kpi_blend", "normal"),
+                       "fit": theme.get("ex_kpi_image_fit", "cover"),
+                       "position": theme.get("ex_kpi_image_position", "center"),
+                   },
+                   "title": {
+                       "image": theme.get("ex_title_image", ""),
+                       "opacity": theme.get("ex_title_image_opacity", 35),
+                       "blend": theme.get("ex_title_blend", "normal"),
+                       "fit": theme.get("ex_title_image_fit", "cover"),
+                       "position": theme.get("ex_title_image_position", "center"),
+                   },
+               },
+               "card_blend": theme.get("ex_card_blend", "normal")},
+        background={"color": theme.get("ex_bg", "#121a2e"),
+                    "image_data_uri": theme.get("ex_bg_image") or ""},
+        metadata={"width": board_w, "height": board_h,
+                  "title": dash_title, "orientation": orientation})
+    return board
+
+
+def _paged_report(*, pages, state, orientation, dash_title, grid_cols_n,
+                  extra_css, report_payload, report_specs, geometry_mode):
+    """Assemble the multi-page (tabbed) report as one document.
+
+    ``pages`` is the snapshot payload built by the dashboard::
+
+        [{"id": pid, "name": display,
+          "charts": [...export tuples for this page...],
+          "kpis": [...page-local KPI dicts...],
+          "slicers": [...effective slicers: globals + page-locals...],
+          "slicer_values": {"<local index>": [str, ...]},
+          "tile_geometry": {...}, "kpi_geometry": {...},
+          "slicer_geometry": {...}}, ...]
+
+    Page-local slicer uids are rewritten to ``<pid>:<uid>`` here so the
+    selection, the option refresh and the delta painting never conflate the
+    two copies of, say, "slicer-0" that two pages legitimately carry. Global
+    slicers (no ``page`` or ``page == "__global__"``) keep their bare uid --
+    they are one shared control rendered on every page, and the export's tab
+    bootstrap keeps the copies visually in step.
+
+    KPI meta entries get compound ``<pid>:<local index>`` ``index`` values to
+    match the ``data-ly-kpi`` attributes the tiles emit, plus ``page`` so the
+    in-browser engine scopes the recompute to the page's own filters.
+    """
+    safe_file = safe_filename(dash_title)
+
+    report_kpis = []
+    slicers_meta = []
+    seen_slicer_uids = set()
+    report_pages = {}
+    page_doms = []
+    for index, spec in enumerate(pages):
+        pid = str(spec.get("id") or f"page{index + 1}")
+        page_charts = list(spec.get("charts") or [])
+        page_kpis = [dict(k) for k in (spec.get("kpis") or [])
+                     if isinstance(k, dict)]
+        eff_slicers = []
+        for raw in spec.get("slicers") or []:
+            if not isinstance(raw, dict):
+                continue
+            s = dict(raw)
+            page = str(s.get("page") or "").strip()
+            if page in ("", "__global__"):
+                s["page"] = "__global__"
+            else:
+                s["page"] = page
+                s["uid"] = f"{pid}:{s.get('uid') or ('slicer-' + str(len(eff_slicers)))}"
+            eff_slicers.append(s)
+
+        for chart in page_charts:
+            if chart:
+                report_pages[str(chart[0])] = pid
+        for i, kpi in enumerate(page_kpis):
+            meta = dict(kpi)
+            meta["index"] = f"{pid}:{i}"
+            meta["page"] = pid
+            report_kpis.append(meta)
+        for s in eff_slicers:
+            uid = str(s.get("uid") or "")
+            if uid and uid not in seen_slicer_uids:
+                seen_slicer_uids.add(uid)
+                slicers_meta.append(s)
+
+        page_doms.append({"id": pid, "name": str(spec.get("name") or pid),
+                          "_charts": page_charts, "_kpis": page_kpis,
+                          "_slicers": eff_slicers,
+                          "_slicer_values": spec.get("slicer_values") or {},
+                          "_tile": spec.get("tile_geometry") or {},
+                          "_kpi_geom": spec.get("kpi_geometry") or {},
+                          "_slicer_geom": spec.get("slicer_geometry") or {}})
+
+    from modules.echarts_export import board_to_html
+
+    per_page = []
+    for dom in page_doms:
+        board = _native_board(
+            charts=dom["_charts"], kpis=dom["_kpis"],
+            slicers=dom["_slicers"],
+            slicer_values=dom["_slicer_values"],
+            tile_geometry=dom["_tile"], kpi_geometry=dom["_kpi_geom"],
+            slicer_geometry=dom["_slicer_geom"],
+            state=state, orientation=orientation, grid_cols_n=grid_cols_n,
+            dash_title=dash_title, geometry_mode=geometry_mode)
+        per_page.append({"id": dom["id"], "name": dom["name"],
+                         "document": board})
+
+    html = board_to_html(
+        None, editor=False, grid_cols_n=grid_cols_n,
+        extra_css=extra_css,
+        report_payload=report_payload,
+        report_slicers=slicers_meta,
+        report_kpis=report_kpis,
+        report_specs=report_specs or {},
+        report_style=dict(state or {}),
+        report_pages=report_pages,
+        pages=per_page)
+    return html, safe_file
+
+
 def build_export_report(
     charts,
     session_name: str,
@@ -338,6 +665,7 @@ def build_export_report(
     editor: bool = False,
     report_specs: Optional[dict] = None,
     report_payload: Optional[dict] = None,
+    pages: Optional[list] = None,
 ) -> tuple[str, str]:
     """Generate an export-ready HTML report and a safe file name.
 
@@ -427,125 +755,27 @@ def build_export_report(
         for key in ("ex_title_font", "ex_notes_font"):
             if (state or {}).get(key):
                 families.add(str(state[key]))
+        caller_css = extra_css or ""
         try:
             from font_bundle import font_face_css
-            extra_css = font_face_css(embed=True, families=families)
+            extra_css = caller_css + font_face_css(embed=True, families=families)
         except Exception:
             log.debug("selected chart fonts could not be embedded", exc_info=True)
-            extra_css = ""
+            extra_css = caller_css
 
-        board_w, board_h = 1600.0, 900.0
+        if pages:
+            return _paged_report(
+                pages=pages, state=state, orientation=orientation,
+                dash_title=dash_title, grid_cols_n=grid_cols_n,
+                extra_css=extra_css, report_payload=report_payload,
+                report_specs=report_specs, geometry_mode=geometry_mode)
 
-        def geometry(raw, fallback):
-            raw = dict(raw or {})
-            x = float(raw.get("x", fallback[0]) or 0)
-            y = float(raw.get("y", fallback[1]) or 0)
-            w = float(raw.get("w", fallback[2]) or fallback[2])
-            h = float(raw.get("h", fallback[3]) or fallback[3])
-            # Dashboard free-layout stores horizontal positions and widths as
-            # fractions of its canvas; vertical values are logical pixels.
-            if abs(x) <= 1 and abs(w) <= 1:
-                x, w = x * board_w, w * board_w
-            return {"x": x, "y": y, "w": max(1, w), "h": max(1, h)}
-
-        theme = dict(state or {})
-        objects = []
-        tile_geometry = tile_geometry or {}
-        objects.append({"id": "__title__", "kind": "text",
-                        "geometry": {"x": 0, "y": 0,
-                                     "w": board_w, "h": 64},
-                        "properties": {"text": dash_title, "role": "title",
-                                       "font_size": int((state or {}).get("ex_title_size", 28)),
-                                       "color": (state or {}).get("ex_title_color", "#6163df"),
-                                       "visible": True}})
-        for index, chart in enumerate(charts):
-            uid, title, model = chart[:3]
-            props = {"chart_model": model, "visible": True, "z_index": index}
-            chart_image_overrides = theme.get("ex_chart_image_overrides") or {}
-            if isinstance(chart_image_overrides, dict):
-                image_override = chart_image_overrides.get(str(uid))
-                if isinstance(image_override, dict):
-                    props["card_image_override"] = image_override
-            note = chart[3] if len(chart) > 3 else ""
-            if note:
-                props["notes"] = str(note)
-            objects.append({"id": str(uid), "kind": "chart",
-                            "geometry": geometry(tile_geometry.get(uid),
-                                (0, 0, board_w / max(1, grid_cols_n), 420)),
-                            "properties": props})
-
-        for index, kpi in enumerate(kpis or []):
-            if not isinstance(kpi, dict):
-                continue
-            label = str(kpi.get("label", kpi.get("name", "KPI")))
-            objects.append({"id": f"kpi-{index}", "kind": "kpi",
-                            "geometry": geometry((kpi_geometry or {}).get(str(index)),
-                                (0, 0, 240, 120)),
-                            "properties": {**kpi, "index": index, "label": label,
-                                           "visible": True}})
-
-        for index, slicer in enumerate(slicers or []):
-            if not isinstance(slicer, dict):
-                continue
-            props = dict(slicer)
-            props["index"] = index
-            props["values"] = [str(value) for value in
-                                (slicer_values or {}).get(str(index), [])]
-            spec = props.get("spec") if isinstance(props.get("spec"), dict) else {}
-            selected = props.get(
-                "selected", props.get("value", spec.get("values", [])))
-            props["selected"] = ([str(value) for value in selected]
-                                 if isinstance(selected, list) else
-                                 [str(selected)] if selected not in (None, "") else [])
-            objects.append({"id": f"slicer-{index}", "kind": "slicer",
-                            "geometry": geometry((slicer_geometry or {}).get(str(index)),
-                                (0, 0, 240, 100)),
-                            "properties": props})
-
-        board_h = max([900.0] + [obj["geometry"]["y"] + obj["geometry"]["h"]
-                                 for obj in objects]) + 32.0
-        board = make_board(objects,
-            style={"background": theme.get("ex_bg", "#121a2e"),
-                   "card": theme.get("ex_card", "#1b2245"),
-                   "border": theme.get("ex_border", "#2c3564"),
-                   "text": theme.get("ex_text", "#f5f7ff"),
-                   "accent": theme.get("ex_accent", "#6163df"),
-                   "card_image": theme.get("ex_card_image", ""),
-                   "card_image_opacity": theme.get("ex_card_image_opacity", 35),
-                   "card_image_groups": theme.get("ex_card_image_groups", "charts,kpi,title"),
-                   # Dashboard style state uses one explicit family of keys
-                   # per card type. The HTML board model uses a compact
-                   # ``card_images`` mapping. Passing only an unrelated
-                   # legacy ``card_images`` key here silently dropped every
-                   # newly selected card image on first render and restore.
-                   "card_images": {
-                       "charts": {
-                           "image": theme.get("ex_chart_image", ""),
-                           "opacity": theme.get("ex_chart_image_opacity", 35),
-                           "blend": theme.get("ex_chart_blend", "normal"),
-                           "fit": theme.get("ex_chart_image_fit", "cover"),
-                           "position": theme.get("ex_chart_image_position", "center"),
-                       },
-                       "kpi": {
-                           "image": theme.get("ex_kpi_image", ""),
-                           "opacity": theme.get("ex_kpi_image_opacity", 35),
-                           "blend": theme.get("ex_kpi_blend", "normal"),
-                           "fit": theme.get("ex_kpi_image_fit", "cover"),
-                           "position": theme.get("ex_kpi_image_position", "center"),
-                       },
-                       "title": {
-                           "image": theme.get("ex_title_image", ""),
-                           "opacity": theme.get("ex_title_image_opacity", 35),
-                           "blend": theme.get("ex_title_blend", "normal"),
-                           "fit": theme.get("ex_title_image_fit", "cover"),
-                           "position": theme.get("ex_title_image_position", "center"),
-                       },
-                   },
-                   "card_blend": theme.get("ex_card_blend", "normal")},
-            background={"color": theme.get("ex_bg", "#121a2e"),
-                        "image_data_uri": theme.get("ex_bg_image") or ""},
-            metadata={"width": board_w, "height": board_h,
-                      "title": dash_title, "orientation": orientation})
+        board = _native_board(
+            charts=charts, kpis=kpis, slicers=slicers,
+            slicer_values=slicer_values, tile_geometry=tile_geometry,
+            kpi_geometry=kpi_geometry, slicer_geometry=slicer_geometry,
+            state=state, orientation=orientation, grid_cols_n=grid_cols_n,
+            dash_title=dash_title, geometry_mode=geometry_mode)
         specs = dict(report_specs or {})
         if not specs:
             try:
@@ -564,6 +794,14 @@ def build_export_report(
             s.setdefault('index', pos)
             if not s.get('uid'):
                 s['uid'] = 'slicer-' + str(pos)
+        # report_style carries the RAW ex_* state, not the compact theme
+        # dict: board_to_html uses it exclusively to build the initial
+        # __lytrizeApplyDashboardStyle() call that applies appearance settings
+        # (KPI value/label size and colour, card radius, slicer typography,
+        # title font...) when the document loads. The compact theme has none
+        # of those keys, so passing it made every full rebuild silently reset
+        # those settings to the selector defaults -- which is why "Value size"
+        # and "Value color" looked like dead options.
         return board_to_html(board, editor=editor,
                              grid_cols_n=grid_cols_n,
                              extra_css=extra_css,
@@ -571,7 +809,7 @@ def build_export_report(
                              report_slicers=slicer_defs,
                              report_kpis=kpi_defs,
                              report_specs=specs,
-                             report_style=theme), safe_file
+                             report_style=dict(state or {})), safe_file
 
     raise ValueError("Dashboard export requires ECharts ChartModels")
 

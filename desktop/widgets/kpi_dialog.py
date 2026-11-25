@@ -25,9 +25,10 @@ from typing import Optional
 
 import pandas as pd
 from PySide6.QtCore import Qt, QObject, QRunnable, QThreadPool, QTimer, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QFrame, QHBoxLayout, QLabel,
-    QLineEdit, QVBoxLayout, QWidget,
+    QComboBox, QColorDialog, QDialog, QDialogButtonBox, QFrame, QHBoxLayout,
+    QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget,
 )
 
 from services import kpi_service as kpi_svc
@@ -164,6 +165,41 @@ class KpiDialog(QDialog):
             root.addWidget(r)
         root.addWidget(_field_row("Label", self.le_label))
 
+        # Per-card appearance. These ride on the KPI dict's own ``style``
+        # block and override the board-wide ex_kpi_* theme keys for THIS
+        # card only; clearing them returns the card to the theme.
+        self._style_override = {
+            key: str(value)
+            for key, value in (self._existing.get("style") or {}).items()
+            if key in ("value_color", "label_color", "card_bg") and str(value)}
+        self._style_buttons = {}
+        style_box = QFrame()
+        style_box.setObjectName("kpi_style_override")
+        style_lay = QVBoxLayout(style_box)
+        style_lay.setContentsMargins(12, 10, 12, 10)
+        style_lay.setSpacing(4)
+        style_cap = QLabel("Appearance — this card only")
+        style_cap.setProperty("theme_role", "section")
+        style_hint = QLabel("Colours that override the board theme for just "
+                            "this card. Reset to go back to the theme.")
+        style_hint.setStyleSheet("font-size: 11px; opacity: 0.7;")
+        style_lay.addWidget(style_cap)
+        style_lay.addWidget(style_hint)
+        style_row = QHBoxLayout()
+        style_row.setSpacing(10)
+        for key, text in (("value_color", "Value"),
+                          ("label_color", "Label"),
+                          ("card_bg", "Card")):
+            style_row.addWidget(self._make_swatch(key, text))
+        style_row.addStretch()
+        btn_reset_style = QPushButton("Reset")
+        btn_reset_style.setToolTip(
+            "Clear this card's colour overrides and follow the board theme.")
+        btn_reset_style.clicked.connect(self._reset_style_override)
+        style_row.addWidget(btn_reset_style)
+        style_lay.addLayout(style_row)
+        root.addWidget(style_box)
+
         root.addWidget(self._build_preview())
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -181,6 +217,51 @@ class KpiDialog(QDialog):
         self._on_type_changed(self.cb_type.currentText())
 
     # -- Construction helpers ---------------------------------------------
+
+    def _make_swatch(self, key: str, text: str) -> QWidget:
+        wrap = QWidget()
+        v = QVBoxLayout(wrap)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+        btn = QPushButton()
+        btn.setFixedSize(44, 24)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setToolTip(f"Pick a colour for this card's {text.lower()}.")
+        btn.clicked.connect(lambda: self._pick_style_color(key))
+        label = QLabel(text)
+        label.setAlignment(Qt.AlignCenter)
+        label.setStyleSheet("font-size: 10px; opacity: 0.7;")
+        v.addWidget(btn)
+        v.addWidget(label)
+        self._style_buttons[key] = btn
+        self._refresh_swatch(key)
+        return wrap
+
+    def _refresh_swatch(self, key: str) -> None:
+        btn = self._style_buttons[key]
+        value = str(self._style_override.get(key) or "")
+        if value:
+            btn.setStyleSheet(
+                f"background:{value}; border: 1px solid palette(mid);"
+                " border-radius: 4px;")
+            btn.setText("")
+        else:
+            btn.setStyleSheet(
+                "background: transparent; border: 1px dashed palette(mid);"
+                " border-radius: 4px; font-size: 10px;")
+            btn.setText("Auto")
+
+    def _pick_style_color(self, key: str) -> None:
+        current = str(self._style_override.get(key) or "#ffffff")
+        color = QColorDialog.getColor(QColor(current), self)
+        if color.isValid():
+            self._style_override[key] = color.name()
+            self._refresh_swatch(key)
+
+    def _reset_style_override(self) -> None:
+        self._style_override.clear()
+        for key in self._style_buttons:
+            self._refresh_swatch(key)
 
     def _build_preview(self) -> QWidget:
         """The live preview: exactly what the card will show, before it exists.
@@ -402,7 +483,16 @@ class KpiDialog(QDialog):
     def result_kpi(self) -> dict:
         """The finished card, ready to store. Includes its ``_recipe``."""
         if self._last_preview and self._last_preview[0] == self._preview_revision:
-            return dict(self._last_preview[1])
-        return kpi_svc.calc_kpi(self._calculation_data,
-                                self.cb_type.currentText(), **self._current_args())
+            out = dict(self._last_preview[1])
+        else:
+            out = kpi_svc.calc_kpi(self._calculation_data,
+                                   self.cb_type.currentText(),
+                                   **self._current_args())
+        clean = {key: value for key, value in self._style_override.items()
+                 if str(value)}
+        if clean:
+            out["style"] = clean
+        else:
+            out.pop("style", None)
+        return out
 

@@ -120,8 +120,8 @@ def _legacy_choropleth_model(trace: dict, layout: dict, *, uid: str,
                   or any(str(value).upper().startswith("US-") for value in locations))
     aliases = lookup.get("us_state_aliases", {}) if state_mode else lookup.get("country_aliases", {})
     names = lookup.get("admin1_names", {}) if state_mode else lookup.get("country_names", {})
-    asset = "admin1-50m" if state_mode else "countries-110m"
-    map_id = "lytrize_ne_admin1_50m" if state_mode else "lytrize_ne_countries_110m"
+    asset = "admin1-10m" if state_mode else "countries-50m"
+    map_id = "lytrize_ne_admin1_10m" if state_mode else "lytrize_ne_countries_50m"
     rows = []
     finite_values = []
     for location, value in zip(locations, values):

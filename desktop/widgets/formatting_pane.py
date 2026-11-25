@@ -120,6 +120,11 @@ class CollapsibleSection(QFrame):
     def set_expanded(self, on: bool) -> None:
         self.btn_head.setChecked(bool(on))
 
+    @property
+    def title(self) -> str:
+        """The section's plain caption (no fold-arrow decoration)."""
+        return self._title
+
 
 class FieldRow(QWidget):
     """A label + control pair on the shared grid.

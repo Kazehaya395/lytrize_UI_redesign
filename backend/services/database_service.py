@@ -50,6 +50,7 @@ get_session_charts = _db.get_session_charts
 get_user_stats = _db.get_user_stats
 count_datasets_analysed = _db.count_datasets_analysed
 record_dataset_analysed = _db.record_dataset_analysed
+record_report_built = _db.record_report_built
 delete_user_db = _db.delete_user_db
 export_sessions_to_dict = _db.export_sessions_to_dict
 import_sessions_from_dict = _db.import_sessions_from_dict

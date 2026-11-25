@@ -23,6 +23,8 @@ The saved HTML file is written with the overlay OFF, so it contains none of this
 
 from __future__ import annotations
 
+import json as _json
+
 # Region markers: JS between these is grid-only and is STRIPPED from the free
 # bundle. Kept as named constants so the strip and the markers cannot drift.
 GRID_BEGIN = "/*__GRID_BEGIN__*/"
@@ -31,7 +33,7 @@ GRID_END = "/*__GRID_END__*/"
 
 EDITOR_CSS = """
 /* Only cards in a GRID get position:relative -- the grip, the selection ring and
-   the handles are absolutely positioned inside the card, which needs a
+   the overlay chrome is absolutely positioned inside the card, which needs a
    positioned ancestor. A card on the free canvas is ALREADY absolutely
    positioned by its placement; forcing relative on it here would silently drop
    its left/top and collapse the whole board to the top-left corner. Hence the
@@ -44,14 +46,14 @@ EDITOR_CSS = """
 
 /* On the free canvas the whole card is a drag handle. A window manager lets you
    grab a window anywhere, not only on a 26px title strip -- and on a dashboard
-   the plot fills the card, so there is no strip to grab. The grip stays as the
-   visible affordance, but the card body moves too. The title card is included:
-   it is a card like any other, so it moves and resizes like any other. */
+   the plot fills the card, so there is no strip to grab. The card body itself
+   moves. The title card is included: it is a card like any other, so it moves
+   and resizes like any other. */
 .ly-editing.ly-free .chart-card,
 .ly-editing.ly-free .kpi-card,
 .ly-editing.ly-free .slicer-card,
 .ly-editing.ly-free .title-card { cursor: grab; }
-.ly-editing.ly-free .ly-grip { cursor: grabbing; }
+.ly-editing.ly-grid-editing .ly-grip { cursor: grab; }
 
 /* A dashed cell outline shows the snap target BEFORE the drop, so a drag is a
    decision rather than a guess. */
@@ -64,65 +66,67 @@ EDITOR_CSS = """
 .ly-sel { position: absolute; inset: -2px; pointer-events: none; display: none;
   border: 2px solid __ACCENT__; border-radius: 10px; z-index: 30; }
 .ly-selected > .ly-sel { display: block; }
+/* While a card is being dragged or resized the border goes hot: a bright
+   outline plus an expanding accent glow, so an in-progress gesture reads as
+   alive. The class lives only for the duration of the gesture. */
+.ly-working { z-index: 40; will-change: left, top, width, height; }
+@keyframes ly-glow-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px __ACCENT__,
+             0 0 14px 2px __GLOW_SOFT__, inset 0 0 10px __GLOW_INNER__; }
+  50%      { box-shadow: 0 0 0 2px __ACCENT__,
+             0 0 22px 6px __GLOW_STRONG__, inset 0 0 14px __GLOW_INNER2__; }
+}
+.ly-working > .ly-sel {
+  display: block;
+  border-color: __ACCENT__;
+  box-shadow: 0 0 0 2px __ACCENT__, 0 0 16px 3px __GLOW_SOFT__;
+  animation: ly-glow-pulse 1.1s ease-in-out infinite;
+}
+/* Overlap warning: while a drag or resize would push the card onto another
+   card, the whole affordance (border + glow + ghost) goes red instead of the
+   theme accent -- the same red a "destructive" action uses. The class lives
+   only for the duration of the gesture; the resting border is untouched. */
+.ly-ghost.ly-overlap { border-color: __OVERLAP__; background: #ef444422; }
+@keyframes ly-glow-overlap {
+  0%, 100% { box-shadow: 0 0 0 2px __OVERLAP__,
+             0 0 14px 2px __OVERLAP_SOFT__, inset 0 0 10px __OVERLAP_INNER__; }
+  50%      { box-shadow: 0 0 0 2px __OVERLAP__,
+             0 0 22px 6px __OVERLAP_STRONG__, inset 0 0 14px __OVERLAP_INNER2__; }
+}
+.ly-working.ly-overlap > .ly-sel {
+  display: block;
+  border-color: __OVERLAP__;
+  box-shadow: 0 0 0 2px __OVERLAP__, 0 0 16px 3px __OVERLAP_SOFT__;
+  animation: ly-glow-overlap 1.1s ease-in-out infinite;
+}
 
+/* Dragging and resizing carry NO persistent chrome. The whole card is a
+   move handle on the free canvas, and a thin invisible zone along every edge
+   and corner resizes it (see the overlay script). The only affordance shown
+   is the short accent glow (.ly-sel / .ly-working) while a card is selected
+   or actively being moved or resized -- chrome that appears only during the
+   operation, then goes away.
+
+   The explicit grip square stays for grid mode only: there the plot fills the
+   card and stealing pointer gestures from it was the original reason a grip
+   existed. Free mode hides it -- the card body is the drag handle there. */
 .ly-grip { position: absolute; top: 4px; left: 4px; width: 26px; height: 22px;
   display: none; align-items: center; justify-content: center;
   cursor: grab; background: __ACCENT__; color: #fff; font-size: 13px;
   border-radius: 5px; z-index: 35; user-select: none; line-height: 1; }
-.ly-handle { position: absolute; display: none; z-index: 35;
-  background: __ACCENT__; border-radius: 3px; }
-.ly-editing .ly-grip, .ly-editing .ly-handle { display: flex; }
-.ly-handle { align-items: center; justify-content: center; color: #fff;
-  font-size: 10px; }
-/* The card clips its overflow, which is what keeps a wide plot from bleeding
-   over the rounded corners -- but it also chopped the right and bottom handles
-   in half, leaving a ~5px sliver that is almost impossible to grab. They
-   therefore sit INSIDE the card edge, not straddling it: the grab target stays
-   full size, the card still clips, and a handle can never sit on a neighbour's
-   card. */
-/* Sized for the pointer, not for the eye. 10px is below the ~16px comfortable
-   grab target, which is why the handles read as decoration rather than as
-   something you can pick up. The invisible extension does the real work: the
-   visible chip stays small enough not to cover the plot, while a ::after
-   pseudo-element widens the actual hit area well past the edge. */
-.ly-h-left  { top: 50%; left: 0; width: 12px; height: 44px;
-  margin-top: -22px; cursor: ew-resize; }
-.ly-h-right { top: 50%; right: 0; width: 12px; height: 44px;
-  margin-top: -22px; cursor: ew-resize; }
-.ly-h-top   { left: 50%; top: 0; width: 44px; height: 12px;
-  margin-left: -22px; cursor: ns-resize; }
-.ly-h-bottom { left: 50%; bottom: 0; height: 12px; width: 44px;
-  margin-left: -22px; cursor: ns-resize; }
-.ly-h-corner { left: 0; top: 0; width: 20px; height: 20px;
-  cursor: nwse-resize; }
-.ly-h-top-left { left: 0; top: 0; width: 18px; height: 18px; cursor: nwse-resize; }
-.ly-h-top-right { right: 0; top: 0; width: 18px; height: 18px; cursor: nesw-resize; }
-.ly-h-bottom-left { left: 0; bottom: 0; width: 18px; height: 18px; cursor: nesw-resize; }
-.ly-h-bottom-right { right: 0; bottom: 0; width: 18px; height: 18px; cursor: nwse-resize; }
-.ly-h-right::after, .ly-h-bottom::after, .ly-h-left::after, .ly-h-top::after {
-  content: ''; position: absolute; inset: -8px; }
-.ly-h-left::after { left: -8px; }
-.ly-h-top::after { top: -8px; }
-.ly-h-top-left::after, .ly-h-top-right::after,
-.ly-h-bottom-left::after, .ly-h-bottom-right::after { inset: -8px; }
+.ly-editing.ly-grid-editing .ly-grip { display: flex; }
+/* Hovering a resizable edge brightens the card's own border slightly, so the
+   invisible resize zones can be discovered without any permanent chrome. */
+.ly-editing.ly-free .chart-card:hover,
+.ly-editing.ly-free .kpi-card:hover,
+.ly-editing.ly-free .slicer-card:hover,
+.ly-editing.ly-free .title-card:hover { border-color: __ACCENT__; }
 
-/* Chart, KPI and slicer content needs clearance from the edit chrome. The grip
-   and toolbar are absolutely positioned in the card corners. The dashboard
-   title card has no toolbar and its title should stay centred in its own box. */
-.ly-editing .chart-card h2,
-.ly-editing .kpi-card .kpi-value,
-.ly-editing .slicer-card .slicer-title { margin-top: 26px; }
-/* The slicer's control list needs the same bottom clearance the KPI label
-   does: the resize handles are drawn over the card's lower edge, and the last
-   value in a scrollable list is exactly what sits there. */
-.ly-editing .slicer-card .slicer-body { padding-bottom: 0.75rem; }
-/* ...and the BOTTOM edge needs clearance too, for the bottom/corner resize
-   handles. Without it a KPI's label -- the one line that says what the number
-   means -- ends up underneath the handle drawn over it. Scoped to editing, so
-   Preview and the saved file keep their natural spacing. */
-.ly-editing .kpi-card .kpi-label { margin-bottom: 14px; }
-.ly-editing .chart-card .notes { padding-bottom: 0.9rem; }
-.ly-editing .chart-card > .notes { clear: both; }
+/* No clearance offsets are needed for persistent handles any more: the only
+   overlay chrome is the hover toolbar at the top-right corner (which does not
+   overlap centred content) and the gesture-time .ly-working glow. Preview
+   and the saved file never carried these offsets, so editing and the export
+   now agree on KPI and slicer spacing. */
 
 /* Hover toolbar, mirroring the Qt card's on-hover action bar. */
 .ly-bar { position: absolute; top: 4px; right: 4px; display: none;
@@ -164,11 +168,12 @@ EDITOR_JS = r"""
   var MODE = '__MODE__';
   var FREE = MODE !== 'grid';
   /* Mirrors canvas_geometry.MIN_W / MIN_H. A card below this stops being
-   * grabbable: the grip and the four handles no longer fit inside it. */
+   * grabbable: the grip and the edge zones no longer fit inside it. */
   var MIN_W = 0.12, MIN_H = 120;
   /* Mirrors canvas_geometry.TITLE_MIN_H: the heading band is sized by its
    * own text, so the title card alone may be resized below the chart floor. */
   var TITLE_MIN_H = 24;
+  var SLICER_MIN_H = 56;
   var bridge = null;
 
   function uidOf(el) {
@@ -179,7 +184,7 @@ EDITOR_JS = r"""
   }
   function cards() {
     /* The title card is in this list for the same reason a KPI card is: it is
-       a card, so it gets the same grip, the same three handles, the same
+       a card, so it gets the same grip, the same edge-resize zones, the same
        click-to-select and the same arrow-key nudge. Excluding it is what made
        the heading the one element on the board that could not be arranged.
        A slicer card is here for the same reason -- it is draggable and
@@ -248,7 +253,7 @@ EDITOR_JS = r"""
     g.w = w;
     g.x = Math.max(0, Math.min(g.x, 1 - w));
     g.y = Math.max(0, g.y);
-    var minH = (el && uidOf(el) === '__title__') ? TITLE_MIN_H : MIN_H;
+    var minH = (el && uidOf(el) === '__title__') ? TITLE_MIN_H : (el && el.classList && el.classList.contains('slicer-card')) ? SLICER_MIN_H : MIN_H;
     g.h = Math.max(minH, g.h);
     return g;
   }
@@ -332,8 +337,34 @@ EDITOR_JS = r"""
     }
     return gh;
   }
-  function paintGhost(el, g) {
+  /* Does the given card currently overlap ANY other tile by a meaningful
+   * area? Used only during a gesture to paint the affordance red -- dropping
+   * with an overlap is allowed (the user asked for a warning, not a block,
+   * and forbidding the drop could strand a card under another one). */
+  function overlapHit(el) {
+    var r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    var tiles = document.querySelectorAll('.tile');
+    for (var i = 0; i < tiles.length; i++) {
+      var t = tiles[i];
+      if (t === el) continue;
+      var b = t.getBoundingClientRect();
+      if (b.width <= 0 || b.height <= 0) continue;
+      var ix = Math.min(r.right, b.right) - Math.max(r.left, b.left);
+      var iy = Math.min(r.bottom, b.bottom) - Math.max(r.top, b.top);
+      if (ix <= 0 || iy <= 0) continue;
+      var inter = ix * iy;
+      var smaller = Math.min(r.width * r.height, b.width * b.height);
+      /* Require ~5% of the smaller card to be covered: a 1px seam while
+       * nudging cards past each other should not trip the alarm. */
+      if (smaller > 0 && inter / smaller > 0.05) return true;
+    }
+    return false;
+  }
+
+  function paintGhost(el, g, hit) {
     var gh = ghost(el);
+    if (hit) gh.classList.add('ly-overlap'); else gh.classList.remove('ly-overlap');
     /*__GRID_BEGIN__*/
     if (!FREE) {
       var grid = el.parentElement;
@@ -377,6 +408,7 @@ EDITOR_JS = r"""
   function clearGhost() {
     Array.prototype.forEach.call(document.querySelectorAll('.ly-ghost.on'), function (n) {
       n.classList.remove('on');
+      n.classList.remove('ly-overlap');
     });
   }
 
@@ -425,6 +457,8 @@ EDITOR_JS = r"""
               grabX: ev.clientX, grabY: ev.clientY,
               originX: r.left, originY: r.top, pending: null};
       document.body.classList.add('ly-dragging');
+      card.classList.add('ly-working');
+      card.classList.remove('ly-overlap');
     };
   }
 
@@ -460,7 +494,7 @@ EDITOR_JS = r"""
       }
       clampGeom(g, el);
       if (drag.mode === 'resize') {
-        var minH = el && uidOf(el) === '__title__' ? TITLE_MIN_H : MIN_H;
+        var minH = (el && uidOf(el) === '__title__') ? TITLE_MIN_H : (el && el.classList && el.classList.contains('slicer-card')) ? SLICER_MIN_H : MIN_H;
         if (edge.indexOf('left') >= 0) {
           var fixedRight = drag.start.x + drag.start.w;
           g.w = Math.max(MIN_W, Math.min(fixedRight, g.w));
@@ -509,12 +543,23 @@ EDITOR_JS = r"""
      * the window-manager behaviour people already have in their hands. */
     writeGeom(el, g);
     refit(el);
-    paintGhost(el, g);
+    var hit = false;
+    if (FREE) {
+      hit = overlapHit(el);
+      if (hit) el.classList.add('ly-overlap'); else el.classList.remove('ly-overlap');
+    } else {
+      el.classList.remove('ly-overlap');
+    }
+    paintGhost(el, g, hit);
   }
 
   function end() {
     if (!drag) return;
     document.body.classList.remove('ly-dragging');
+    if (drag.el) {
+      drag.el.classList.remove('ly-working');
+      drag.el.classList.remove('ly-overlap');
+    }
     var d = drag;
     drag = null;
     clearGhost();
@@ -568,6 +613,12 @@ EDITOR_JS = r"""
     writeGeom(el, g);
     refit(el);
     syncCanvasHeight(canvasOf(el));
+    /* Brief glow so the keyboard nudge registers visually. */
+    el.classList.add('ly-working');
+    clearTimeout(el.__lyFlashTimer);
+    el.__lyFlashTimer = setTimeout(function () {
+      el.classList.remove('ly-working');
+    }, 700);
     if (bridge) bridge.geometryChanged(uidOf(el), JSON.stringify(g));
   }
   /* ---- chrome --------------------------------------------------------- */
@@ -577,6 +628,9 @@ EDITOR_JS = r"""
     b.textContent = label;
     b.title = title;
     b.type = 'button';
+    b.addEventListener('pointerdown', function (ev) {
+      ev.stopPropagation();
+    });
     b.addEventListener('click', function (ev) {
       ev.stopPropagation();
       fn();
@@ -598,18 +652,6 @@ EDITOR_JS = r"""
     grip.title = 'Drag to move';
     grip.addEventListener('pointerdown', begin('move'));
     el.appendChild(grip);
-
-    var handles = [['left', '\u2190'], ['right', '\u2192'], ['top', '\u2191'], ['bottom', '\u2193'],
-                   ['top-left', '\u2196'], ['top-right', '\u2197'],
-                   ['bottom-left', '\u2199'], ['bottom-right', '\u2198']];
-    handles.forEach(function (spec) {
-      var h = document.createElement('div');
-      h.className = 'ly-handle ly-h-' + spec[0];
-      h.textContent = spec[1];
-      h.title = 'Drag to resize';
-      h.addEventListener('pointerdown', begin('resize', spec[0]));
-      el.appendChild(h);
-    });
 
     /* The action bar lives inside the page, so the per-card operations that
      * used to be Qt buttons are now bridge calls back into the page's own
@@ -645,7 +687,7 @@ EDITOR_JS = r"""
          edit its notes, restyle it, reorder it, delete it -- and the heading has
          none of those. Showing the chart toolbar on it would offer to "remove
          the chart" on the dashboard's title, which the page would then have to
-         refuse; the grip and the handles are the whole of its affordance. */
+         refuse; the card body and its edges are the whole of its affordance. */
     } else {
       /* The pencil OPENS this chart in the Analysis page (bound settings
          form) -- it never edited notes inline, so the old "Edit analysis
@@ -672,12 +714,12 @@ EDITOR_JS = r"""
      * Guarded against interactive descendants, and deliberately NOT the plot:
      * the plot is skipped too, because dragging a chart is a real gesture in
      * its own right and taking it away would be a regression. The grip, the
-     * handles and the action bar keep their own handlers. */
+     * grip and the action bar keep their own handlers. */
     if (FREE) {
       el.addEventListener('pointerdown', function (ev) {
         if (ev.button !== 0) return;
         var t = ev.target;
-        if (t.closest && t.closest('.ly-grip, .ly-handle, .ly-bar, .ly-sel, ' +
+        if (t.closest && t.closest('.ly-grip, .ly-bar, .ly-sel, ' +
                                     'button, input, select, textarea, label, ' +
                                     '[contenteditable], ' +
                                     '.notes, .slicer-body')) return;
@@ -741,6 +783,17 @@ EDITOR_JS = r"""
       var valueNode = card.querySelector('.kpi-value');
       var deltaNode = card.querySelector('.kpi-delta');
       var sparkNode = card.querySelector('.kpi-sparkline');
+      /* Per-card appearance overrides ride on kpi.style; a card carrying one
+       * opts itself out of the theme patcher via data-ly-nostyle. Missing
+       * keys fall back to theme values, exactly as a fresh render emits. */
+      var kpiStyle = kpi.style || {};
+      var kpiValueColor = kpiStyle.value_color || '';
+      var kpiLabelColor = kpiStyle.label_color || '';
+      var kpiCardBg = kpiStyle.card_bg || '';
+      if (kpiCardBg) { card.style.background = kpiCardBg; card.setAttribute('data-ly-nostyle', '1'); }
+      else { card.style.background = ''; card.removeAttribute('data-ly-nostyle'); }
+      if (labelNode) { if (kpiLabelColor) { labelNode.style.color = kpiLabelColor; labelNode.setAttribute('data-ly-nostyle', '1'); } else { labelNode.style.color = ''; labelNode.removeAttribute('data-ly-nostyle'); } }
+      if (valueNode) { if (kpiValueColor) { valueNode.style.color = kpiValueColor; valueNode.setAttribute('data-ly-nostyle', '1'); } else { valueNode.style.color = ''; valueNode.removeAttribute('data-ly-nostyle'); } }
       if (labelNode) labelNode.textContent = String(kpi.label || kpi.name || 'KPI');
       if (valueNode) valueNode.textContent = String(kpi.prefix || '') +
         String(kpi.value == null ? '--' : kpi.value) + String(kpi.suffix || '');
@@ -880,7 +933,7 @@ EDITOR_JS = r"""
       slicer = slicer || {};
       var key = String(index), uid = String(slicer.uid || ('slicer-' + key));
       var geom = geometry[key] || {}, card = host.querySelector(
-        '.slicer-card[data-slicer=' + key + ']');
+        '.slicer-card[data-slicer="' + key + '"]');
       keep[key] = true;
       if (!card) {
         card = document.createElement('section');
@@ -916,6 +969,22 @@ EDITOR_JS = r"""
       card.style.width = (Number(geom.w || 0.24) * 100) + '%';
       card.style.height = Number(geom.h || 180) + 'px';
       var titleNode = card.querySelector('.slicer-title');
+      var bodyNode = card.querySelector('.slicer-body');
+      /* Per-card appearance overrides ride on slicer.style (label_color,
+       * value_color, card_bg). Card opts out of the theme patcher via
+       * data-ly-nostyle, exactly like KPI cards. */
+      var slicerStyle = slicer.style || {};
+      var sLabelColor = slicerStyle.label_color || '';
+      var sValueColor = slicerStyle.value_color || '';
+      var sCardBg = slicerStyle.card_bg || '';
+      if (sCardBg) { card.style.background = sCardBg; card.setAttribute('data-ly-nostyle', '1'); }
+      else { card.style.background = ''; card.removeAttribute('data-ly-nostyle'); }
+      if (titleNode) { if (sLabelColor) { titleNode.style.color = sLabelColor; titleNode.setAttribute('data-ly-nostyle', '1'); } else { titleNode.style.color = ''; titleNode.removeAttribute('data-ly-nostyle'); } }
+      if (bodyNode) bodyNode.style.color = sValueColor || '';
+      Array.prototype.forEach.call(card.querySelectorAll('.slicer-select, .slicer-search'), function (ctrl) {
+        if (sValueColor) { ctrl.style.color = sValueColor; ctrl.setAttribute('data-ly-nostyle', '1'); }
+        else { ctrl.style.color = ''; ctrl.removeAttribute('data-ly-nostyle'); }
+      });
       if (titleNode) titleNode.textContent = String(slicer.label || slicer.column || 'Filter');
       Array.prototype.forEach.call(card.querySelectorAll('[data-ly-slicer="' + key + '"]'), function (ctrl) {
         ctrl.setAttribute('data-ly-uid', uid);
@@ -1055,6 +1124,9 @@ EDITOR_JS = r"""
   }
   function wireNotes() {
     document.querySelectorAll('.notes').forEach(function (note) {
+      /* Injected after page load? Handlers must not be double-bound. */
+      if (note.__lyWired) return;
+      note.__lyWired = true;
       var card = note.closest('.chart-card, .kpi-card, .title-card');
       var uid = card ? uidOf(card) : '';
       if (!uid) return;
@@ -1107,6 +1179,17 @@ EDITOR_JS = r"""
   document.addEventListener('keydown', keyNav);
   window.addEventListener('resize', clearGhost);
 
+  /* Exposed for the in-app injector: a chart generated while the board is
+   * on screen is inserted as a finished card, and only then needs the edit
+   * chrome (selection ring, grip, bar) and the note wiring. Keeps
+   * decorate() single-sourced -- the same code paths the initial document
+   * uses. */
+  window.__lytrizeDecorateCard = function (el) { if (el) decorate(el); };
+  window.__lytrizeWireNotes = wireNotes;
+  window.__lytrizeSyncHeight = function () {
+    syncCanvasHeight(document.querySelector('.ly-canvas, .grid'));
+  };
+
   /* Called from Python. Switching modes is ONE class toggle: the report DOM
    * underneath is untouched, so Edit and Preview are the same document. */
   window.lySetEditing = function (on) {
@@ -1149,6 +1232,42 @@ EDITOR_JS = r"""
 """
 
 
+def _accent_variants(accent: str) -> dict[str, str]:
+    """Pre-compute translucent accent shades for the glow effect.
+
+    Uses 8-digit hex when the accent is hex (rgb expanded if needed); falls back
+    to color-mix for anything else Qt WebEngine (Chromium) handles natively.
+    """
+    def with_alpha(alpha: str) -> str:
+        a = accent.lstrip("#")
+        if len(a) == 3:
+            a = "".join(ch * 2 for ch in a)
+        if len(a) == 6:
+            try:
+                int(a, 16)
+                return "#" + a + alpha
+            except ValueError:
+                pass
+        return f"color-mix(in srgb, {accent} {int(alpha, 16) * 100 // 255}%, transparent)"
+
+    # The overlap red is deliberately NOT theme-derived: it has to read as
+    # "danger" on every accent and on light and dark cards alike.
+    overlap = {
+        "__OVERLAP__": "#ef4444",
+        "__OVERLAP_SOFT__": "#ef444466",
+        "__OVERLAP_STRONG__": "#ef4444a8",
+        "__OVERLAP_INNER__": "#ef444433",
+        "__OVERLAP_INNER2__": "#ef444444",
+    }
+    return {
+        "__GLOW_SOFT__": with_alpha("66"),
+        "__GLOW_STRONG__": with_alpha("8c"),
+        "__GLOW_INNER__": with_alpha("33"),
+        "__GLOW_INNER2__": with_alpha("44"),
+        **overlap,
+    }
+
+
 def editor_css(accent: str = "#6163df") -> str:
     """The overlay CSS, with the accent substituted in.
 
@@ -1156,7 +1275,10 @@ def editor_css(accent: str = "#6163df") -> str:
     and selection outline belong to the report the user actually chose.
     """
     safe = str(accent or "#6163df").strip() or "#6163df"
-    return EDITOR_CSS.replace("__ACCENT__", safe)
+    css = EDITOR_CSS.replace("__ACCENT__", safe)
+    for token, value in _accent_variants(safe).items():
+        css = css.replace(token, value)
+    return css
 
 
 def editor_js(cols: int = 2, gap: int = 24, mode: str = "free") -> str:
@@ -1192,3 +1314,60 @@ def editor_js(cols: int = 2, gap: int = 24, mode: str = "free") -> str:
             .replace("__COLS__", str(int(cols)))
             .replace("__GAP__", str(int(gap)))
             .replace("__MODE__", safe_mode))
+
+
+def injection_js(fragments) -> str:
+    """JavaScript that inserts chart fragments into a live canvas document.
+
+    *fragments* are the dicts produced by
+    ``echarts_export.chart_fragments_for_injection`` -- each carries the
+    ``<section>`` markup, the chart-models key, the model itself and the uid.
+    The script appends each card, registers its model with the chart runtime
+    (``__lytrizeRegisterModel``) and the live-filter worker
+    (``__lytrizeAddModel``), draws it, decorates it with the editor chrome
+    and briefly flashes the glow border so the arrival reads as an event.
+
+    Any failure removes the inserted cards and asks Python -- via the same
+    bridge the per-card toolbar uses -- to rebuild the board, so a botched
+    injection can never leave a torn canvas behind.
+    """
+    payload = _json.dumps(fragments, ensure_ascii=False)
+    return (
+        "(function(fragments){\n"
+        "  var added=[];\n"
+        "  try {\n"
+        "    var board=document.getElementById('board');\n"
+        "    if(!board) throw new Error('board missing');\n"
+        "    fragments.forEach(function(f){\n"
+        "      var tmp=document.createElement('div');\n"
+        "      tmp.innerHTML=f.html;\n"
+        "      var card=tmp.firstElementChild;\n"
+        "      if(!card) throw new Error('fragment has no card');\n"
+        "      board.appendChild(card);\n"
+        "      added.push(card);\n"
+        "      if(f.model){\n"
+        "        if(window.__lytrizeRegisterModel) window.__lytrizeRegisterModel(f.key, f.model);\n"
+        "        if(window.__lytrizeAddModel) window.__lytrizeAddModel(f.key, f.model);\n"
+        "        if(window.__lytrizeDrawChart) window.__lytrizeDrawChart(f.key);\n"
+        "      }\n"
+        "    });\n"
+        "    added.forEach(function(card){\n"
+        "      if(window.__lytrizeDecorateCard) window.__lytrizeDecorateCard(card);\n"
+        "    });\n"
+        "    if(window.__lytrizeWireNotes) window.__lytrizeWireNotes();\n"
+        "    if(window.__lytrizeSyncHeight) window.__lytrizeSyncHeight();\n"
+        "    added.forEach(function(card){\n"
+        "      card.classList.add('ly-working');\n"
+        "      setTimeout(function(){ card.classList.remove('ly-working'); }, 1500);\n"
+        "    });\n"
+        "    /* Re-apply the active slicer selection over the new model. */\n"
+        "    if(window.__lytrizeDrawAll) window.__lytrizeDrawAll();\n"
+        "    return fragments.length;\n"
+        "  } catch (error) {\n"
+        "    added.forEach(function(card){ if(card.parentNode) card.parentNode.removeChild(card); });\n"
+        "    try { if(window.bridge && window.bridge.actionRequested)\n"
+        "      window.bridge.actionRequested('__injection__', 'failed'); } catch (e) {}\n"
+        "    return -1;\n"
+        "  }\n"
+        "})(" + payload + ");"
+    )

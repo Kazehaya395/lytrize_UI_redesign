@@ -147,7 +147,8 @@ WIDGET_SPEC = {
         ("render_mode", "render_mode", "scalar"),
     ],
     "outlier": [
-        ("column", "column", "scalar"),
+        ("columns", "columns", "list"),
+        ("multiplier", "multiplier", "number"),
     ],
     "matrix_heatmap": [
         ("index_col", "index_col", "scalar"),
@@ -403,6 +404,24 @@ def build_analysis_config(aid: str, df: pd.DataFrame,
                       value_col=_single_choice_value(g("value_col", NONE), NONE),
                       map_style=g("map_style", "Local boundaries (Light)"))
 
+    elif aid == "outlier":
+        cols = g("columns", NONE)
+        if cols is None:
+            cols = g("column")  # legacy scalar key
+        if isinstance(cols, str):
+            cols = [] if cols in (NONE, "") else [cols]
+        if not cols:
+            # Default to the metric pool (user's classification wins), so the
+            # scan covers exactly what the form showed as metrics.
+            cols = list(num)
+        try:
+            multiplier = float(g("multiplier", 1.5) or 1.5)
+        except (TypeError, ValueError):
+            multiplier = 1.5
+        kwargs.update(columns=[c for c in cols if c in all_cols],
+                      multiplier=max(0.5, min(5.0, multiplier)),
+                      render_mode=g("render_mode", "svg"))
+
     elif aid == "scatter_plot":
         def _sp_resolve(key):
             v = g(key, NONE)
@@ -616,14 +635,14 @@ def run_analysis(aid: str, df: pd.DataFrame, roles: Optional[dict] = None,
             models = [builders.build_descriptive_table_chart(
                 dataset, roles=roles, layout=layout, typography=typography)]
         elif aid == "data_quality":
-            models = builders.build_data_quality_charts(dataset)
+            models = builders.build_data_quality_charts(dataset, roles=roles)
         elif aid == "outlier":
             columns = config.get("columns") or config.get("column") or []
             if isinstance(columns, str):
                 columns = [columns]
             models = builders.build_outlier_charts(
                 dataset, columns, multiplier=float(config.get("multiplier", 1.5)),
-                typography=typography)
+                typography=typography, roles=roles)
         elif aid == "map_plot":
             model = builders.build_map_plot_chart(
                 dataset, config, layout=layout, typography=typography)

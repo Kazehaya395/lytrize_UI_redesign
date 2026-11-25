@@ -26,8 +26,14 @@ LEGEND_ORIENTATIONS = ["Auto", "Vertical", "Horizontal"]
 LEGEND_ORDERS = ["Normal", "Reversed"]
 COLORBAR_POSITIONS = ["Right", "Left", "Top", "Bottom"]
 
+# The curated universe the picker may offer beyond the bundled files: the
+# bundled families are always offered (the app itself ships them); on top of
+# that, fontconfig-visible families from this list may appear on machines
+# that happen to have them. Bundled families that ship under 8.3 file names
+# are spelled with their real family name here.
 _FONT_CHOICES = [
     ("Inter", "sans-serif"), ("Source Sans 3", "sans-serif"),
+    ("Open Sans", "sans-serif"), ("Roboto", "sans-serif"),
     ("Noto Sans", "sans-serif"), ("DejaVu Sans", "sans-serif"),
     ("Lato", "sans-serif"), ("Ubuntu", "sans-serif"),
     ("Arial", "sans-serif"), ("Calibri", "sans-serif"),
@@ -35,7 +41,7 @@ _FONT_CHOICES = [
     ("Barlow Condensed", "sans-serif"),
     ("Noto Serif", "serif"), ("DejaVu Serif", "serif"),
     ("EB Garamond", "serif"), ("Georgia", "serif"),
-    ("Times New Roman", "serif"),
+    ("Times New Roman", "serif"), ("Caladea", "serif"), ("Carlito", "sans-serif"),
     ("Fira Code", "monospace"), ("DejaVu Sans Mono", "monospace"),
     ("JetBrains Mono", "monospace"), ("Liberation Mono", "monospace"),
     ("Courier New", "monospace"), ("Comic Sans MS", "cursive"),
@@ -44,7 +50,8 @@ _FONT_CHOICES = [
     ("Candara", "sans-serif"), ("Corbel", "sans-serif"),
     ("Constantia", "serif"), ("Lucida Console", "monospace"),
     ("Consolas", "monospace"), ("Sora", "sans-serif"),
-    ("Cambria", "serif"),
+    ("Cambria", "serif"), ("Tahoma", "sans-serif"),
+    ("Andale Mono", "monospace"), ("Arial Black", "sans-serif"),
 ]
 _FONT_FALLBACKS = [
     ("Liberation Sans", "sans-serif"), ("DejaVu Sans", "sans-serif"),
@@ -83,21 +90,56 @@ def font_is_available(name: str) -> bool:
     return name in installed_font_families()
 
 
+def _bundled_family_choices() -> list:
+    """Families shipped inside the app, ordered by the bundled preference list.
+
+    Chromium in QWebEngineView cannot see fontconfig, so for the chart shell
+    the bundled files are the ONLY guarantee that an offered family actually
+    renders. Importing lazily keeps chart_display usable even if the font
+    bundle module were ever missing from a stripped build.
+    """
+    try:
+        import font_bundle
+        return [(name, _generic_for(name)) for name in font_bundle.bundled_families()]
+    except Exception:
+        try:
+            from backend import font_bundle  # package-style fallback
+            return [(name, _generic_for(name)) for name in font_bundle.bundled_families()]
+        except Exception:
+            return []
+
+
 def available_fonts(prefer: Optional[Iterable[str]] = None) -> list:
-    """Return installable font choices, filtered to what fontconfig resolves."""
-    prefer = set(prefer or [])
-    seen: set = set()
+    """Picker choices: everything the app bundles, then fontconfig-visible
+    curated extras.
+
+    The old implementation intersected the curated list with fontconfig,
+    which (a) hid every bundled font on machines where fc-list is absent
+    (the frozen Windows build) and (b) hid the bundled Microsoft core fonts
+    everywhere, since those live in the app's asset directory, not in a
+    system font path. Bundled families now always make the list; the
+    fontconfig union only adds whatever else the machine happens to have.
+    """
+    prefer = list(prefer or [])
     out: list = []
-    for family, generic in _FONT_CHOICES + _FONT_FALLBACKS:
-        if family in seen:
+    seen: set = set()
+    for family, generic in _bundled_family_choices():
+        if family.lower() in seen:
             continue
-        seen.add(family)
-        if font_is_available(family) or not prefer:
+        seen.add(family.lower())
+        out.append({"family": family, "generic": generic})
+    for family, generic in _FONT_CHOICES + _FONT_FALLBACKS:
+        if family.lower() in seen:
+            continue
+        seen.add(family.lower())
+        if font_is_available(family):
             out.append({"family": family, "generic": generic})
-    # Prefer requested fonts first
+    # Prefer requested fonts first, keeping the bundled preference order
+    # for the rest.
     if prefer:
-        pref_out = [f for f in out if f["family"] in prefer]
-        rest = [f for f in out if f["family"] not in prefer]
+        want = {str(p).lower() for p in prefer}
+        pref_out = [f for f in out if f["family"].lower() in want]
+        rest = [f for f in out if f["family"].lower() not in want]
         out = pref_out + rest
     return out
 
@@ -121,13 +163,27 @@ LEGEND_COLUMN_MAX_SHARE = 0.34
 LEGEND_BAND_MAX_SHARE = 0.30
 
 
+# Power BI-style type scaling: full-size at 640px and above (and for the
+# headless export path, which passes no width), floored at 0.72 at 300px and
+# below, linear between. The on-screen ECharts renderer does not consume this
+# yet -- see apply_display_options for where it is applied -- so the anchors
+# are fixed here where both the tests and the future wiring can read them.
+_TYPE_SCALE_FULL_PX = 640
+_TYPE_SCALE_MIN_PX = 300
+_TYPE_SCALE_MIN = 0.72
+
+
 def _type_scale(width_px=None, height_px=None):
-    """Return a font-size scale factor based on canvas size."""
-    if width_px and width_px < 400:
-        return 0.85
-    if width_px and width_px < 600:
-        return 0.92
-    return 1.0
+    """Return the type scale factor for a canvas width in pixels."""
+    if not width_px:
+        return 1.0
+    w = float(width_px)
+    if w >= _TYPE_SCALE_FULL_PX:
+        return 1.0
+    if w <= _TYPE_SCALE_MIN_PX:
+        return _TYPE_SCALE_MIN
+    frac = (w - _TYPE_SCALE_MIN_PX) / (_TYPE_SCALE_FULL_PX - _TYPE_SCALE_MIN_PX)
+    return _TYPE_SCALE_MIN + (1.0 - _TYPE_SCALE_MIN) * frac
 
 
 def _scale_size(size, factor):
@@ -194,6 +250,12 @@ def default_typo_opts() -> dict:
         "legend_item_color": "auto",
         "legend_title_size": 11,
         "legend_title_color": "auto",
+        # Legacy value-label ink/size: no longer exposed in the Typography
+        # tab (the dedicated per-chart controls own value labels: Layout
+        # "Show value labels" / "Label pos", Pie "Value size"/"Value color",
+        # Heatmap "Annotation size"/"Annotation color"). Kept so saved
+        # recipes that carry explicit values keep rendering exactly as
+        # before -- the adapter still reads these as fallbacks.
         "value_label_size": 11,
         "value_label_color": "auto",
         "tooltip_size": 12,
@@ -210,10 +272,53 @@ def default_typo_opts() -> dict:
     }
 
 
+def _clamp_halign(value, default: str = "left") -> str:
+    """The three alignments ECharts honours; anything else falls back."""
+    a = str(value or "").strip().lower()
+    return a if a in ("left", "center", "right") else default
+
+
+def _title_band_px(header_size, default: int = 20) -> int:
+    """Pixels of canvas height reserved for the chart title band.
+
+    Mirrors the ECharts adapter (client-side source of truth): at least
+    34px so a default 20px header is never clipped, and the band grows one
+    pixel per point of header size beyond that (``size + 16``). Unknown or
+    bogus sizes fall back to *default* -- never NaN, never zero.
+    """
+    try:
+        size = float(header_size)
+    except (TypeError, ValueError):
+        size = float(default)
+    if size != size or size in (float("inf"), float("-inf")):
+        size = float(default)
+    return int(max(34, int(size) + 16))
+
+
 # ── Font helpers ───────────────────────────────────────────────────────────
 
+def _resolve_family(name: str) -> str:
+    """Map a requested family to the bundled face that actually renders.
+
+    The chart shell is Chromium and cannot see fontconfig, so the page can
+    only draw bundled faces. The font bundle owns the substitution table
+    (Helvetica -> Carlito, etc.); fall back to the requested name when the
+    bundle is unavailable so a missing module never breaks rendering.
+    """
+    key = str(name or "").strip() or "Inter"
+    try:
+        from font_bundle import resolve as _resolve
+        return _resolve(key) or key
+    except Exception:
+        return key
+
+
 def _font_stack(name: str) -> str:
-    return FONT_STACKS.get(name, name)
+    key = str(name or "").strip()
+    resolved = _resolve_family(key)
+    if key in FONT_STACKS and key == resolved:
+        return FONT_STACKS[key]
+    return f"{resolved}, {_generic_for(resolved)}"
 
 
 def _style_dict(family, font_style):
@@ -221,7 +326,7 @@ def _style_dict(family, font_style):
 
 
 def header_font_css(typo_opts):
-    family = typo_opts.get("header_font_family", "Inter")
+    family = _resolve_family(typo_opts.get("header_font_family", "Inter"))
     size = typo_opts.get("header_font_size", 20)
     style = typo_opts.get("header_font_style", "Normal")
     weight = "700" if "Bold" in style else "400"
@@ -268,9 +373,7 @@ CHART_THEME = {
 
 def chart_canvas_color(mode=None):
     """Return the canvas background color for *mode*."""
-    from desktop.theme import theme_key
-    key = theme_key(mode or "dark")
-    return CHART_THEME.get(key, CHART_THEME["dark"])["canvas"]
+    return CHART_THEME[_theme_key(mode)]["canvas"]
 
 
 # ── apply_display_options (ECharts-native) ─────────────────────────────────
@@ -293,7 +396,8 @@ def apply_display_options(model: dict, layout_opts: dict, typo_opts: dict,
         "border_width": int(layout_opts.get("border_width", 1)),
         "border_radius": int(layout_opts.get("border_radius", 10)),
         "padding": int(layout_opts.get("padding", 12)),
-        "title_align": layout_opts.get("title_align", "left"),
+        "title_align": _clamp_halign(typo_opts.get(
+            "header_align", layout_opts.get("title_align", "left"))),
         "title_position": layout_opts.get("title_position", "top"),
         "title_gap": int(layout_opts.get("title_gap", 16)),
         "show_legend": bool(layout_opts.get("show_legend", True)),
@@ -312,6 +416,11 @@ def apply_display_options(model: dict, layout_opts: dict, typo_opts: dict,
     display.update({
         "header_font_family": typo_opts.get("header_font_family", "Inter"),
         "header_font_size": int(typo_opts.get("header_font_size", 20)),
+        # The adapter reads `typography.header_size || display.title_size`;
+        # keep display.title_size in step so models that pass through this
+        # function alone still size their header.
+        "title_size": int(typo_opts.get(
+            "header_font_size", typo_opts.get("header_size", 20))),
         "header_font_style": typo_opts.get("header_font_style", "Bold"),
         "header_font_color": typo_opts.get("header_font_color", "#f8fafc"),
         "font_family": typo_opts.get("font_family", "Inter"),
@@ -326,6 +435,16 @@ def apply_display_options(model: dict, layout_opts: dict, typo_opts: dict,
     })
 
     if width_px:
+        # A card below the full-size anchor gets proportionally smaller
+        # type (the "Power BI scales the type with the visual" rule). The
+        # on-screen renderer does not call this yet -- it is wired here so
+        # the contract holds for every caller and the tests can pin it.
+        factor = _type_scale(width_px)
+        for key in ("header_font_size", "font_size", "axis_title_font_size",
+                    "axis_label_font_size", "tick_label_font_size",
+                    "legend_font_size", "data_label_font_size"):
+            if key in display:
+                display[key] = _scale_size(display[key], factor)
         display["width_px"] = width_px
     if height_px:
         display["height_px"] = height_px
@@ -336,10 +455,28 @@ def apply_display_options(model: dict, layout_opts: dict, typo_opts: dict,
 
 # ── theme_figure (ECharts-native) ──────────────────────────────────────────
 
+def _theme_key(mode) -> str:
+    """Normalise a theme mode string to a CHART_THEME key.
+
+    desktop.theme exposes THEMES under the lowercase mode names; accept any
+    case/whitespace, fall back to the app's current mode, then to dark.
+    """
+    key = str(mode or "").strip().lower()
+    if key in CHART_THEME:
+        return key
+    try:
+        from desktop.theme import current_mode
+        key = str(current_mode() or "").strip().lower()
+        if key in CHART_THEME:
+            return key
+    except Exception:
+        pass
+    return "dark"
+
+
 def theme_figure(model: dict, mode: str = "dark") -> dict:
     """Apply theme colors to a ChartModel's display dict."""
-    from desktop.theme import theme_key
-    key = theme_key(mode or "dark")
+    key = _theme_key(mode)
     theme = CHART_THEME.get(key, CHART_THEME["dark"])
 
     display = dict(model.get("display") or {})
@@ -555,6 +692,7 @@ __all__ = [
     "BAR_MODES", "LEGEND_POSITIONS", "LEGEND_ORIENTATIONS", "LEGEND_ORDERS",
     "COLORBAR_POSITIONS", "CHART_THEME", "installed_font_families",
     "font_is_available", "available_fonts", "default_layout_opts",
+    "_title_band_px", "_clamp_halign",
     "default_typo_opts", "apply_display_options", "theme_figure",
     "chart_canvas_color", "_font_stack", "_style_dict", "header_font_css",
     "_font_kwargs", "_weight_style", "_type_scale", "_scale_size",

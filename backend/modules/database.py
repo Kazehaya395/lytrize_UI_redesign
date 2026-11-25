@@ -389,6 +389,22 @@ def init_db() -> None:
         c.execute("""CREATE INDEX IF NOT EXISTS idx_analysed_user
                      ON analysed_datasets(user_id)""")
 
+        # Home page counter: one row per finished dashboard export the user
+        # saved to a file (HTML or PNG) -- i.e. a report that was actually
+        # BUILT, not one that was merely saved as a session. Started in
+        # 2026-11; no reliable history exists before this, so no backfill.
+        c.execute("""CREATE TABLE IF NOT EXISTS report_builds (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id        INTEGER NOT NULL,
+            title          TEXT,
+            export_kind    TEXT NOT NULL,
+            rows_count     INTEGER,
+            built_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )""")
+        c.execute("""CREATE INDEX IF NOT EXISTS idx_report_builds_user
+                     ON report_builds(user_id)""")
+
         c.execute("""CREATE TABLE IF NOT EXISTS user_activity (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id       INTEGER NOT NULL,
@@ -412,6 +428,7 @@ def init_db() -> None:
             chart_meta_json      TEXT DEFAULT '{}',
             layout_mode           TEXT DEFAULT 'portrait',
             tile_geometry_json    TEXT DEFAULT '{}',
+            pages_json            TEXT DEFAULT '{}',
             updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users(id)
         )""")
@@ -454,12 +471,17 @@ def init_db() -> None:
                 ("dataset_uri",         "TEXT DEFAULT ''"),
                 ("dataset_hash",        "TEXT DEFAULT ''"),
                 ("slicers_json",        "TEXT DEFAULT '[]'"),
+                # Multi-page dashboards:
+                # {"version":1,"active":pid,"pages":[{id,name}],"chart_pages":{uid:pid},
+                #  "page_geometry":{pid:blob},"page_kpis":{pid:[k...]},"page_slicers":{pid:[s...]}}
+                ("pages_json",          "TEXT DEFAULT '{}'"),
             ],
             "draft_sessions": [
                 # Free-canvas placement. Absent on installs created before the
                 # canvas carried its geometry into the draft, so a relaunch
                 # there must add it rather than lose every dragged position.
                 ("tile_geometry_json",  "TEXT DEFAULT '{}'"),
+                ("pages_json",          "TEXT DEFAULT '{}'"),
             ],
         }
 
@@ -777,6 +799,7 @@ def save_draft(
     chart_meta_json: str = "{}",
     layout_mode: str = "portrait",
     tile_geometry_json: str = "{}",
+    pages_json: str = "{}",
 ) -> None:
     """Upsert the user's current in-progress state to draft_sessions."""
     try:
@@ -786,12 +809,12 @@ def save_draft(
                         (user_id, page, charts_json, file_name, editing_session_id,
                          editing_session_name, editing_file_name, dashboard_title,
                          kpis_json, chart_meta_json, layout_mode,
-                         tile_geometry_json, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
+                         tile_geometry_json, pages_json, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""",
                     (user_id, page, charts_json, file_name,
                      editing_session_id, editing_session_name, editing_file_name,
                      dashboard_title, kpis_json, chart_meta_json, layout_mode,
-                     tile_geometry_json),
+                     tile_geometry_json, pages_json),
                 )
     except Exception as exc:
         logging.getLogger(__name__).debug("Suppressed error: %s", exc, exc_info=True)
@@ -849,6 +872,7 @@ def save_session_db(
     dataset_uri: str = "",
     dataset_hash: str = "",
     slicers_json: str = "[]",
+    pages_json: str = "{}",
     session_uuid: Optional[str] = None,
     source: str = "local",
 ) -> int:
@@ -861,13 +885,13 @@ def save_session_db(
                (user_id, session_uuid, session_name, file_name, rows_count, cols_count,
                 analysis_types, charts_json, dashboard_title, kpis_json, layout_mode,
                 grid_cols_n, grid_order_json, grid_fullwidth_json, export_text_json, export_colours_json,
-                dataset_uri, dataset_hash, slicers_json, source, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)"""),
+                dataset_uri, dataset_hash, slicers_json, pages_json, source, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)"""),
             (user_id, session_uuid, session_name, file_name, rows, cols,
              json.dumps(analysis_types), charts_json,
              dashboard_title, kpis_json, layout_mode,
              grid_cols_n, grid_order_json, grid_fullwidth_json, export_text_json, export_colours_json,
-             dataset_uri, dataset_hash, slicers_json, source),
+             dataset_uri, dataset_hash, slicers_json, pages_json, source),
         )
         sid = _last_id(c)
     log_activity(user_id, "dashboard_saved",
@@ -1025,6 +1049,7 @@ def update_session_db(
     dataset_uri: str = "",
     dataset_hash: str = "",
     slicers_json: str = "[]",
+    pages_json: str = "{}",
     session_uuid: Optional[str] = None,
 ) -> None:
     """Overwrite a saved session in-place. user_id guard enforces ownership."""
@@ -1040,13 +1065,13 @@ def update_session_db(
             "SET session_name=?, charts_json=?, analysis_types=?, "
             "    dashboard_title=?, kpis_json=?, layout_mode=?, grid_cols_n=?, "
             "    grid_order_json=?, grid_fullwidth_json=?, export_text_json=?, export_colours_json=?, "
-            "    dataset_uri=?, dataset_hash=?, slicers_json=?, "
+            "    dataset_uri=?, dataset_hash=?, slicers_json=?, pages_json=?, "
             "    updated_at=CURRENT_TIMESTAMP "
             "WHERE id=? AND user_id=?"),
             (session_name, charts_json, json.dumps(analysis_types),
              dashboard_title, kpis_json, layout_mode, grid_cols_n,
              grid_order_json, grid_fullwidth_json, export_text_json, export_colours_json,
-             dataset_uri, dataset_hash, slicers_json,
+             dataset_uri, dataset_hash, slicers_json, pages_json,
              session_id, user_id),
         )
     log_activity(user_id, "session_updated",
@@ -1124,6 +1149,37 @@ def record_dataset_analysed(user_id, file_name: str, file_signature: str,
 # accident when inserting a new function directly above the def -- a function
 # inserted between a decorator and its def silently inherits the decorator
 # (and the original silently loses it), which is exactly what happened here.
+def record_report_built(user_id, title: str = "", export_kind: str = "html",
+                        rows: int = 0) -> bool:
+    """Record that the user exported (built) a dashboard report.
+
+    One row per saved export file (HTML or PNG). Returns True when a row
+    was inserted; never raises — a stats bookkeeping failure must not
+    break an otherwise finished export.
+    """
+    if user_id is None:
+        return False
+    conn = _connect()
+    try:
+        c = conn.cursor()
+        c.execute(
+            _ph("INSERT INTO report_builds (user_id, title, export_kind, rows_count) "
+                "VALUES (?,?,?,?)"),
+            (user_id, str(title or ""), str(export_kind or "html"), int(rows or 0)),
+        )
+        conn.commit()
+        try:
+            get_user_stats.clear()
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        log.warning("record_report_built: %s", e)
+        return False
+    finally:
+        conn.close()
+
+
 @_ttl_cache(ttl_seconds=30)
 def get_user_stats(user_id: int, analyses_available: int = 0) -> dict:
     """Return summary counts for the Home page stat cards.
@@ -1135,6 +1191,9 @@ def get_user_stats(user_id: int, analyses_available: int = 0) -> dict:
       user happened to SAVE (session rows are only written by the manual
       Save Session action), and it keyed on the filename alone, so
       re-uploading an updated file of the same name was invisible.
+    - reports: dashboard reports the user exported to a file (HTML/PNG),
+      from report_builds. Saving a session does NOT count — building the
+      report is the deliberate completion act.
     - analyses: the number of analysis types the app currently offers,
       passed in by the caller. It is a property of the build, not of this
       user's history, so deriving it from stored charts_json (the old
@@ -1142,7 +1201,7 @@ def get_user_stats(user_id: int, analyses_available: int = 0) -> dict:
       user happened to have made.
     """
     if user_id is None:
-        return {"sessions": 0, "datasets": 0, "analyses": 0}
+        return {"sessions": 0, "datasets": 0, "reports": 0, "analyses": 0}
 
     conn = _connect()
     try:
@@ -1156,11 +1215,20 @@ def get_user_stats(user_id: int, analyses_available: int = 0) -> dict:
         )
         dataset_count = c.fetchone()[0] or 0
 
+        try:
+            c.execute(
+                _ph("SELECT COUNT(*) FROM report_builds WHERE user_id=?"),
+                (user_id,),
+            )
+            report_count = c.fetchone()[0] or 0
+        except Exception:
+            report_count = 0
+
         return {"sessions": session_count, "datasets": dataset_count,
-                "analyses": analyses_available}
+                "reports": int(report_count), "analyses": analyses_available}
     except Exception as e:
         log.warning("get_user_stats: %s", e)
-        return {"sessions": 0, "datasets": 0, "analyses": 0}
+        return {"sessions": 0, "datasets": 0, "reports": 0, "analyses": 0}
     finally:
         conn.close()
 
@@ -1226,12 +1294,12 @@ def get_session_meta(session_id: int, user_id=None) -> Optional[dict]:
             c = conn.cursor()
             if user_id is None:
                 c.execute(
-                    _ph("SELECT dashboard_title, kpis_json, layout_mode, grid_cols_n, grid_order_json, grid_fullwidth_json, export_text_json, export_colours_json, dataset_uri, dataset_hash, slicers_json FROM sessions WHERE id=?"),
+                    _ph("SELECT dashboard_title, kpis_json, layout_mode, grid_cols_n, grid_order_json, grid_fullwidth_json, export_text_json, export_colours_json, dataset_uri, dataset_hash, slicers_json, pages_json FROM sessions WHERE id=?"),
                     (session_id,),
                 )
             else:
                 c.execute(
-                    _ph("SELECT dashboard_title, kpis_json, layout_mode, grid_cols_n, grid_order_json, grid_fullwidth_json, export_text_json, export_colours_json, dataset_uri, dataset_hash, slicers_json "
+                    _ph("SELECT dashboard_title, kpis_json, layout_mode, grid_cols_n, grid_order_json, grid_fullwidth_json, export_text_json, export_colours_json, dataset_uri, dataset_hash, slicers_json, pages_json "
                         "FROM sessions WHERE id=? AND user_id=?"),
                     (session_id, user_id),
                 )
@@ -1249,6 +1317,7 @@ def get_session_meta(session_id: int, user_id=None) -> Optional[dict]:
                     "dataset_uri":        row[8] or "",
                     "dataset_hash":       row[9] or "",
                     "slicers_json":       row[10] or "[]",
+                    "pages_json":         row[11] or "{}",
                 }
     except Exception as exc:
         logging.getLogger(__name__).debug("Suppressed error: %s", exc, exc_info=True)
@@ -1338,7 +1407,7 @@ def export_sessions_to_dict(
                 # Without these three a restore brings back pictures with dead
                 # slicers (no data behind them) -- the same bug as reopening
                 # a session whose parquet was never persisted.
-                "dataset_uri", "dataset_hash", "slicers_json",
+                "dataset_uri", "dataset_hash", "slicers_json", "pages_json",
                 "source", "created_at",
             ]
             select_parts = [col for col in wanted if col in available]
@@ -1418,7 +1487,7 @@ def import_sessions_from_dict(
                 "cols_count", "analysis_types", "charts_json", "dashboard_title",
                 "kpis_json", "layout_mode", "grid_cols_n", "grid_order_json", "grid_fullwidth_json",
                 "export_text_json", "export_colours_json",
-                "dataset_uri", "dataset_hash", "slicers_json",
+                "dataset_uri", "dataset_hash", "slicers_json", "pages_json",
                 "source", "created_at"]
         _vals = {
             "user_id": user_id,
@@ -1440,6 +1509,7 @@ def import_sessions_from_dict(
             "dataset_uri": payload.get("dataset_uri") or "",
             "dataset_hash": payload.get("dataset_hash") or "",
             "slicers_json": payload.get("slicers_json") or "[]",
+            "pages_json": payload.get("pages_json") or "{}",
             "source": payload.get("source") or "local",
             "created_at": payload.get("created_at"),
         }
@@ -1492,7 +1562,7 @@ def import_sessions_from_dict(
                                          "grid_cols_n", "grid_order_json", "grid_fullwidth_json",
                                          "export_text_json", "export_colours_json",
                                          "dataset_uri", "dataset_hash", "slicers_json",
-                                         "source"]
+                                         "pages_json", "source"]
                             try:
                                 _have = {row[1] for row in
                                          conn.execute("PRAGMA table_info(sessions)")}
@@ -1517,6 +1587,7 @@ def import_sessions_from_dict(
                                 "dataset_uri": s.get("dataset_uri") or "",
                                 "dataset_hash": s.get("dataset_hash") or "",
                                 "slicers_json": s.get("slicers_json") or "[]",
+                                "pages_json": s.get("pages_json") or "{}",
                                 "source": source,
                             }
                             _execute(

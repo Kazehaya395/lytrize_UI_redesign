@@ -10,6 +10,14 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Optional: simplified admin-1 output keeps the shipped boundary set far
+# more detailed than the previous 1:50m generalized file at a fraction of the
+# raw 1:10m byte size. Only used when --admin1-simplify > 0.
+try:
+    from shapely.geometry import shape, mapping
+except ImportError:  # pragma: no cover - optional maintainer dependency
+    shape = mapping = None
+
 
 def norm(value) -> str:
     text = unicodedata.normalize("NFKD", str(value or ""))
@@ -69,17 +77,40 @@ def main() -> None:
     parser.add_argument("--admin1", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--admin1-simplify", type=float, default=0.0,
+                        help="Douglas-Peucker tolerance in degrees for the admin-1 "
+                             "layer (0 = keep full 1:10m detail; ~0.005 ~ 550m keeps "
+                             "sub-kilometre fidelity at half the bytes). Requires shapely.")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
 
     countries_src = read_geojson(args.countries)
     admin1_src = read_geojson(args.admin1)
+    if args.admin1_simplify and args.admin1_simplify > 0:
+        if shape is None:
+            raise SystemExit(
+                "--admin1-simplify requires the optional 'shapely' package "
+                "(pip install shapely). Re-run without it to ship raw 1:10m data.")
+        simplified = []
+        for feature in admin1_src["features"]:
+            geom = shape(feature["geometry"]).simplify(args.admin1_simplify,
+                                                       preserve_topology=True)
+            simplified.append({"type": "Feature", "id": feature.get("id"),
+                               "properties": feature.get("properties") or {},
+                               "geometry": mapping(geom)})
+        admin1_src = {"type": "FeatureCollection", "features": simplified}
+        print(f"Simplified admin-1 with tolerance {args.admin1_simplify} degrees "
+              f"({len(simplified)} features)")
     country_features = []
     country_aliases, country_names, country_centers = {}, {}, {}
     for feature in countries_src["features"]:
         props = feature.get("properties") or {}
-        map_key = (props.get("ISO_A3_EH") if props.get("ISO_A3_EH") not in (None, "-99")
-                   else props.get("ADM0_A3"))
+        # GU_A3 (the geographic unit code) is unique across the 1:50m source
+        # and equals the ISO 3166-1 alpha-3 code for every regular country;
+        # ADM0_A3 is the fallback. ISO_A3_EH is NOT usable here: it repeats
+        # "AUS" for mainland Australia and its offshore territories.
+        map_key = props.get("GU_A3") if props.get("GU_A3") not in (None, "-99") \
+            else props.get("ADM0_A3")
         display_name = props.get("NAME_EN") or props.get("ADMIN") or props.get("NAME")
         if not map_key or not display_name:
             continue
@@ -123,7 +154,12 @@ def main() -> None:
     admin1_features = []
     for feature in admin1_src["features"]:
         props = feature.get("properties") or {}
-        map_key = props.get("iso_3166_2") or props.get("adm1_code")
+        # adm1_code is unique across all 4,596 features of the 1:10m source
+        # (iso_3166_2 repeats for shared city/province codes upstream, which
+        # is why the previous choice failed the uniqueness check). iso_3166_2
+        # stays in the aliases and properties so users can still select e.g.
+        # "IN-TG".
+        map_key = props.get("adm1_code") or props.get("iso_3166_2")
         display_name = props.get("name_en") or props.get("name")
         if not map_key or not display_name:
             continue
@@ -168,9 +204,27 @@ def main() -> None:
         if len(keys) == 1:
             admin1_aliases.setdefault(alias, next(iter(keys)))
 
-    if "US-DC" in state_names:
-        state_aliases[norm("District of Columbia")] = "US-DC"
-        state_aliases[norm("Washington DC")] = "US-DC"
+    # Natural Earth lists the District of Columbia with name_en
+    # "Washington", which collides with Washington state. Key it off the
+    # stable iso_3166_2 / postal codes instead and make the display name
+    # unambiguous in the bundled asset.
+    dc_key = None
+    for feature in admin1_src["features"]:
+        props = feature.get("properties") or {}
+        if props.get("adm0_a3") == "USA" and str(props.get("iso_3166_2")) == "US-DC":
+            dc_key = props.get("adm1_code")
+            break
+    if dc_key:
+        admin1_names[dc_key] = "District of Columbia"
+        state_names[dc_key] = "District of Columbia"
+        for out in admin1_features:
+            if out["properties"]["name"] == dc_key:
+                out["properties"]["display_name"] = "District of Columbia"
+                break
+        for alias in ("Washington DC", "Washington, D.C.", "District of Columbia",
+                      "DC", "D.C."):
+            admin1_aliases[norm(alias)] = dc_key
+            state_aliases[norm(alias)] = dc_key
 
     if len({f["properties"]["name"] for f in country_features}) != len(country_features):
         raise ValueError("Country map keys are not unique")
@@ -183,8 +237,8 @@ def main() -> None:
 
     countries = {"type": "FeatureCollection", "features": country_features}
     admin1 = {"type": "FeatureCollection", "features": admin1_features}
-    countries_hash = write_json(args.output / "countries-110m.geojson", countries)
-    admin1_hash = write_json(args.output / "admin1-50m.geojson", admin1)
+    countries_hash = write_json(args.output / "countries-50m.geojson", countries)
+    admin1_hash = write_json(args.output / "admin1-10m.geojson", admin1)
     lookup_hash = write_json(args.output / "lookup.json", {
         "version": args.version, "country_aliases": country_aliases,
         "country_names": country_names, "us_state_aliases": state_aliases,
@@ -200,22 +254,23 @@ def main() -> None:
         "license_url": "https://www.naturalearthdata.com/about/terms-of-use/",
         "source_repository": "https://github.com/nvkelso/natural-earth-vector",
         "source_files": {
-            "countries": "geojson/ne_110m_admin_0_countries.geojson",
-            "admin1": "geojson/ne_50m_admin_1_states_provinces.geojson",
+            "countries": "geojson/ne_50m_admin_0_countries.geojson",
+            "admin1": "geojson/ne_10m_admin_1_states_provinces.geojson",
         },
         "map_assets": {
-            "countries-110m.geojson": {"features": len(country_features),
+            "countries-50m.geojson": {"features": len(country_features),
                                         "sha256": countries_hash},
-            "admin1-50m.geojson": {"features": len(admin1_features),
+            "admin1-10m.geojson": {"features": len(admin1_features),
                                     "sha256": admin1_hash},
             "lookup.json": {"sha256": lookup_hash},
         },
         "coverage_note": (
-            "Countries use Natural Earth 1:110m generalized boundaries. Admin-1 "
-            "uses 1:50m generalized boundaries and contains only the subdivisions "
-            "published by Natural Earth (294 features in the pinned source). "
-            "Admin-1 resolution supports country-qualified names/codes and unique "
-            "bare names; US states also have postal aliases. "
+            "Countries use Natural Earth 1:50m cultural vector boundaries. Admin-1 "
+            "uses Natural Earth 1:10m subdivisions (Douglas-Peucker simplified to "
+            "~0.005 degrees, i.e. sub-kilometre fidelity, when built with "
+            "--admin1-simplify), and contains every subdivision Natural Earth "
+            "publishes. Admin-1 resolution supports country-qualified names/codes "
+            "and unique bare names; US states also have postal aliases. "
             "These are cartographic boundaries, not legal or survey boundaries."
         ),
         "attribution": "Made with Natural Earth (public domain).",

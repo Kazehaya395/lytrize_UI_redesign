@@ -17,6 +17,22 @@
     return Number.isFinite(n) ? n : null;
   }
 
+  /* Tooltip numbers: grouped thousands, short decimals. The old formatter
+     printed the raw value array ("-75.0152,40.71,555,8") which read as
+     garbage; now only the metric is printed, formatted. */
+  function fmtLyNumber(value) {
+    var n = Number(value);
+    if (!isFinite(n)) return String(value == null ? "" : value);
+    var abs = Math.abs(n);
+    if (abs >= 1000) {
+      var s = n.toLocaleString(undefined, {maximumFractionDigits: 2});
+      return s;
+    }
+    if (abs >= 1) return String(Math.round(n * 1000) / 1000);
+    if (n !== 0 && abs < 0.001) return n.toExponential(2);
+    return String(Math.round(n * 10000) / 10000);
+  }
+
   function fontStyle(typography, part, size, color) {
     var heading = part === "header";
     var style = String((typography || {})[heading ? "header_font_style" : "font_style"] || "Normal").toLowerCase();
@@ -85,6 +101,10 @@
   // component in every renderer (the continuous visualMap drops its default
   // tick labels and its `name` on some builds), so chart chrome that must
   // always be visible -- the colour-bar title -- is drawn this way.
+  var log = {error: function (message) {
+    if (typeof console !== "undefined" && console.error) console.error(message);
+  }};
+
   function pushGraphic(option, item) {
     if (!option.graphic) option.graphic = [];
     if (!Array.isArray(option.graphic)) option.graphic = [option.graphic];
@@ -99,31 +119,54 @@
     return result;
   }
 
+  function effectiveFrameZoom(display, width, height, fallbackZoom) {
+    var span = Number(display && display.map_frame_span);
+    var w = Number(width), h = Number(height);
+    if (!isFinite(span) || span <= 0 || !isFinite(w) || !isFinite(h) || w <= 0 || h <= 0) {
+      return Math.max(1, isFinite(fallbackZoom) ? fallbackZoom : 1);
+    }
+    // World pixel width at zoom 1 == 0.92*min(W,H); grow until the span fills
+    // ~84% of the panel width (leaves room for the colour bar on the right).
+    var base = 0.92 * Math.min(w, h);
+    var zoom = (0.84 * w * 360) / (span * base);
+    return Math.max(1.5, Math.min(12, zoom));
+  }
+
   function mapProjection(name) {
     var mode = String(name || "natural earth").toLowerCase();
     if (mode !== "natural earth" && mode !== "mercator" && mode !== "equirectangular") {
       mode = "natural earth";
     }
+    // ECharts lays projections out with y growing DOWNWARD on screen and,
+    // when a projection is set, disables its usual y flip (invertY=false).
+    // Projections must therefore return north-negative y; unproject reverses
+    // that. Both take and return lon/lat in DEGREES, like ECharts' own
+    // Mercator example (y = -ln(tan(pi/4 + phi/2))).
     if (mode === "equirectangular") {
       return {project: function (point) {
-        return [point[0] * Math.PI / 180, point[1] * Math.PI / 180];
+        return [point[0] * Math.PI / 180, -point[1] * Math.PI / 180];
       }, unproject: function (point) {
-        return [point[0] * 180 / Math.PI, point[1] * 180 / Math.PI];
+        return [point[0] * 180 / Math.PI, -point[1] * 180 / Math.PI];
       }};
     }
     if (mode === "mercator") {
       return {project: function (point) {
         var lambda = point[0] * Math.PI / 180;
         var phi = Math.max(-85.05112878, Math.min(85.05112878, point[1])) * Math.PI / 180;
-        return [lambda, Math.log(Math.tan(Math.PI / 4 + phi / 2))];
+        return [lambda, -Math.log(Math.tan(Math.PI / 4 + phi / 2))];
       }, unproject: function (point) {
         return [point[0] * 180 / Math.PI,
-          (2 * Math.atan(Math.exp(point[1])) - Math.PI / 2) * 180 / Math.PI];
+          (2 * Math.atan(Math.exp(-point[1])) - Math.PI / 2) * 180 / Math.PI];
       }};
     }
     function xFactor(phi) {
-      var p2 = phi * phi, p4 = p2 * p2, p6 = p4 * p2, p12 = p6 * p6;
-      return 0.8707 - 0.131979 * p2 + p12 * (-0.013791 + p2 * (0.003971 * p2 - 0.001529 * p4));
+      // Natural Earth parallels, l(phi): see Wikipedia "Natural Earth
+      // projection". The previous powers (phi^12/phi^14/phi^16) drove the
+      // factor negative above ~65 deg and folded the high latitudes inside
+      // out, rendering the world as a thin distorted band.
+      var p2 = phi * phi, p4 = p2 * p2, p6 = p4 * p2, p10 = p6 * p4, p12 = p6 * p6;
+      return 0.8707 - 0.131979 * p2 - 0.013791 * p4 +
+        0.003971 * p10 - 0.001529 * p12;
     }
     function yProject(phi) {
       var p2 = phi * phi, p4 = p2 * p2, p6 = p4 * p2, p8 = p4 * p4;
@@ -132,14 +175,15 @@
     return {project: function (point) {
       var lambda = point[0] * Math.PI / 180;
       var phi = Math.max(-89.5, Math.min(89.5, point[1])) * Math.PI / 180;
-      return [lambda * xFactor(phi), yProject(phi)];
+      return [lambda * xFactor(phi), -yProject(phi)];
     }, unproject: function (point) {
-      var phi = Math.max(-1.56, Math.min(1.56, point[1]));
+      var y = -point[1];
+      var phi = Math.max(-1.56, Math.min(1.56, y));
       for (var i = 0; i < 12; i++) {
         var delta = 1e-6;
         var derivative = (yProject(phi + delta) - yProject(phi - delta)) / (2 * delta);
         if (!Number.isFinite(derivative) || Math.abs(derivative) < 1e-9) break;
-        phi -= (yProject(phi) - point[1]) / derivative;
+        phi -= (yProject(phi) - y) / derivative;
       }
       return [point[0] / xFactor(phi) * 180 / Math.PI, phi * 180 / Math.PI];
     }};
@@ -157,7 +201,9 @@
     var labels = display.labels || {};
     var titleText = model.title || "";
     var topTitle = display.title_position !== "bottom";
-    var titleBand = titleText ? Math.max(34, Number(typography.header_size || display.title_size || 20) + 16) : 12;
+    var headerPx = Number(typography.header_size || display.title_size);
+    if (!isFinite(headerPx) || headerPx <= 0) { headerPx = 20; }
+    var titleBand = titleText ? Math.max(34, headerPx + 16) : 12;
     var legendPos = String(legend.position || "bottom center").toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
     var legendTitle = String(legend.title || "");
     var hasLegend = legend.show !== false;
@@ -292,7 +338,7 @@
       if (atCenter) { titleX = width / 2; titleAlign = "center"; }
       else if (atEnd || atRight) { titleX = width - 8; titleAlign = "right"; }
       else { titleX = 8; titleAlign = "start"; }
-      pushGraphic(option, {type: "text",
+      pushGraphic(option, {type: "text", id: "lytrize-legend-title",
         silent: true, style: {text: legendTitle,
           x: titleX,
           y: legendTitleTop + Math.max(10, legendTitleBand / 2),
@@ -433,7 +479,19 @@
           displayName: item[2] || String(item[0]), details: item[3] || {}};
       }).filter(function (item) { return item.value !== null; });
       var mapCenter = Array.isArray(mapDisplay.map_center) ? mapDisplay.map_center : [0, 0];
-      var mapZoom = Number(mapDisplay.map_zoom || 1);
+      // ECharts sizes the projection's base fit to 0.92*min(W,H) (the wider
+      // aspect side), so the renderer re-frames data/scope bounds against the
+      // ACTUAL panel: Python reports the span (degrees) to cover; without
+      // that knowledge any pre-baked zoom opens country views zoomed out.
+      var mapZoom = effectiveFrameZoom(mapDisplay, width, height,
+        Number(mapDisplay.map_zoom || 1));
+      var mapProjectionFn = mapProjection(satellite ? "mercator" : mapDisplay.map_projection);
+      // With a custom projection active, ECharts interprets `center` in
+      // PROJECTED coordinates, not lon/lat degrees (aspectScale is also
+      // ignored). Projecting here keeps the view centred on the requested
+      // scope; passing degrees rendered a thin off-centre band.
+      var projCenter = (mapProjectionFn && typeof mapProjectionFn.project === "function")
+        ? mapProjectionFn.project(mapCenter) : mapCenter;
       option.tooltip = {trigger: "item", confine: true,
         backgroundColor: tooltipBackground,
         borderColor: autoValueColor === "#111827" ? "#cbd5e1" : "#475569",
@@ -442,9 +500,17 @@
         var data = params && params.data || {};
         var details = data.details || {};
         var parts = ["<strong>" + escapeHtml(data.displayName || params.name) + "</strong>"];
-        if (data.value != null) parts.push(escapeHtml(mapDisplay.map_value_title || "Value") + ": " + escapeHtml(data.value));
+        var metricValue = (Array.isArray(data.value) ? data.value[2] : data.value);
+        if (metricValue != null && !isNaN(Number(metricValue))) {
+          parts.push(escapeHtml(mapDisplay.map_value_title || "Value") + ": " + escapeHtml(fmtLyNumber(metricValue)));
+        } else if (metricValue != null) {
+          parts.push(escapeHtml(mapDisplay.map_value_title || "Value") + ": " + escapeHtml(metricValue));
+        }
         Object.keys(details).forEach(function (key) {
-          if (details[key] != null) parts.push(escapeHtml(key) + ": " + escapeHtml(details[key]));
+          if (details[key] == null) return;
+          var dv = details[key];
+          parts.push(escapeHtml(key) + ": " +
+            escapeHtml(isFinite(Number(dv)) && String(dv).trim() !== "" ? fmtLyNumber(dv) : dv));
         });
         return parts.join("<br>");
       }};
@@ -465,13 +531,9 @@
         bottom: !colorbarVertical && colorbarPosition !== "top" ? 6 : undefined,
         itemWidth: colorbarVertical ? 12 : undefined,
         itemHeight: colorbarVertical ? Math.max(70, height * 0.58) : 10,
-        name: mapDisplay.colorbar_title || "",
-        nameLocation: "middle", nameGap: Number(mapDisplay.colorbar_title_size || 11) + 8,
-        text: [String(mapMax), String(mapMin)],
+        text: [String(Number(mapMax.toPrecision(4))), String(Number(mapMin.toPrecision(4)))],
         textStyle: fontStyle(typography, "body", mapDisplay.colorbar_tick_size || 10,
           mapDisplay.colorbar_tick_color || mapDisplay.text_color || "#cbd5e1"),
-        nameTextStyle: fontStyle(typography, "body", mapDisplay.colorbar_title_size || 11,
-          mapDisplay.colorbar_title_color || mapDisplay.text_color || "#cbd5e1"),
         borderColor: mapDisplay.colorbar_border ? "rgba(100,116,139,.55)" : "transparent",
         borderWidth: mapDisplay.colorbar_border ? 1 : 0,
         show: mapDisplay.show_colorbar !== false,
@@ -484,8 +546,8 @@
         if (satellite) option.visualMap = undefined;
         option.series = [{id: mapSeries.id || "choropleth", name: mapSeries.name || model.title,
           type: "map", map: mapMeta.id, nameProperty: "name", data: mapValues,
-          center: mapCenter, zoom: mapZoom, roam: true, scaleLimit: {min: 1, max: 12},
-          projection: mapProjection(satellite ? "mercator" : mapDisplay.map_projection),
+          center: projCenter, zoom: mapZoom, roam: true, scaleLimit: {min: 0.5, max: 48},
+          projection: mapProjectionFn,
           layoutCenter: ["48%", "54%"], layoutSize: "92%",
           itemStyle: {areaColor: satellite ? "rgba(0,0,0,0)" : (mapDisplay.map_land_color || "#1e293b"),
             borderColor: mapDisplay.map_borders ? (mapDisplay.map_border_color || "rgba(203,213,225,.68)") : "transparent",
@@ -493,13 +555,17 @@
           emphasis: {label: {show: false}, itemStyle: {areaColor: "#818cf8"}},
           select: {disabled: true}, label: {show: false}}];
       } else {
-        option.geo = {map: mapMeta.id, roam: true, center: mapCenter, zoom: mapZoom,
-          scaleLimit: {min: 1, max: 12}, projection: mapProjection(satellite ? "mercator" : mapDisplay.map_projection),
+        option.geo = Object.assign({map: mapMeta.id, roam: true, center: projCenter, zoom: mapZoom,
+          scaleLimit: {min: 0.5, max: 48}, projection: mapProjectionFn,
           layoutCenter: ["50%", "54%"], layoutSize: "92%",
           itemStyle: {areaColor: satellite ? "rgba(0,0,0,0)" : (mapDisplay.map_land_color || "#e8edf4"),
             borderColor: mapDisplay.map_borders ? (mapDisplay.map_border_color || "#9aa8ba") : "transparent",
             borderWidth: mapDisplay.map_borders ? 0.55 : 0},
-          emphasis: {itemStyle: {areaColor: mapDisplay.map_emphasis_color || "#cbd5e1"}}};
+          emphasis: {itemStyle: {areaColor: mapDisplay.map_emphasis_color || "#cbd5e1"}}},
+          // Imagery sits at z 0; the boundary stroke must stay visible above
+          // it, so the geo component (which paints fill/borders) is lifted
+          // just above the tiles but below the data series (z 2).
+          satellite ? {z: 1} : {});
         // A continuous visualMap bound to dimension 2 turns points whose
         // third value is null into fill="none" -- the whole scatter vanishes
         // even with show:false. Bind it only when the model really carries a
@@ -539,8 +605,7 @@
             },
             itemStyle: {opacity: Number(mapDisplay.map_marker_opacity || 0.82),
               borderColor: "rgba(255,255,255,.45)", borderWidth: 0.5},
-            encode: {value: 2}, large: true, largeThreshold: 2000,
-            progressive: 4000, animation: false}];
+            encode: {value: 2}, progressive: 4000, animation: false}];
         } else {
           option.series = series.map(function (s, index) {
             return {id: s.id || "map-points-" + index, name: s.name || "Locations",
@@ -561,11 +626,45 @@
                 return Math.max(min, Math.min(max, raw));
               },
               itemStyle: {opacity: Number(mapDisplay.map_marker_opacity || 0.82)},
-              encode: {value: 2}, large: true, largeThreshold: 2000,
-              progressive: 3000, progressiveThreshold: 5000};
+              encode: {value: 2}, progressive: 3000, progressiveThreshold: 5000,
+              z: 2};
           });
         }
       }
+      // Colour-bar title is drawn only when the (final) colorbar survives
+      // to render -- a satellite choropleth nulls the visualMap and would
+      // otherwise get an orphaned title.
+            // This build's continuous visualMap silently drops its `name` (see the
+            // heatmap branch), so the colour-bar title is drawn as a graphic text
+            // element -- anchored next to the bar exactly like the heatmap one.
+            var mapCbTitle = String(mapDisplay.colorbar_title || "").trim();
+            if (option.visualMap && option.visualMap.show && mapCbTitle) {
+              var mapCbSize = Number(mapDisplay.colorbar_title_size || 11);
+              var mapCbFontStyle = String((typography || {}).font_style || "Normal").toLowerCase();
+              var mapCbFont = (mapCbFontStyle.indexOf("italic") >= 0 ? "italic " : "") +
+                (mapCbFontStyle.indexOf("bold") >= 0 ? "700 " : "400 ") +
+                mapCbSize + "px \"" + String((typography || {}).family || "Inter") + "\"";
+              var mapCbInk = String(mapDisplay.colorbar_title_color || mapDisplay.text_color || "#cbd5e1");
+              var mapCbTitleItem = {type: "text", silent: true, style: {
+                text: mapCbTitle, fill: mapCbInk, font: mapCbFont,
+                textAlign: "center", textVerticalAlign: "middle"}};
+              if (colorbarVertical) {
+                var mapCbTop = Math.max(44, titleBand + 4);
+                mapCbTitleItem.style.y = Math.max(2, mapCbTop - mapCbSize - 4) + mapCbSize / 2;
+                if (colorbarPosition === "right") { mapCbTitleItem.style.x = width - 8; mapCbTitleItem.style.textAlign = "right"; }
+                else if (colorbarPosition === "left") { mapCbTitleItem.style.x = 8; mapCbTitleItem.style.textAlign = "start"; }
+                else { mapCbTitleItem.style.x = width / 2; }
+              } else if (colorbarPosition === "top") {
+                var mapCbTopH = Math.max(4, titleBand);
+                mapCbTitleItem.style.x = width / 2;
+                mapCbTitleItem.style.y = mapCbTopH + 10 + 3 + mapCbSize / 2;
+              } else {
+                mapCbTitleItem.style.x = width / 2;
+                mapCbTitleItem.style.y = height - 6 - 10 - 4 - mapCbSize / 2;
+              }
+              mapCbTitleItem.id = "lytrize-cb-title";
+              pushGraphic(option, mapCbTitleItem);
+            }
     } else if (isPie) {
       var source = series[0] || {values: []};
       var pieData = (source.values || []).map(function (pair) {
@@ -860,6 +959,7 @@
           cbTitleItem.style.x = width / 2;
           cbTitleItem.style.y = height - 6 - colorbarBarThickness - 4 - cbTitleSize / 2;
         }
+        cbTitleItem.id = "lytrize-cb-title";
         pushGraphic(option, cbTitleItem);
       }
       option.series = [{id: (series[0] && series[0].id) || "heatmap",
@@ -1001,7 +1101,9 @@
             fontStyle: String(typography.font_style || "Normal").toLowerCase().indexOf("italic") >= 0 ? "italic" : "normal",
             formatter: function (params) {
               var value = params.value && typeof params.value === "object" ? params.value.value : params.value;
-              return value == null ? "" : String(value);
+              if (value == null) return "";
+              var n = Number(value);
+              return isFinite(n) ? fmtLyNumber(n) : String(value);
             }
           },
           data: data};
@@ -1035,11 +1137,45 @@
     // Axis titles belong centred on their axis. ECharts defaults
     // nameLocation to "end", which strands the x-axis title at the extreme
     // right edge (and clips it on single-axis charts) instead of centring
-    // it under the axis line.
+    // it under the axis line. The y-axis title had the same bug: it
+    // rendered horizontally at the TOP of the axis line instead of centred
+    // on it.
+    //
+    // containLabel only reserves room for the tick LABELS -- the centred
+    // axis NAME is painted away from the axis line and needs its own slice
+    // of the grid margin, otherwise it renders past the canvas edge and
+    // clips (seen on the categorical bar live preview). Reserve label room
+    // + nameGap + the title's font size whenever an axis title exists.
+    var xAxisTitleSize = Number(typography && typography.axis_title_size || 12);
     [].concat(option.xAxis || []).forEach(function (axis) {
       if (axis && axis.name && !axis.nameLocation) {
         axis.nameLocation = "middle";
         axis.nameGap = Number(axis.nameGap || 26);
+        if (option.grid && typeof option.grid.bottom === "number") {
+          option.grid.bottom += axis.nameGap + xAxisTitleSize + 4;
+        }
+      }
+    });
+    var yAxisTitleSize = Number(typography && typography.axis_title_size || 12);
+    [].concat(option.yAxis || []).forEach(function (axis) {
+      if (axis && axis.name && !axis.nameLocation) {
+        axis.nameLocation = "middle";
+        // A vertical axis reads best with its title rotated alongside the
+        // line. ECharts draws a y-axis name unrotated (horizontal) by
+        // default, so without this the centred title still sits flat.
+        if (axis.nameRotate === undefined || axis.nameRotate === null) axis.nameRotate = 90;
+        // Gap between the axis line and the rotated title: wide enough to
+        // clear the tick labels (containLabel only reserves those, not the
+        // name), then the name itself.
+        axis.nameGap = Number(axis.nameGap || 56);
+        if (option.grid && typeof option.grid === "object") {
+          var pad = axis.nameGap + yAxisTitleSize + 4;
+          if ((axis.position || "left") === "right") {
+            if (typeof option.grid.right === "number") option.grid.right += pad;
+          } else if (typeof option.grid.left === "number") {
+            option.grid.left += pad;
+          }
+        }
       }
     });
     if (display.empty_message) {
@@ -1053,45 +1189,183 @@
     return option;
   }
 
+  function satelliteTileWindow(chart, coordTarget, root, display) {
+    // Recover the VISIBLE lon/lat window without ECharts' pixel→data API.
+    // That API (convertFromPixel) returns the raw projected-plane coordinate
+    // for custom projections, NOT lon/lat degrees -- feeding it into the old
+    // tile maths placed every imagery tile at the far-east edge and left the
+    // rest of the map unpainted ("satellite image glitch out" once zoomed).
+    // The geo similarity transform is uniform scale + translation, so two
+    // longitude probes pin it exactly: pixel = a·plane + t with t = pixel(0,0).
+    var probes = null;
+    if (chart && typeof chart.convertToPixel === "function" && coordTarget) {
+      try {
+        var p00 = chart.convertToPixel(coordTarget, [0, 0]);
+        var p10 = chart.convertToPixel(coordTarget, [1, 0]);
+        if (p00 && p10 && isFinite(p00[0]) && isFinite(p00[1]) &&
+            isFinite(p10[0]) && isFinite(p10[1])) {
+          var a = (p10[0] - p00[0]) * 180 / Math.PI;
+          if (isFinite(a) && Math.abs(a) > 1e-6) probes = {p00: p00, perRadian: a};
+        }
+      } catch (_) { probes = null; }
+    }
+    var width = root && root.clientWidth || 600, height = root && root.clientHeight || 320;
+    if (probes) {
+      var perRadian = probes.perRadian, origin = probes.p00;
+      function toLonLat(px, py) {
+        var planeX = (px - origin[0]) / perRadian;
+        var planeY = (py - origin[1]) / perRadian;
+        var lon = planeX * 180 / Math.PI;
+        var lat = (2 * Math.atan(Math.exp(-planeY)) - Math.PI / 2) * 180 / Math.PI;
+        return [Math.max(-180, Math.min(180, lon)),
+                Math.max(-85.05112878, Math.min(85.05112878, lat))];
+      }
+      var nw = toLonLat(0, 0), se = toLonLat(width, height);
+      return {lonW: Math.min(nw[0], se[0]), lonE: Math.max(nw[0], se[0]),
+              latN: Math.max(nw[1], se[1]), latS: Math.min(nw[1], se[1]),
+              pxPerDeg: Math.abs(perRadian) * Math.PI / 180};
+    }
+    // Fallback when the chart cannot report its layout yet (very first frame):
+    // estimate the window from the configured centre/zoom.
+    var center = Array.isArray(display.map_center) ? display.map_center : [0, 0];
+    var rootW = root && root.clientWidth || 600, rootH = root && root.clientHeight || 320;
+    var zoom = effectiveFrameZoom(display, rootW, rootH, Number(display.map_zoom || 1));
+    var halfW = 180 / zoom, halfH = halfW * (height / Math.max(1, width)) * 1.35;
+    return {lonW: Math.max(-180, center[0] - halfW), lonE: Math.min(180, center[0] + halfW),
+            latN: Math.min(85, center[1] + halfH), latS: Math.max(-85, center[1] - halfH),
+            pxPerDeg: 0.92 * Math.min(width, height) * zoom / 360};
+  }
+
+  function satelliteTiles(win) {
+    var level = Math.max(2, Math.min(13,
+      Math.round(Math.log2(Math.max(1e-6, win.pxPerDeg) * 360 / 260))));
+    function mercY(latDeg) {
+      var phi = Math.max(-85.05112878, Math.min(85.05112878, latDeg)) * Math.PI / 180;
+      return (1 - Math.asinh(Math.tan(phi)) / Math.PI) / 2;
+    }
+    function latOfTile(y, count) {
+      return Math.atan(Math.sinh(Math.PI * (1 - 2 * y / count))) * 180 / Math.PI;
+    }
+    for (;;) {
+      var count = Math.pow(2, level), spanDeg = 360 / count, tiles = [];
+      var x0 = Math.max(0, Math.floor((win.lonW + 180) / spanDeg));
+      var x1 = Math.min(count - 1, Math.floor((win.lonE + 180) / spanDeg));
+      var y0 = Math.max(0, Math.floor(mercY(win.latN) * count));
+      var y1 = Math.min(count - 1, Math.floor(mercY(win.latS) * count));
+      for (var y = y0; y <= y1; y++) {
+        for (var x = x0; x <= x1; x++) {
+          tiles.push({x: x, y: y,
+            west: x * spanDeg - 180, east: (x + 1) * spanDeg - 180,
+            north: latOfTile(y, count), south: latOfTile(y + 1, count),
+            url: "https://services.arcgisonline.com/ArcGIS/rest/services/" +
+                 "World_Imagery/MapServer/tile/" + level + "/" + y + "/" + x});
+        }
+      }
+      if (tiles.length <= 56 || level >= 13) return {level: level, tiles: tiles};
+      level++;
+    }
+  }
+
+  function satelliteTileSeries(sized) {
+    // One custom geo series, rendered BY THE SAME PIPELINE that draws the
+    // polygons and dots: the imagery therefore tracks every zoom/pan with no
+    // screen-space math, no georoam bookkeeping and no possible drift.
+    return {
+      id: "lytrize-satellite", name: "Satellite imagery", type: "custom",
+      coordinateSystem: "geo", silent: true, animation: false, clip: true,
+      z: 0,
+      dimensions: ["west", "south", "east", "north", "url"],
+      encode: {x: "west", y: "south"},
+      renderItem: function (params, api) {
+        var nw = api.coord([api.value(0), api.value(3)]);
+        var se = api.coord([api.value(2), api.value(1)]);
+        if (!nw || !se || !isFinite(nw[0]) || !isFinite(nw[1]) ||
+            !isFinite(se[0]) || !isFinite(se[1])) return;
+        var x = Math.min(nw[0], se[0]), y = Math.min(nw[1], se[1]);
+        var width = Math.abs(se[0] - nw[0]), height = Math.abs(se[1] - nw[1]);
+        if (width <= 0 || height <= 0) return;
+        return {type: "image", silent: true,
+          shape: {x: x, y: y, width: width, height: height},
+          style: {image: api.value(4)}};
+      },
+      data: sized.tiles.map(function (tile) {
+        return [tile.west, tile.south, tile.east, tile.north, tile.url];
+      }),
+    };
+  }
+
   function applySatelliteBasemap(chart, model, root) {
     if (!model || model.chart_type !== "map_plot") return;
-    var display = model && model.display || {};
+    var display = (model && model.display) || {};
     var active = String(display.map_basemap || "").toLowerCase() === "satellite";
     var graphics = [];
     if (active && chart && root && typeof chart.convertToPixel === "function") {
-      var center = display.map_center || [0, 0];
       var state = chart.getOption() || {};
-      var mapSeries = (state.series || []).find(function (item) { return item.type === "map"; });
-      var mapSeriesIndex = (state.series || []).indexOf(mapSeries);
-      var coordTarget = mapSeries ? {seriesIndex: mapSeriesIndex} : {geoIndex: 0};
-      try { center = chart.convertFromPixel(coordTarget, [root.clientWidth / 2, root.clientHeight / 2]) || center; }
-      catch (_) { /* use the configured starting center */ }
-      var zoom = Number((mapSeries && mapSeries.zoom) ||
-        ((state.geo || [])[0] && (state.geo[0].zoom)) || display.map_zoom || 1);
-      var level = Math.max(1, Math.min(13, Math.round(Math.log2(Math.max(1, zoom))) + 2));
-      var count = Math.pow(2, level);
-      var cx = (Number(center[0]) + 180) / 360 * count;
-      var cy = (1 - Math.asinh(Math.tan(Math.max(-85, Math.min(85, Number(center[1]))) * Math.PI / 180)) / Math.PI) / 2 * count;
-      var radius = Math.ceil(count / Math.max(2, zoom * 2)) + 1;
-      function tileLat(y) { return Math.atan(Math.sinh(Math.PI * (1 - 2 * y / count))) * 180 / Math.PI; }
-      for (var y = Math.max(0, Math.floor(cy) - radius); y <= Math.min(count - 1, Math.floor(cy) + radius); y++) {
-        for (var x = Math.max(0, Math.floor(cx) - radius); x <= Math.min(count - 1, Math.floor(cx) + radius); x++) {
-          var west = x / count * 360 - 180, east = (x + 1) / count * 360 - 180;
-          var north = tileLat(y), south = tileLat(y + 1);
+      var series = state.series || [];
+      var mapSeriesIndex = -1;
+      for (var i = 0; i < series.length; i++) {
+        if (series[i] && series[i].type === "map") { mapSeriesIndex = i; break; }
+      }
+      var geoComponent = state.geo && (Array.isArray(state.geo) ? state.geo[0] : state.geo);
+      var hasGeo = !!(geoComponent && (geoComponent.map || geoComponent.id));
+      var coordTarget = hasGeo ? {geoIndex: 0}
+        : (mapSeriesIndex >= 0 ? {seriesIndex: mapSeriesIndex} : null);
+      var win = coordTarget ? satelliteTileWindow(chart, coordTarget, root, display) : null;
+      var tileIds = [];
+      if (win) {
+        var sized = satelliteTiles(win);
+        if (hasGeo) {
+          // Scatter/density maps: imagery rides the geo pipeline via a custom
+          // series, tracking every roam frame with no screen-space math.
           try {
-            var nw = chart.convertToPixel(coordTarget, [west, north]);
-            var se = chart.convertToPixel(coordTarget, [east, south]);
-            if (!nw || !se || !Number.isFinite(nw[0]) || !Number.isFinite(se[1])) continue;
-            graphics.push({id: "lytrize-imagery-" + x + "-" + y,
-              type: "image", left: Math.min(nw[0], se[0]), top: Math.min(nw[1], se[1]),
-              z: -10, silent: true,
-              style: {image: "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/" + level + "/" + y + "/" + x,
-                width: Math.abs(se[0] - nw[0]), height: Math.abs(se[1] - nw[1])}});
-          } catch (_) { /* ignore tiles outside the active map projection */ }
+            chart.setOption({series: [satelliteTileSeries(sized)]});
+          } catch (e) {
+            log.error("Lytrize ECharts adapter: satellite imagery failed: " + e);
+          }
+        } else if (mapSeriesIndex >= 0) {
+          // Choropleth maps have no geo component for a custom series to ride;
+          // drop axis-aligned imagery tiles in as graphic images positioned by
+          // the same two-probe affine. Stale tiles from a previous window are
+          // removed explicitly via $action -- foreign graphic elements (title,
+          // attribution) are never touched.
+          var level = sized.level;
+          var images = [];
+          for (var t = 0; t < sized.tiles.length; t++) {
+            var tile = sized.tiles[t];
+            try {
+              var pNw = chart.convertToPixel(coordTarget, [tile.west, tile.north]);
+              var pSe = chart.convertToPixel(coordTarget, [tile.east, tile.south]);
+              if (!pNw || !pSe || !isFinite(pNw[0]) || !isFinite(pNw[1]) ||
+                  !isFinite(pSe[0]) || !isFinite(pSe[1])) continue;
+              var imgX = Math.min(pNw[0], pSe[0]), imgY = Math.min(pNw[1], pSe[1]);
+              var imgW = Math.abs(pSe[0] - pNw[0]), imgH = Math.abs(pSe[1] - pNw[1]);
+              if (imgW <= 0 || imgH <= 0) continue;
+              var tileId = "lytrize-satellite-" + level + "-" + tile.x + "-" + tile.y;
+              tileIds.push(tileId);
+              images.push({id: tileId, type: "image", silent: true, z: 0,
+                style: {image: tile.url, x: imgX, y: imgY, width: imgW, height: imgH}});
+            } catch (tileErr) { /* skip this tile */ }
+          }
+          var previous = chart.__lytrizeTileIds || [];
+          var stale = previous.filter(function (id) { return tileIds.indexOf(id) < 0; });
+          try {
+            if (stale.length) {
+              chart.setOption({graphic: stale.map(function (id) {
+                return {id: id, $action: "remove"};
+              })});
+            }
+            if (images.length) {
+              chart.setOption({graphic: images});
+            }
+          } catch (e) {
+            log.error("Lytrize ECharts adapter: choropleth satellite imagery failed: " + e);
+          }
+          chart.__lytrizeTileIds = tileIds;
         }
       }
-      graphics.push({id: "lytrize-imagery-attribution", type: "text", right: 8, bottom: 5,
-        z: 20, silent: true, style: {text: "Powered by Esri | Imagery © Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+      graphics.push({id: "lytrize-imagery-attribution", type: "text",
+        right: 8, bottom: 5, z: 20, silent: true,
+        style: {text: "Powered by Esri | Imagery © Esri, Maxar, Earthstar Geographics, and the GIS User Community",
           fill: "#fff", backgroundColor: "rgba(0,0,0,.65)", padding: [3, 5],
           font: "11px sans-serif"}});
     }
@@ -1101,9 +1375,12 @@
           fill: display.text_color || "#fff", backgroundColor: "rgba(0,0,0,.58)",
           padding: [4, 6], font: "12px sans-serif"}});
     }
-    if (chart && typeof chart.setOption === "function") {
+    if (chart && typeof chart.setOption === "function" && graphics.length) {
       try {
-        chart.setOption({graphic: graphics}, {replaceMerge: ["graphic"], lazyUpdate: true});
+        // Merge BY ID: every element created elsewhere (colour-bar/legend
+        // titles) keeps its id, so adding the imagery attribution must not
+        // evict or collide with it. replaceMerge would wipe foreign elements.
+        chart.setOption({graphic: graphics});
       } catch (e) {
         log.error("Lytrize ECharts adapter: setOption failed: " + e);
       }

@@ -259,7 +259,3 @@ class MatrixHeatmapSettings(CorrelationSettings):
                 combo.blockSignals(False)
         self._mark_dirty(emit=True)
 
-    def build_typography(self):
-        root = super().build_typography()
-        self._mask_rows(root, ("Value size", "Value color", "Value Color"))
-        return root

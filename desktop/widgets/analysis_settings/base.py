@@ -1,5 +1,6 @@
 """Shared flat-section helpers + 3-tab builder contract (no cards)."""
 from __future__ import annotations
+import math
 import logging
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPalette, QStandardItem, QStandardItemModel
@@ -615,6 +616,54 @@ def colorbar_position_row(layout_opts, on_change, label='Colorbar pos',
     wrap._pos = pos
     wrap._orient = orient
     return grid_row(label, wrap), pos, orient
+
+def exp_slider_with_readout(maximum, value, k=2.0, readout_width=60, decimals=2):
+    """A non-linear slider whose response is an exponential approach curve.
+
+    The linear 0..max slider left more than half its travel below the point
+    where the chart visibly reacts ("bar gap" report, 2026-11-24). The wire is
+    ``value = maximum * (1 - exp(-k * t)) / (1 - exp(-k))`` for slider fraction
+    ``t`` in [0, 1]: equal travel buys more change near zero and less near the
+    far end, so the whole slider does something useful. The spin box still
+    reads and writes the REAL value, linearly, so typing 0.35 gives exactly
+    0.35 -- only the drag mapping is warped.
+    """
+    maximum = float(maximum)
+    k = float(k) or 2.0
+    norm = 1.0 - math.exp(-k)
+
+    def pos_to_value(pos):  # pos: 0..100 -> value in [0, maximum]
+        t = max(0.0, min(1.0, float(pos) / 100.0))
+        return maximum * (1.0 - math.exp(-k * t)) / norm
+
+    def value_to_pos(val):  # value -> 0..100 slider position
+        v = max(0.0, min(maximum, float(val)))
+        if maximum <= 0:
+            return 0
+        return int(round(100.0 * (-math.log(max(1e-9, 1.0 - v / maximum * norm))) / k))
+
+    wrap = QWidget()
+    hl = QHBoxLayout(wrap)
+    hl.setContentsMargins(0, 0, 0, 0)
+    hl.setSpacing(6)
+    sl = QSlider(Qt.Horizontal)
+    sl.setRange(0, 100)
+    sl.setValue(value_to_pos(value))
+    sl.setSingleStep(1)
+    hl.addWidget(sl, stretch=1)
+    spin = QDoubleSpinBox()
+    spin.setRange(0.0, maximum)
+    spin.setDecimals(decimals)
+    spin.setSingleStep(0.01)
+    spin.setValue(float(value))
+    spin.setFixedWidth(readout_width)
+    hl.addWidget(spin)
+    sl.valueChanged.connect(lambda p: spin.setValue(pos_to_value(p)))
+    spin.valueChanged.connect(lambda v: sl.setValue(value_to_pos(v)))
+    wrap._as_slider = sl
+    wrap._as_spin = spin
+    return wrap
+
 
 def slider_with_readout(minimum, maximum, value, is_int=True, step=1, readout_width=60):
     wrap = QWidget()

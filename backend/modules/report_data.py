@@ -12,6 +12,7 @@ caller's responsibility; this module never samples.
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from typing import Any, Optional
 
 log = logging.getLogger(__name__)
@@ -127,6 +128,15 @@ def build_report_payload(df, recipes: dict, slicers: Optional[list],
         cols = payload_columns(recipes, slicers, kpis)
         frame_cols = list(df.columns)
         cols = [c for c in cols if c in frame_cols]
+        try:
+            schema_sig = tuple((name, str(getattr(df, "dtypes", {}).get(name, "")))
+                               for name in frame_cols) + (int(len(df)),)
+        except Exception:
+            schema_sig = tuple(frame_cols) + (int(len(df)),)
+        source_id = (df, int(len(df)))
+        cached = _payload_cache_get(source_id, schema_sig, cols)
+        if cached is not None:
+            return cached
         total = int(len(df))
         if not cols:
             return dict(empty, total_rows=total)
@@ -173,11 +183,59 @@ def build_report_payload(df, recipes: dict, slicers: Optional[list],
                         dtypes[col] = "string"
             except Exception:
                 dtypes[col] = "string"
-        return {"columns": cols, "rows": rows, "dtypes": dtypes,
-                "truncated": False, "total_rows": total}
+        return _payload_cache_put(
+            source_id, schema_sig, cols,
+            {"columns": cols, "rows": rows, "dtypes": dtypes,
+             "truncated": False, "total_rows": total})
     except Exception:
         log.warning("build_report_payload failed; static export", exc_info=True)
         return empty
+
+
+def _payload_cache_key(source_id, schema_sig, cols):
+    # The frame itself is UNHASHABLE, so it can never sit in the key; use its
+    # id plus the stored length, and keep a strong reference to the frame
+    # inside the cache entry so the id cannot be recycled while it lives.
+    frame = source_id[0] if isinstance(source_id, tuple) else source_id
+    extra = source_id[1] if isinstance(source_id, tuple) and len(source_id) > 1 else 0
+    try:
+        extra_key = int(extra)
+    except (TypeError, ValueError):
+        # e.g. the Polars path keys the frame by its revision signature
+        extra_key = str(extra)
+    return (id(frame), extra_key, tuple(schema_sig), tuple(cols))
+
+
+def _payload_cache_get(source_id, schema_sig, cols):
+    frame = source_id[0] if isinstance(source_id, tuple) else source_id
+    key = _payload_cache_key(source_id, schema_sig, cols)
+    hit = _PAYLOAD_CACHE.get(key)
+    if hit is None:
+        return None
+    ref, payload = hit
+    if ref is not None and frame is not ref:
+        # The dict value holds a strong ref, so the live object always wins
+        # and a recycled address can never alias here -- belt and braces.
+        return None
+    _PAYLOAD_CACHE.move_to_end(key)
+    return payload
+
+
+def _payload_cache_put(source_id, schema_sig, cols, payload):
+    frame = source_id[0] if isinstance(source_id, tuple) else source_id
+    key = _payload_cache_key(source_id, schema_sig, cols)
+    # Keep a strong reference to the source object alongside the payload so
+    # the id() in the key can never be recycled by a different frame while
+    # this entry lives. Payloads are the biggest thing in the cache; 3 slots
+    # is a deliberate ceiling.
+    _PAYLOAD_CACHE[key] = (frame, payload)
+    while len(_PAYLOAD_CACHE) > _PAYLOAD_CACHE_MAX:
+        _PAYLOAD_CACHE.popitem(last=False)
+    return payload
+
+
+_PAYLOAD_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_PAYLOAD_CACHE_MAX = 3
 
 
 def build_report_payload_polars(dataset, recipes: dict,
@@ -196,6 +254,19 @@ def build_report_payload_polars(dataset, recipes: dict,
         cols = payload_columns(recipes, slicers, kpis)
         schema = dataset.schema
         cols = [c for c in cols if c in schema]
+        schema_sig = tuple(sorted((name, str(dtype))
+                                  for name, dtype in schema.items()))
+        # The cache stores a strong reference to the dataset (see
+        # _payload_cache_put), so the object cannot be recycled while an
+        # entry lives; updating the same dataset in place is guarded by its
+        # revision, the path+mtime signature the engine computed at
+        # construction time.
+        source_id = (dataset, str(getattr(dataset, "revision", "")))
+        cached = _payload_cache_get(source_id, schema_sig, cols)
+        if cached is not None:
+            # Same dataset object, same pruned columns: the collect and the
+            # per-value conversion are reusable as-is.
+            return cached
         if not cols:
             try:
                 total = int(dataset.frame.select("__row_id__").count()
@@ -226,8 +297,10 @@ def build_report_payload_polars(dataset, recipes: dict,
                     dtypes[col] = "string"
             except Exception:
                 dtypes[col] = "string"
-        return {"columns": cols, "rows": rows, "dtypes": dtypes,
-                "truncated": False, "total_rows": total}
+        return _payload_cache_put(
+            source_id, schema_sig, cols,
+            {"columns": cols, "rows": rows, "dtypes": dtypes,
+             "truncated": False, "total_rows": total})
     except Exception:
         log.warning("build_report_payload_polars failed; static export",
                     exc_info=True)

@@ -13,7 +13,6 @@ import re
 from typing import Any, Optional
 
 import numpy as np
-import pandas as pd
 
 from modules.charts import (
     PALETTES,
@@ -27,6 +26,91 @@ from modules.charts import (
 )
 
 log = logging.getLogger(__name__)
+
+
+# -- Chart-recipe result cache -------------------------------------------
+#
+# The slicer re-run path re-executes every affected chart recipe over the
+# filtered frame on every rebuild. The filter itself is computed once per
+# distinct applicable-slicer set, but ``run_chart_recipe`` -- the groupby /
+# aggregation / model construction -- ran again even when NOTHING about the
+# inputs had changed since the last rebuild. This cache keys the rebuilt
+# ``(uid, title, model)`` tuple on the exact inputs of the rebuild:
+#
+#   * the parent DataFrame's content (polars ``hash_rows`` over the full
+#     frame; row order is included, so a reordered frame is a miss rather
+#     than a wrong hit),
+#   * the canonical form of the slicers applicable to this chart
+#     (``slicer_service.slicers_for_chart`` semantics),
+#   * the canonical form of the recipe itself.
+#
+# Correctness over hit rate: there is no "close enough" path -- any change
+# to the data, the selection or the recipe misses. A frame we cannot
+# fingerprint (non-polars, or a failure inside hash_rows) bypasses the
+# cache entirely rather than guessing.
+_RECIPE_CACHE_MAX = 32
+_RECIPE_CACHE: "OrderedDict[str, tuple]" = None  # lazily created
+
+
+def _recipe_cache():
+    global _RECIPE_CACHE
+    if _RECIPE_CACHE is None:
+        from collections import OrderedDict
+        _RECIPE_CACHE = OrderedDict()
+    return _RECIPE_CACHE
+
+
+def _canonical_json(obj: Any) -> str:
+    try:
+        return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False, default=str)
+    except Exception:
+        return repr(obj)
+
+
+def frame_fingerprint(df: Any) -> Optional[str]:
+    """Exact content fingerprint of a polars frame, or None if unavailable."""
+    hash_rows = getattr(df, "hash_rows", None)
+    if not callable(hash_rows):
+        return None
+    try:
+        import hashlib
+        digest = hashlib.sha1()
+        rows = hash_rows()
+        digest.update(rows.rechunk().to_numpy().tobytes())
+        return digest.hexdigest()
+    except Exception:
+        log.debug("frame fingerprint unavailable; recipe cache bypassed",
+                  exc_info=True)
+        return None
+
+
+def recipe_cache_key(df_fingerprint: str, applicable_slicers, recipe) -> str:
+    """Content key for one chart's rebuilt output."""
+    import hashlib
+    payload = [str(df_fingerprint),
+               _canonical_json(list(applicable_slicers or [])),
+               _canonical_json(recipe or {})]
+    return hashlib.sha1(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def recipe_cache_get(key: str):
+    cache = _recipe_cache()
+    entry = cache.pop(key, None)
+    if entry is not None:
+        cache[key] = entry  # most recently used
+    return entry
+
+
+def recipe_cache_put(key: str, value) -> None:
+    if value is None:
+        return
+    cache = _recipe_cache()
+    cache.pop(key, None)
+    cache[key] = value
+    while len(cache) > _RECIPE_CACHE_MAX:
+        cache.popitem(last=False)
+
 
 # Re-export the static constants so the Qt UI can use them directly
 __all__ = [
@@ -42,6 +126,10 @@ __all__ = [
     "serialize_chart",
     "deserialize_chart",
     "run_chart_recipe",
+    "frame_fingerprint",
+    "recipe_cache_key",
+    "recipe_cache_get",
+    "recipe_cache_put",
     "recipe_columns",
     "num_cols",
     "cat_cols",
@@ -395,7 +483,7 @@ def recipe_columns(recipe: dict) -> set:
     return out
 
 
-def run_chart_recipe(recipe: dict, df: pd.DataFrame, *,
+def run_chart_recipe(recipe: dict, df: Any, *,
                      roles: Optional[dict] = None) -> Optional[tuple]:
     """Re-execute one saved chart against a (possibly filtered) DataFrame.
 
@@ -494,7 +582,7 @@ def run_chart_recipe(recipe: dict, df: pd.DataFrame, *,
     return _rebuild_one(recipe, chart_type, df, roles=roles)
 
 
-def _rebuild_one(recipe: dict, chart_type: str, df: pd.DataFrame, *,
+def _rebuild_one(recipe: dict, chart_type: str, df: Any, *,
                  roles: Optional[dict] = None) -> Optional[tuple]:
     """Build one semantic model from *recipe*, preserving the chart's uid.
 

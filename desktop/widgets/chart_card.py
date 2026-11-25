@@ -186,7 +186,7 @@ class ChartCard(QFrame):
         self.btn_slicer.setProperty("kind", "icon")
         self.btn_slicer.clicked.connect(
             lambda: self.slicer_requested.emit(self.uid))
-        header.addWidget(self.btn_slicer)
+        self.btn_slicer.setVisible(False)
 
         self.btn_style = QPushButton("🎨")
         self.btn_style.setFixedSize(28, 28)
@@ -274,6 +274,13 @@ class ChartCard(QFrame):
         # Back-compat alias: the corner is "the" resize handle, which is what
         # set_tiling_enabled() and the dashboard page already refer to.
         self.resize_handle = self.resize_handles["corner"]
+        # Tiling chrome is opt-in and no view opts in any more (the dashboard
+        # is the report document; the Analysis page shows one chart at a
+        # time). Constructing every card with the grip and the three resize
+        # glyphs visible meant the Analysis tab offered "drag me" handles that
+        # nothing would ever act on. Start hidden; set_tiling_enabled(True)
+        # re-shows them for a caller that genuinely tiles.
+        self.set_tiling_enabled(False)
         # Widgets sharing a grid cell are z-ordered by insertion; the bar is
         # added second so it is already in front, and raise_() makes that
         # explicit and survives later re-layouts of the plot.

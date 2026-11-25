@@ -154,15 +154,28 @@ def _parse_datetime_robust(series: Any) -> pl.Series:
     date_fmts = (("%d/%m/%Y", "%m/%d/%Y") if dayfirst
                  else ("%m/%d/%Y", "%d/%m/%Y"))
     for fmt in date_fmts:
-        result = _fill_datetimes(result, s.str.to_datetime(fmt, strict=False))
-        if result.null_count() == 0:
+        try:
+            parsed = s.str.to_datetime(fmt, strict=False)
+        except Exception:
+            # Explicit format that cannot parse anything raises ComputeError
+            # rather than returning all-null; treat as "no matches".
+            parsed = None
+        result = _fill_datetimes(result, parsed)
+        if result is not None and result.null_count() == 0:
             return result
 
     # Second pass: the loose parser (handles "2019-04-22 16:02:01" and
     # ISO-8601 with a T).
-    result = _fill_datetimes(result, s.str.to_datetime(strict=False))
-    if result.null_count() == 0:
-        return result
+    try:
+        loose = s.str.to_datetime(strict=False)
+    except Exception:
+        # The loose parser raises ComputeError when nothing can be parsed at
+        # all; a column of garbage must yield all-null, never an exception.
+        loose = None
+    if loose is not None:
+        result = _fill_datetimes(result, loose)
+        if result.null_count() == 0:
+            return result
 
     # Third pass: the time-oriented formats.
     normalised = (s.str.to_uppercase()

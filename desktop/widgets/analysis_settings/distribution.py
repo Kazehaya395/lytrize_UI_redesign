@@ -20,7 +20,7 @@ Design note (why this subclasses StatisticalSettings):
 """
 from __future__ import annotations
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLineEdit, QCheckBox
-from .base import (hint_label, cap_widget, multi_select_combo, slider_with_readout, legend_position_row, legend_orientation_row, GEN_W, HINT_GAP, SECTION_GAP, page_root, section_box, grid_row, FlowGrid)
+from .base import (hint_label, cap_widget, multi_select_combo, slider_with_readout, exp_slider_with_readout, legend_position_row, legend_orientation_row, GEN_W, HINT_GAP, SECTION_GAP, page_root, section_box, grid_row, FlowGrid)
 from .statistical import StatisticalSettings, NONE_SENTINEL, LPOS, BMODES
 
 # GEN_W (the compact Generate field width) now comes from ``.base`` so the
@@ -231,7 +231,7 @@ class DistributionSettings(StatisticalSettings):
         self._cb_bmode.setCurrentText(str(self._layout_opts.get('bar_mode', 'group')))
         self._cb_bmode.currentTextChanged.connect(lambda t: self._set_layout(bar_mode=t))
         rr.addWidget(grid_row('Bar mode', self._cb_bmode))
-        gap = slider_with_readout(0.0, 0.9, float(self._layout_opts.get('bar_gap', 0.28)), is_int=False, step=0.01)
+        gap = exp_slider_with_readout(0.9, float(self._layout_opts.get('bar_gap', 0.28)), k=2.0)
         self._gap_slider = gap._as_slider
         self._gap_spin = gap._as_spin
         try:

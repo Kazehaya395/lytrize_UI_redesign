@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -93,6 +94,35 @@ def save_dataset(df: Optional[pd.DataFrame]) -> tuple[str, str]:
         PolarsDataset = ()
     if isinstance(df, PolarsDataset):
         return save_polars_dataset(df)
+    try:
+        import polars as pl  # the desktop bridge hands down pl.DataFrame
+    except Exception:
+        pl = None
+    if pl is not None and isinstance(df, pl.DataFrame):
+        # Same content-addressing as the lazy path: write once, hash the
+        # artifact, store under its digest. Dedups repeat saves of an
+        # unchanged board without ever routing through pandas.
+        try:
+            if df.height == 0:
+                return "", ""
+            root = _bundle_dir()
+            tmp = root / f".eager-{os.getpid()}-{hashlib.sha1(repr(df.shape).encode()).hexdigest()[:8]}.parquet.tmp"
+            df.write_parquet(tmp)
+            digest = hashlib.sha256()
+            with tmp.open("rb") as saved:
+                for chunk in iter(lambda: saved.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            frame_hash = digest.hexdigest()
+            uri = f"{frame_hash}.parquet"
+            target = root / uri
+            if target.exists():
+                tmp.unlink(missing_ok=True)
+            else:
+                tmp.replace(target)
+            return frame_hash, uri
+        except Exception as exc:
+            log.warning("session_bundle: could not persist Polars dataset: %s", exc)
+            return "", ""
     try:
         if len(df) == 0:
             return "", ""

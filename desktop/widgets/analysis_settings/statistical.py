@@ -2,7 +2,7 @@
 from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLineEdit, QCheckBox, QPushButton, QLabel, QSizePolicy
-from .base import (AnalysisSettingsBase, section_label, hint_label, cap_widget, multi_select_combo, slider_with_readout, color_swatch, live_preview_label, apply_preview_font, legend_position_row, legend_orientation_row, colorbar_position_row, COMPACT_W, GEN_W, PAGE_MARGINS, PAGE_SPACING, ROW_SPACING, HINT_GAP, SECTION_GAP, page_root, section_box, grid_row, FlowGrid)
+from .base import (AnalysisSettingsBase, section_label, hint_label, cap_widget, multi_select_combo, slider_with_readout, exp_slider_with_readout, color_swatch, live_preview_label, apply_preview_font, legend_position_row, legend_orientation_row, colorbar_position_row, COMPACT_W, GEN_W, PAGE_MARGINS, PAGE_SPACING, ROW_SPACING, HINT_GAP, SECTION_GAP, page_root, section_box, grid_row, FlowGrid)
 from desktop.theme import group_label_style
 NONE_SENTINEL = ''
 # The "no grouping" entry renders as a blank field, not the literal word
@@ -10,28 +10,27 @@ NONE_SENTINEL = ''
 # and the backend already treats both '' and 'None' as "no grouping"
 # (see analysis_service._single_choice_value), so a blank is unambiguous.
 # The hint under the field carries the meaning instead.
-# Only offer font families that are actually installed. Offering 33 names when
-# the machine has 5 of them is what made the picker look broken: every missing
-# family silently fell back to the same default, so most choices changed
-# nothing. chart_display.available_fonts() resolves this from fontconfig once
-# and caches it; the static list stays as the ordered wish-list.
-_FONT_WISHLIST = ['Inter', 'Source Sans 3', 'Noto Sans', 'DejaVu Sans',
-                  'Lato', 'Ubuntu', 'Arial', 'Calibri', 'Verdana', 'Oswald',
-                  'Barlow Condensed', 'Noto Serif', 'DejaVu Serif',
-                  'EB Garamond', 'Georgia', 'Times New Roman', 'Fira Code',
-                  'DejaVu Sans Mono', 'JetBrains Mono', 'Liberation Mono',
-                  'Courier New', 'Comic Sans MS', 'Impact', 'Trebuchet MS',
-                  'Helvetica', 'Palatino Linotype', 'Candara', 'Corbel',
-                  'Constantia', 'Lucida Console', 'Consolas', 'Sora',
-                  'Cambria']
+# The picker offers every family the app bundles (chart_display.available_fonts
+# resolves the bundled set plus any fontconfig-visible extras, once and cached).
+# Every offered name renders in Qt previews, on the chart, and in exports --
+# no missing-family silent fallbacks.
+# (The wish-list that used to live here was superseded by available_fonts().)
 
 
 def _fonts() -> list:
-    """Installed font choices, with the app defaults first when present."""
+    """Picker choices: everything the app bundles first, then anything
+    fontconfig-visible on this machine."""
     try:
         from chart_display import available_fonts
         return [f["family"] for f in available_fonts(prefer=['Inter'])]
     except Exception:
+        try:
+            from font_bundle import bundled_families
+            fams = bundled_families()
+            if fams:
+                return fams
+        except Exception:
+            pass
         return ['DejaVu Sans', 'DejaVu Serif', 'DejaVu Sans Mono']
 
 
@@ -58,7 +57,7 @@ class StatisticalSettings(AnalysisSettingsBase):
             self._layout_opts = {}
             self._typo_opts = {}
         self._pending = {'x': None, 'y': [], 'palette': None}
-        for attr in ('_as_slider', '_as_spin', '_axs_slider', '_axs_spin', '_cb_bmode', '_cb_fam', '_cb_fstyle', '_cb_halign', '_cb_hfont', '_cb_hfstyle', '_cb_legclick', '_cb_legorder', '_cb_legorient', '_cb_legpos', '_cb_lpos', '_ck_border', '_ck_grid', '_ck_vals', '_combo_groupby', '_combo_metrics', '_combo_palette', '_gap_slider', '_gap_spin', '_hs_slider', '_hs_spin', '_le_leg', '_le_title', '_le_x', '_le_y', '_ls_slider', '_ls_spin', '_prev1', '_prev2', '_sw_acol', '_sw_hcol', '_sw_lcol', '_sw_tcol', '_ts_slider', '_ts_spin', '_vs_spin', '_sw_vcol', '_ck_vauto', '_tips_spin', '_sw_tipcol', '_ck_tipauto'):
+        for attr in ('_as_slider', '_as_spin', '_axs_slider', '_axs_spin', '_cb_bmode', '_cb_fam', '_cb_fstyle', '_cb_halign', '_cb_hfont', '_cb_hfstyle', '_cb_legclick', '_cb_legorder', '_cb_legorient', '_cb_legpos', '_cb_lpos', '_ck_border', '_ck_grid', '_ck_vals', '_combo_groupby', '_combo_metrics', '_combo_palette', '_gap_slider', '_gap_spin', '_hs_slider', '_hs_spin', '_le_leg', '_le_title', '_le_x', '_le_y', '_ls_slider', '_ls_spin', '_prev1', '_prev2', '_sw_acol', '_sw_hcol', '_sw_lcol', '_sw_tcol', '_ts_slider', '_ts_spin', '_tips_spin', '_sw_tipcol', '_ck_tipauto'):
             if not hasattr(self, attr):
                 setattr(self, attr, None)
     def prefill(self, values):
@@ -242,7 +241,7 @@ class StatisticalSettings(AnalysisSettingsBase):
                         w.blockSignals(False)
                 except Exception:
                     pass
-            for attr, key, dflt in (("_hs_spin", "header_size", 28), ("_ts_spin", "axis_title_size", 16), ("_axs_spin", "axis_tick_size", 12), ("_ls_spin", "legend_item_size", 11), ("_vs_spin", "value_label_size", 11), ("_tips_spin", "tooltip_size", 12)):
+            for attr, key, dflt in (("_hs_spin", "header_size", 28), ("_ts_spin", "axis_title_size", 16), ("_axs_spin", "axis_tick_size", 12), ("_ls_spin", "legend_item_size", 11), ("_tips_spin", "tooltip_size", 12)):
                 try:
                     w = getattr(self, attr, None)
                     if w is not None:
@@ -266,7 +265,7 @@ class StatisticalSettings(AnalysisSettingsBase):
             except Exception:
                 mode = "light"
             auto_ink = "#f8fafc" if mode == "dark" else "#111827"
-            for attr, key in (("_sw_hcol", "header_color"), ("_sw_tcol", "axis_title_color"), ("_sw_acol", "axis_tick_color"), ("_sw_lcol", "legend_item_color"), ("_sw_vcol", "value_label_color"), ("_sw_tipcol", "tooltip_color")):
+            for attr, key in (("_sw_hcol", "header_color"), ("_sw_tcol", "axis_title_color"), ("_sw_acol", "axis_tick_color"), ("_sw_lcol", "legend_item_color"), ("_sw_tipcol", "tooltip_color")):
                 try:
                     w = getattr(self, attr, None)
                     if w is not None and hasattr(w, "_retint"):
@@ -274,14 +273,14 @@ class StatisticalSettings(AnalysisSettingsBase):
                         w._retint("auto" if value.lower() in ("", "auto", "none") else value)
                 except Exception:
                     pass
-            for attr, key in (("_ck_vauto", "value_label_color"), ("_ck_tipauto", "tooltip_color")):
+            for attr, key in (("_ck_tipauto", "tooltip_color"),):
                 try:
                     check = getattr(self, attr, None)
                     if check is not None:
                         check.blockSignals(True)
                         check.setChecked(str(self._typo_opts.get(key, "auto")).lower() == "auto")
                         check.blockSignals(False)
-                        swatch = getattr(self, "_sw_vcol" if key == "value_label_color" else "_sw_tipcol", None)
+                        swatch = getattr(self, "_sw_tipcol", None)
                         if swatch is not None:
                             swatch.setEnabled(not check.isChecked())
                 except Exception:
@@ -461,7 +460,7 @@ class StatisticalSettings(AnalysisSettingsBase):
         self._cb_bmode.setCurrentText(str(self._layout_opts.get('bar_mode', 'group')))
         self._cb_bmode.currentTextChanged.connect(lambda t: self._set_layout(bar_mode=t))
         rr.addWidget(grid_row('Bar mode', self._cb_bmode))
-        gap = slider_with_readout(0.0, 0.9, float(self._layout_opts.get('bar_gap', 0.28)), is_int=False, step=0.01)
+        gap = exp_slider_with_readout(0.9, float(self._layout_opts.get('bar_gap', 0.28)), k=2.0)
         self._gap_slider = gap._as_slider
         self._gap_spin = gap._as_spin
         try:
@@ -540,13 +539,6 @@ class StatisticalSettings(AnalysisSettingsBase):
         bl.addWidget(grid_row('Font style', self._cb_fstyle, label_w))
         self._prev1 = live_preview_label()
         bl.addWidget(self._prev1)
-        value_size = slider_with_readout(8, 32, int(self._typo_opts.get('value_label_size', 11)))
-        self._vs_spin = value_size._as_spin
-        self._vs_spin.valueChanged.connect(lambda v: self._set_typo(value_label_size=int(v)))
-        bl.addWidget(grid_row('Value size', value_size, label_w))
-        value_color_row, self._ck_vauto, self._sw_vcol = self._auto_color_control(
-            'value_label_color', 'Value color', label_w)
-        bl.addWidget(value_color_row)
         bl.addStretch()
         # -- Column 2: the header (the chart title) + its live preview ------
         hs = slider_with_readout(10, 60, int(self._typo_opts.get('header_size', 28)))
@@ -645,9 +637,9 @@ class StatisticalSettings(AnalysisSettingsBase):
 
         Built as one compact widget and handed to ``grid_row`` -- exactly how
         every other typography control is built -- so the Auto tick and the
-        swatch sit hard against the caption on the same left edge as the Value
-        size / Font style controls, instead of a bespoke row whose spacing
-        drifted away from the rest of the page.
+        swatch sit hard against the caption on the same left edge as the
+        Font style and other column controls, instead of a bespoke row
+        whose spacing drifted away from the rest of the page.
         """
         # Compact group: keep Auto and the swatch immediately together and
         # push any spare horizontal space to the trailing side of the row.
@@ -806,7 +798,7 @@ class StatisticalSettings(AnalysisSettingsBase):
                 pass
         for attr, key in (("_hs_spin", "header_size"), ("_ts_spin", "axis_title_size"),
                           ("_axs_spin", "axis_tick_size"), ("_ls_spin", "legend_item_size"),
-                          ("_vs_spin", "value_label_size"), ("_tips_spin", "tooltip_size")):
+                          ("_tips_spin", "tooltip_size")):
             w = getattr(self, attr, None)
             if w is not None:
                 try:
@@ -822,8 +814,7 @@ class StatisticalSettings(AnalysisSettingsBase):
                     opts[key] = "auto" if val.lower() in ("", "auto", "none") else val
                 except Exception:
                     pass
-        for ck_attr, sw_attr, key in (("_ck_vauto", "_sw_vcol", "value_label_color"),
-                                      ("_ck_tipauto", "_sw_tipcol", "tooltip_color")):
+        for ck_attr, sw_attr, key in (("_ck_tipauto", "_sw_tipcol", "tooltip_color"),):
             ck = getattr(self, ck_attr, None)
             sw = getattr(self, sw_attr, None)
             if ck is not None and sw is not None:

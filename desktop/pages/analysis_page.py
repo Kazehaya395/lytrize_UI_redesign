@@ -1209,7 +1209,8 @@ class AnalysisPage(QWidget):
         dashboard rebuilds itself when it sees ``state_changed("slicers")``.
         """
         df = self.bridge.df
-        if df is None or df.is_empty:
+        if df is None or (hasattr(df, "is_empty") and callable(df.is_empty)
+                          and df.is_empty()):
             QMessageBox.warning(self, "No Data",
                                 "Load a dataset before adding slicers.")
             return

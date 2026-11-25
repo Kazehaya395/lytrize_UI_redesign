@@ -174,9 +174,11 @@ class HomePage(QWidget):
         stats_row.setSpacing(12)
         self.stat_sessions = StatCard("💾", 0, "Sessions Saved")
         self.stat_datasets = StatCard("📂", 0, "Datasets Analyzed")
+        self.stat_reports = StatCard("📄", 0, "Reports Built")
         self.stat_analyses = StatCard("📊", 0, "Analyses Available")
         stats_row.addWidget(self.stat_sessions, 0, Qt.AlignLeft)
         stats_row.addWidget(self.stat_datasets, 0, Qt.AlignLeft)
+        stats_row.addWidget(self.stat_reports, 0, Qt.AlignLeft)
         stats_row.addWidget(self.stat_analyses, 0, Qt.AlignLeft)
         stats_row.addStretch()
         root.addLayout(stats_row)
@@ -363,10 +365,28 @@ class HomePage(QWidget):
         stats = (
             get_user_stats(user_id, analyses_available=analyses_available)
             if user_id
-            else {"sessions": 0, "datasets": 0, "analyses": analyses_available}
+            else {"sessions": 0, "datasets": 0, "reports": 0,
+                  "analyses": analyses_available}
         )
+        # A database that failed at startup must SAY so on the cards that are
+        # reading zero because of it -- otherwise "0 datasets analysed" is
+        # indistinguishable from "the DB is fine and you have not analysed a
+        # dataset yet". The error text goes to a tooltip, not the card face,
+        # so the layout is unchanged when everything is healthy.
+        db_error = self.bridge.get("db_init_error") or ""
+        hint = (
+            f"Statistics are unavailable: the local database could not be "
+            f"opened ({db_error}). Sessions, datasets and reports will show 0 "
+            f"until this is fixed." if db_error else ""
+        )
+        for card in (self.stat_sessions, self.stat_datasets, self.stat_reports):
+            try:
+                card.setToolTip(hint)
+            except Exception:
+                pass
         self.stat_sessions.set_value(stats.get("sessions", 0))
         self.stat_datasets.set_value(stats.get("datasets", 0))
+        self.stat_reports.set_value(stats.get("reports", 0))
         self.stat_analyses.set_value(stats.get("analyses", 0))
 
     def _on_selection_changed(self) -> None:

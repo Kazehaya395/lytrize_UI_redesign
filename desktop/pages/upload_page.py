@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QTableView, QLineEdit, QComboBox, QGroupBox,
     QMessageBox, QProgressBar, QSplitter, QFrame, QTabWidget, QHeaderView,
-    QScrollArea,
+    QScrollArea, QDialog,
 )
 
 from desktop.theme import PAGE_MARGINS
@@ -28,7 +28,7 @@ from desktop.session_bridge import SessionBridge
 from desktop.widgets.dataframe_model import DataFrameModel
 from desktop.widgets.table_index_header import auto_fit_index_header
 from desktop.widgets.resizable_table import apply_table_defaults, fit_columns_to_content
-from desktop.workers import ImportWorker
+from desktop.workers import ImportWorker, DatabaseLoadWorker
 from desktop.pages.column_classifier_panel import ColumnClassifierPanel
 from desktop.pages.column_manager_panel import ColumnManagerPanel
 from desktop.pages.data_cleaner_panel import DataCleanerPanel
@@ -53,6 +53,18 @@ class UploadPage(QWidget):
     def __init__(self, bridge: SessionBridge, parent=None) -> None:
         super().__init__(parent)
         self.bridge = bridge
+        # Drop-in database connectors (plugins/*.py) register their kinds at
+        # import time of this call. Best-effort: a broken add-on must never
+        # block the upload page from loading.
+        try:
+            from services.connector_plugins import load_connector_plugins
+            plugin_result = load_connector_plugins()
+            if plugin_result.failures:
+                log.warning("%d connector add-on(s) failed to load: %s",
+                            len(plugin_result.failures),
+                            [f for f, _ in plugin_result.failures])
+        except Exception:
+            log.exception("connector plugin discovery failed")
         self._model = DataFrameModel()
         self._current_file: Optional[str] = None
 
@@ -103,6 +115,13 @@ class UploadPage(QWidget):
         self.btn_import = QPushButton("📁 Import CSV / Excel")
         self.btn_import.setProperty("kind", "primary")
         header.addWidget(self.btn_import)
+        self.btn_db = QPushButton("🗄 From database…")
+        self.btn_db.setProperty("kind", "ghost")
+        self.btn_db.setToolTip(
+            "Load a table or SQL query from a database (PostgreSQL built in).\n"
+            "A row limit is applied server-side, so an exploratory load\n"
+            "cannot materialise an entire production table.")
+        header.addWidget(self.btn_db)
         root.addLayout(header)
 
         # -- File info --
@@ -268,6 +287,7 @@ class UploadPage(QWidget):
 
     def _connect_signals(self) -> None:
         self.btn_import.clicked.connect(self._on_import)
+        self.btn_db.clicked.connect(self._on_db_import)
         self.btn_go_analysis.clicked.connect(self._on_go_analysis)
         self.preview_mode.currentIndexChanged.connect(self._on_preview_mode)
         self.search_box.textChanged.connect(self._on_search)
@@ -310,12 +330,101 @@ class UploadPage(QWidget):
     def _on_import_finished(self, df: pl.DataFrame) -> None:
         """Handle successful import from the worker thread."""
         path = Path(self._current_file or "")
+        suffix = path.suffix.lower()
+        try:
+            signature = f"{path.name}:{path.stat().st_size}"
+        except OSError:
+            signature = path.name
+        self._ingest_loaded(
+            df, source_name=path.name or "dataset",
+            signature=signature,
+            is_excel=suffix in (".xlsx", ".xls"),
+            display=path.name or "dataset",
+        )
+
+    def _on_db_import(self) -> None:
+        """Open the database connection dialog and load the chosen view."""
+        from desktop.widgets.database_dialog import DatabaseDialog
+
+        dialog = DatabaseDialog(self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        spec = dialog.load_spec()
+        if not spec:
+            return
+        self._db_spec = dict(spec)
+        self.progress.setVisible(True)
+        self.progress.setValue(10)
+        self.btn_db.setEnabled(False)
+        self.btn_import.setEnabled(False)
+        self.lbl_file.setText("⏳ Loading from database…")
+        worker = DatabaseLoadWorker(spec, self)
+        worker.finished_ok.connect(self._on_db_loaded)
+        worker.polars_ready.connect(self.bridge.set_polars_dataset)
+        worker.failed.connect(self._on_db_failed)
+        self._db_worker = worker
+        worker.start()
+
+    def _on_db_loaded(self, df: pl.DataFrame) -> None:
+        """Route a successful database load through the common ingest path."""
+        spec = getattr(self, "_db_spec", {}) or {}
+        try:
+            from services import data_source as ds
+            kwargs = {"engine": str(spec.get("engine") or ""),
+                      "limit": spec.get("limit")}
+            if spec.get("table"):
+                kwargs["table"] = spec["table"]
+            elif spec.get("query"):
+                kwargs["query"] = spec["query"]
+            source = ds.make_source(str(spec.get("kind", "postgres")),
+                                    uri=str(spec.get("uri", "")), **kwargs)
+            signature = source.fingerprint()
+        except Exception:
+            signature = "db:unknown"
+        label = self._db_label(spec)
+        self._ingest_loaded(df, source_name=label, signature=signature,
+                            is_excel=False, display=label)
+        self.btn_db.setEnabled(True)
+        self.btn_import.setEnabled(True)
+
+    def _on_db_failed(self, error: str) -> None:
+        from services.data_source import _redact
+        log.error("database load failed: %s", _redact(str(error)))
+        QMessageBox.critical(self, "Database Error",
+                             "Failed to load from database:\n"
+                             + _redact(str(error)))
+        self.lbl_file.setText("Database load failed")
+        self.progress.setVisible(False)
+        self.btn_db.setEnabled(True)
+        self.btn_import.setEnabled(True)
+
+    @staticmethod
+    def _db_label(spec: dict) -> str:
+        """Human-readable, credential-free label for a connection spec."""
+        from urllib.parse import urlsplit
+        try:
+            parts = urlsplit(str(spec.get("uri", "") or ""))
+            host = parts.hostname or "database"
+            database = (parts.path or "").strip("/")
+            base = f"{host}/{database}" if database else host
+        except Exception:
+            base = "database"
+        if spec.get("table"):
+            base += f" — {spec['table']}"
+        elif spec.get("query"):
+            base += " — query"
+        return base[:80]
+
+    def _ingest_loaded(self, df: pl.DataFrame, *, source_name: str,
+                       signature: str, is_excel: bool,
+                       display: str) -> None:
+        """Shared ingest path for file and database imports."""
         self.progress.setValue(60)
 
         # Store in session
         self.bridge.set_df(df)
-        self.bridge.set("file_name", path.name)
-        self.bridge.set("file_signature", f"{path.name}:{path.stat().st_size}")
+        self.bridge.set("file_name", source_name)
+        self.bridge.set("file_signature", signature)
 
         # Update model -- through the preview path so the grid always shows
         # what the combo says (and the gutter is sized to those rows), not
@@ -326,13 +435,9 @@ class UploadPage(QWidget):
         self.btn_go_analysis.setEnabled(True)
         self.btn_save_csv.setEnabled(True)
 
-        # Excel Sheets tab is inserted/removed based on file type, not just
-        # enabled/disabled. For a .csv there's no sheet to pick, so the tab
-        # is removed entirely instead of sitting there greyed out. For an
-        # .xlsx it's moved to the FRONT and made the active tab, since
-        # picking a sheet is a prerequisite step before the rest of the
-        # transform tools make sense to touch.
-        is_excel = path.suffix.lower() in (".xlsx", ".xls")
+        # Excel Sheets tab is inserted/removed based on source type, not just
+        # enabled/disabled. File and database loads land here with
+        # is_excel=False; only a real .xlsx/.xls gets the sheet browser.
         excel_tab_index = self._transform_tabs.indexOf(self._excel_loader_panel)
         if is_excel:
             # BUG FOUND HERE: the Excel Loader panel's own load_file()
@@ -346,7 +451,7 @@ class UploadPage(QWidget):
             # controls looked completely dead -- they were dead, not
             # broken selection logic, just never given any data to
             # select from in the first place.
-            self._excel_loader_panel.load_file(str(path))
+            self._excel_loader_panel.load_file(str(Path(self._current_file or "")))
             if excel_tab_index == -1:
                 self._transform_tabs.insertTab(0, self._excel_loader_panel, "📑 Excel Sheets")
             elif excel_tab_index != 0:
@@ -364,10 +469,11 @@ class UploadPage(QWidget):
             self.bridge.save_df_snapshot_async(user_id)
 
         self.progress.setValue(100)
-        self.lbl_file.setText(f"✅ {path.name} — {df.shape[0]:,} rows × {df.shape[1]} columns")
+        self.lbl_file.setText(f"✅ {display} — {df.shape[0]:,} rows × {df.shape[1]} columns")
 
         self.progress.setVisible(False)
         self.btn_import.setEnabled(True)
+        self.btn_db.setEnabled(True)
 
     def _on_import_failed(self, error: str) -> None:
         """Handle import failure from the worker thread."""
@@ -787,6 +893,7 @@ class UploadPage(QWidget):
         """Handle single sheet selection from Excel loader."""
         self.bridge.set_df(df)
         self.bridge.set("file_name", f"{sheet_name}.xlsx")
+        self.bridge.set("file_signature", f"{sheet_name}.xlsx:{df.height}x{len(df.columns)}")
         self._update_preview_label()
         self.btn_go_analysis.setEnabled(True)
 
@@ -794,6 +901,7 @@ class UploadPage(QWidget):
         """Handle merged table from Excel loader."""
         self.bridge.set_df(df)
         self.bridge.set("file_name", "merged_table.xlsx")
+        self.bridge.set("file_signature", f"merged_table.xlsx:{df.height}x{len(df.columns)}")
         self._update_preview_label()
         self.btn_go_analysis.setEnabled(True)
         self.lbl_file.setText(f"✅ Merged table — {df.shape[0]:,} rows × {df.shape[1]} columns")

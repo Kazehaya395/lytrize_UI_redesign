@@ -338,10 +338,9 @@ class PieChartSettings(StatisticalSettings):
         from PySide6.QtWidgets import QLabel
         label = QLabel("Slice values")
         label.setProperty("theme_role", "section")
-        # Typography controls live in the first option column, alongside the
-        # inherited slice Value size/color controls. Inserting into page_root's
-        # outer layout puts them beside the columns and can target a zero-count
-        # layout after Qt reparents the column widget.
+        # Typography controls live in the first option column. Inserting
+        # into page_root's outer layout puts them beside the columns and
+        # can target a zero-count layout after Qt reparents the column widget.
         column = next((child for child in root.findChildren(QWidget)
                        if child.property('option_column') is True), None)
         layout = column.layout() if column is not None else None
@@ -350,6 +349,19 @@ class PieChartSettings(StatisticalSettings):
         # Append them to the column: Qt's layout can be temporarily empty
         # while the tab is being rebuilt, so positional insertion is invalid.
         layout.addWidget(label)
+        # -- Slice (data-value) typography: the other half of the issue --
+        # Size + colour for the labels drawn ON the slices, kept separate
+        # from the donut centre total below. Bound to the typography keys
+        # the renderer already prefers (slice_value_size/slice_value_color).
+        slice_size = slider_with_readout(8, 28, int(self._typo_opts.get(
+            "slice_value_size", 11)))
+        self._slice_size = slice_size._as_spin
+        self._slice_size.valueChanged.connect(
+            lambda value: self._set_typo(slice_value_size=int(value)))
+        layout.addWidget(grid_row("Slice size", slice_size))
+        slice_color_row, self._ck_sliceauto, self._sw_slicecol = (
+            self._auto_color_control('slice_value_color', 'Slice color'))
+        layout.addWidget(slice_color_row)
         center_size = slider_with_readout(8, 28, int(self._typo_opts.get(
             "pie_center_total_size", self._layout_opts.get("pie_value_size", 12))))
         self._pie_center_size = center_size._as_spin
@@ -366,6 +378,28 @@ class PieChartSettings(StatisticalSettings):
     def prefill_typography(self, values):
         super().prefill_typography(values)
         values = dict(values or {})
+        slice_size = getattr(self, "_slice_size", None)
+        if slice_size is not None:
+            try:
+                slice_size.blockSignals(True)
+                slice_size.setValue(int(values.get("slice_value_size", 11)))
+                slice_size.blockSignals(False)
+            except RuntimeError:
+                pass
+        slice_auto = getattr(self, "_ck_sliceauto", None)
+        slice_swatch = getattr(self, "_sw_slicecol", None)
+        if slice_auto is not None and slice_swatch is not None:
+            current = str(values.get("slice_value_color", "auto"))
+            is_auto = current.lower() == "auto"
+            try:
+                slice_auto.blockSignals(True)
+                slice_auto.setChecked(is_auto)
+                slice_auto.blockSignals(False)
+                slice_swatch.setEnabled(not is_auto)
+                if hasattr(slice_swatch, "_retint"):
+                    slice_swatch._retint('#111827' if is_auto else current)
+            except RuntimeError:
+                pass
         size = getattr(self, "_pie_center_size", None)
         if size is not None:
             try:
@@ -382,6 +416,20 @@ class PieChartSettings(StatisticalSettings):
 
     def collect_typography(self):
         opts = super().collect_typography()
+        slice_size = getattr(self, "_slice_size", None)
+        if slice_size is not None:
+            try:
+                opts["slice_value_size"] = int(slice_size.value())
+            except RuntimeError:
+                pass
+        slice_auto = getattr(self, "_ck_sliceauto", None)
+        slice_swatch = getattr(self, "_sw_slicecol", None)
+        if slice_auto is not None and slice_swatch is not None:
+            if slice_auto.isChecked():
+                opts["slice_value_color"] = "auto"
+            else:
+                val = getattr(slice_swatch, "_color_value", None) or slice_swatch.text()
+                opts["slice_value_color"] = str(val or "#111827")
         size = getattr(self, "_pie_center_size", None)
         if size is not None:
             try:

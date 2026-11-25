@@ -3,11 +3,15 @@ name = "lytrize-ui-redesign"
 version = "2.0.0"
 description = "Add your description here"
 readme = "README.md"
-authors = [
-    { name = "Kazehaya395", email = "bantybnath@gmail.com" }
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=1.26.0,<3.0.0",
+    "openpyxl>=3.1.0,<4.0.0",
+    "pandas>=2.2.0,<3.0.0",
+    "polars[rtcompat]==1.44.2",
+    "pyarrow>=18.0.0",
+    "pyside6>=6.11.0,<7.0.0",
 ]
-requires-python = ">=3.14"
-dependencies = []
 
 [project.scripts]
 lytrize-ui-redesign = "lytrize_ui_redesign:main"

@@ -69,9 +69,6 @@ class SessionManager:
         # -- Derived-cache invalidation --
         self._cache: dict[str, Any] = {}
 
-        # -- Shadow for notes sync --
-        self._notes_shadow: dict[str, str] = {}
-
         # -- Callbacks (Qt signals equivalent) --
         self._df_change_callbacks: list[Callable[[pl.DataFrame], None]] = []
         self._state_change_callbacks: list[Callable[[str, Any], None]] = []

@@ -24,7 +24,8 @@ from PySide6.QtWidgets import (
     QScrollArea, QGridLayout, QLineEdit, QComboBox, QFileDialog,
     QMessageBox, QFrame, QSplitter, QTextEdit, QCheckBox, QSpinBox,
     QColorDialog, QFontComboBox, QInputDialog,
-    QDialog, QDialogButtonBox,
+    QDialog, QDialogButtonBox, QToolButton, QButtonGroup, QMenu,
+    QSizePolicy,
 )
 
 from desktop import theme as _theme_mod
@@ -48,7 +49,7 @@ _FREE_MODES = {"free", _FREE_MODE}
 from desktop.workers import ExportWorker, ReportPreviewWorker
 from services.export_service import (
     build_export_report, build_export_charts, apply_preset, EXPORT_PRESETS,
-    EXPORT_DEFAULTS,
+    EXPORT_DEFAULTS, export_defaults_for,
 )
 from services.chart_service import safe_filename
 from services.database_service import (
@@ -88,7 +89,57 @@ def _df_is_empty(df) -> bool:
 # rather than restated here: the panel, the live-apply path, the preview and the
 # exported payload must all agree on the same defaults, and two hand-maintained
 # copies of one 23-key dict is how they silently drifted apart before.
-_STYLE_DEFAULTS = dict(EXPORT_DEFAULTS)
+class _ThemeAwareDefaults(dict):
+    """EXPORT_DEFAULTS that follow the app theme, lazily.
+
+    The board was built from one hard-coded dark palette, so in light mode it
+    stayed permanently dark ("permanent dark canvas" report, 2026-11-24).
+    Unstyled keys now resolve against the CURRENT app theme: light mode gets
+    the light export palette, dark mode the historical dark one. A key the
+    user set explicitly is stored on the bridge and always wins over these
+    defaults (``bridge.get(key, _STYLE_DEFAULTS[key])`` everywhere), so this
+    only changes what a never-touched board looks like.
+    """
+
+    def _src(self):
+        try:
+            from desktop.theme import current_mode
+            return export_defaults_for(current_mode())
+        except Exception:
+            return dict(EXPORT_DEFAULTS)
+
+    def __getitem__(self, key):
+        return self._src()[key]
+
+    def get(self, key, default=None):
+        return self._src().get(key, default)
+
+    def items(self):
+        return self._src().items()
+
+    def keys(self):
+        return self._src().keys()
+
+    def values(self):
+        return self._src().values()
+
+    def __iter__(self):
+        return iter(self._src())
+
+    def __len__(self):
+        return len(self._src())
+
+    def __contains__(self, key):
+        return key in self._src()
+
+    def copy(self):
+        return self._src()
+
+    def __repr__(self):
+        return repr(self._src())
+
+
+_STYLE_DEFAULTS = _ThemeAwareDefaults()
 
 # Appearance-only controls with a DOM patch do not need to regenerate and
 # reload the report document. Layout and board-content changes still use the
@@ -98,10 +149,12 @@ _LIVE_STYLE_KEYS = frozenset({
     "ex_not_bg", "ex_not_bd", "ex_radius", "ex_meta",
     "ex_kpi_text_color", "ex_kpi_val_size", "ex_kpi_val_color",
     "ex_kpi_label_size", "ex_kpi_label_upper",
+    "ex_kpi_val_align", "ex_kpi_label_align", "ex_kpi_gap", "ex_kpi_pad",
     "ex_slicer_bg", "ex_slicer_bd", "ex_slicer_text", "ex_slicer_accent",
     "ex_slicer_label_size", "ex_slicer_label_color",
     "ex_slicer_value_size", "ex_slicer_value_color",
     "ex_title_font", "ex_title_style", "ex_title_size", "ex_title_color",
+    "ex_title_align", "ex_title_gap", "ex_title_pad",
     "ex_notes_font", "ex_notes_style", "ex_notes_size", "ex_notes_color",
     "ex_chart_image", "ex_chart_image_opacity", "ex_chart_blend",
     "ex_chart_image_fit", "ex_chart_image_position",
@@ -130,12 +183,11 @@ _LIVE_STYLE_IMAGE_KEYS = frozenset({
 # #f1f5f9 window) and why a preset could be selected in the gallery yet not
 # appear on the board.
 #
-# With the canvas rendering the real report, that split has nowhere to live: the
-# board and the file are the same document, so it is the export palette by
-# construction. A report keeps its own colours whichever app theme is active --
-# the same reason a Tableau dashboard stays white inside a dark IDE -- so
-# switching light/dark deliberately does NOT repaint the board, and a chosen
-# preset stays exactly as chosen.
+# The canvas renders the real report, so the board and the file are the same
+# document: the export palette it is, by construction. The palette's DEFAULTS
+# follow the app theme (light app -> light board, per the user's 2026-11-24
+# directive); any key the user set explicitly is stored and always wins, so a
+# chosen preset stays exactly as chosen in either mode.
 _OVERRIDABLE_COLORS = (
     "ex_bg", "ex_card", "ex_kpi", "ex_border", "ex_text", "ex_accent",
     "ex_not_bg", "ex_not_bd", "ex_title_color", "ex_notes_color",
@@ -315,6 +367,161 @@ def _is_user_override(bridge, key: str, stored) -> bool:
     return stored != _STYLE_DEFAULTS.get(key)
 
 
+class _PageTabBar(QFrame):
+    """Browser-style tab strip for the dashboard's pages.
+
+    One tab per page plus a trailing "+" button. Single left-click switches,
+    double-click renames, right-click offers rename/delete. The strip always
+    shows at least the default Overview page, so the feature is
+    discoverable without being modal.
+    """
+
+    page_selected = Signal(str)
+    page_added = Signal()
+    page_renamed = Signal(str)     # pid
+    page_deleted = Signal(str)     # pid
+
+    _DEFAULT_ACCENT = "#6163df"
+
+    @staticmethod
+    def _accent_rgba(accent: str, alpha: float) -> str:
+        """rgba() string for a #rgb/#rrggbb accent; falls back to a neutral
+        grey-indigo blend when the stored value is not a usable hex."""
+        raw = str(accent or "").strip()
+        hexpart = raw[1:] if raw.startswith("#") else raw
+        try:
+            if len(hexpart) == 3:
+                hexpart = "".join(ch * 2 for ch in hexpart)
+            if len(hexpart) != 6:
+                raise ValueError
+            r, g, b = (int(hexpart[i:i + 2], 16) for i in (0, 2, 4))
+        except ValueError:
+            r, g, b = (97, 99, 223)
+        return f"rgba({r},{g},{b},{alpha})"
+
+    @classmethod
+    def _qss(cls, accent: str) -> str:
+        accent = str(accent or cls._DEFAULT_ACCENT).strip() or cls._DEFAULT_ACCENT
+        soft = cls._accent_rgba(accent, 0.30)
+        softer = cls._accent_rgba(accent, 0.22)
+        return f"""
+    QFrame#pageTabBar {{ background: transparent; border: none; }}
+    QToolButton[class="lyTab"] {{
+        padding: 6px 16px 7px; margin: 0;
+        border: 1px solid rgba(128,128,128,.35);
+        border-radius: 8px;
+        background: rgba(128,128,128,.12); font-size: 12px;
+    }}
+    QToolButton[class="lyTab"]:hover {{ background: rgba(128,128,128,.22); }}
+    QToolButton[class="lyTab"]:checked {{
+        background: {soft}; border-color: {accent};
+        font-weight: 700;
+    }}
+    QToolButton#pageTabAdd {{
+        padding: 4px 12px; border: 1px dashed rgba(128,128,128,.5);
+        border-radius: 8px; font-size: 13px; font-weight: 700;
+    }}
+    QToolButton#pageTabAdd:hover {{ background: {softer}; }}
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("pageTabBar")
+        self._accent = self._DEFAULT_ACCENT
+        self.setStyleSheet(self._qss(self._accent))
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_context_menu)
+        self._row = QHBoxLayout(self)
+        self._row.setContentsMargins(2, 2, 2, 0)
+        self._row.setSpacing(2)
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+        self._add = QToolButton()
+        self._add.setObjectName("pageTabAdd")
+        self._add.setText("+")
+        self._add.setToolTip("Add a page")
+        self._add.setCursor(Qt.PointingHandCursor)
+        self._add.clicked.connect(self.page_added.emit)
+        self._tab_buttons = {}
+        self._pages = []
+
+    def set_accent(self, accent: str) -> None:
+        """Re-skin the strip to the dashboard's accent (no rebuild needed).
+
+        The tab bar is chrome for THIS board, so it should follow the same
+        accent the report itself uses instead of a hardcoded indigo. Called
+        when the user edits Accent, applies a quick theme, or resets style.
+        """
+        accent = str(accent or self._DEFAULT_ACCENT).strip() or self._DEFAULT_ACCENT
+        self._accent = accent
+        self.setStyleSheet(self._qss(accent))
+
+    def _clear(self) -> None:
+        while self._row.count():
+            item = self._row.takeAt(0)
+            widget = item.widget()
+            if widget is None:
+                continue
+            if widget is self._add:
+                widget.setParent(None)
+                continue
+            # Detach BEFORE deleteLater: until the deferred delete runs the
+            # corpse stays a child, and childAt() at a tab's position can
+            # return it -- which hid the rename/delete menu entirely.
+            widget.setParent(None)
+            self._group.removeButton(widget)
+            widget.deleteLater()
+        self._tab_buttons = {}
+
+    def set_pages(self, pages: list, active: str) -> None:
+        """Rebuild the strip from the [{id, name}] list."""
+        self._pages = list(pages or [])
+        self._clear()
+        for page in self._pages:
+            pid = str(page.get("id"))
+            btn = QToolButton()
+            btn.setProperty("class", "lyTab")
+            btn.setText(str(page.get("name") or pid))
+            btn.setCheckable(True)
+            btn.setChecked(pid == str(active))
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setToolTip("Double-click to rename | right-click for page actions")
+            btn.clicked.connect(lambda _checked=False, p=pid: self.page_selected.emit(p))
+            btn.installEventFilter(self)
+            self._group.addButton(btn)
+            self._tab_buttons[pid] = btn
+            self._row.addWidget(btn)
+        self._row.addWidget(self._add)
+        self._row.addStretch(1)
+
+    # -- rename on double-click ------------------------------------------------
+    def eventFilter(self, obj, event):  # noqa: N802
+        from PySide6.QtCore import QEvent
+        if event.type() == QEvent.Type.MouseButtonDblClick:
+            pid = next((p for p, b in self._tab_buttons.items() if b is obj), None)
+            if pid:
+                self.page_renamed.emit(pid)
+                return True
+        return super().eventFilter(obj, event)
+
+    # -- right-click menu -------------------------------------------------------
+    def _on_context_menu(self, pos) -> None:
+        widget = self.childAt(pos)
+        pid = next((p for p, b in self._tab_buttons.items() if b is widget), None)
+        if pid is None:
+            return
+        menu = QMenu(self)
+        act_rename = menu.addAction("Rename…")
+        act_delete = menu.addAction("Delete page")
+        act_delete.setEnabled(len(self._pages) > 1)
+        chosen = menu.exec(self.mapToGlobal(pos))
+        if chosen is act_rename:
+            self.page_renamed.emit(pid)
+        elif chosen is act_delete:
+            self.page_deleted.emit(pid)
+
+
 class DashboardPage(QWidget):
     """Dashboard page: chart grid, KPIs, and export."""
 
@@ -366,8 +573,8 @@ class DashboardPage(QWidget):
         self.btn_tidy.setToolTip(
             "Re-flow every card into a clean board, keeping the order you\n"
             "can see and the size you gave each card.\n\n"
-            "Cards are placed by dragging them, resized from the right,\n"
-            "bottom or corner handle, and nudged with the arrow keys\n"
+            "Cards are placed by dragging them anywhere, resized from any\n"
+            "edge or corner, and nudged with the arrow keys\n"
             "(hold Shift for a bigger step). Drag a card's grip, or\n"
             "anywhere on its background, to move it.")
         header.addWidget(self.btn_tidy)
@@ -449,6 +656,15 @@ class DashboardPage(QWidget):
         #
         # Now there is exactly one document, so those settings need no wiring at
         # all: they already reach the report, and the report is what is shown.
+        self.page_tabs = _PageTabBar(right_panel)
+        self.page_tabs.page_selected.connect(self._switch_page)
+        self.page_tabs.page_added.connect(self._page_action_add)
+        self.page_tabs.page_renamed.connect(self._page_action_rename)
+        self.page_tabs.page_deleted.connect(self._page_action_delete)
+        right_layout.addWidget(self.page_tabs)
+        self._sync_tab_accent()
+        self._refresh_page_tabs()
+
         self.report_canvas = ReportCanvas()
         right_layout.addWidget(self.report_canvas, stretch=1)
 
@@ -734,6 +950,39 @@ class DashboardPage(QWidget):
         self.ex_kpi_label_upper.toggled.connect(
             lambda v: self._on_field_changed("ex_kpi_label_upper", bool(v)))
         kpi_text_group.add(self.ex_kpi_label_upper)
+        # Layout: the value and the words under it get SEPARATE horizontal
+        # alignment (they were one inherited alignment), the gap between them
+        # collapses to a plain line break at 0, and the card's inner padding
+        # is no longer fixed.
+        self.ex_kpi_val_align = self._make_align_combo("ex_kpi_val_align")
+        kpi_text_group.add(FieldRow(
+            "Value align", self.ex_kpi_val_align,
+            "Horizontal alignment of the number itself."))
+        self.ex_kpi_label_align = self._make_align_combo("ex_kpi_label_align")
+        kpi_text_group.add(FieldRow(
+            "Label align", self.ex_kpi_label_align,
+            "Horizontal alignment of the words under the number -- "
+            "independent of the value's alignment."))
+        self.ex_kpi_gap = QSpinBox()
+        self.ex_kpi_gap.setRange(0, 32)
+        self.ex_kpi_gap.setValue(int(self.bridge.get(
+            "ex_kpi_gap", _STYLE_DEFAULTS["ex_kpi_gap"])))
+        self.ex_kpi_gap.valueChanged.connect(
+            lambda v: self._on_field_changed("ex_kpi_gap", v))
+        kpi_text_group.add(FieldRow(
+            "Value–label gap", self.ex_kpi_gap,
+            "Vertical space between the value and its label, in pixels. "
+            "Zero means no extra gap -- just the line break."))
+        self.ex_kpi_pad = QSpinBox()
+        self.ex_kpi_pad.setRange(0, 32)
+        self.ex_kpi_pad.setValue(int(self.bridge.get(
+            "ex_kpi_pad", _STYLE_DEFAULTS["ex_kpi_pad"])))
+        self.ex_kpi_pad.valueChanged.connect(
+            lambda v: self._on_field_changed("ex_kpi_pad", v))
+        kpi_text_group.add(FieldRow(
+            "Card padding", self.ex_kpi_pad,
+            "Inner padding of the KPI card in pixels. Zero removes the "
+            "space between the content and the card's edge."))
         layout.addWidget(kpi_text_group)
 
         # -- Background image ------------------------------------------------
@@ -756,8 +1005,155 @@ class DashboardPage(QWidget):
         # only layout affordance, which is what a canvas wants.
 
         layout.addStretch()
+        self._index_sidebar_rows(layout)
         scroll.setWidget(content)
-        return scroll
+
+        # -- Filter toolbar ------------------------------------------------
+        # The pane carries ~100 controls behind foldable sections; finding
+        # "the colour swatch" meant opening five sections. A filter box
+        # matches rows by their own labels, control tooltips and button
+        # captions, auto-expands the sections that match and hides the
+        # rest until the query is cleared. Fold/Expand live beside it.
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+        toolbar = QFrame()
+        toolbar.setObjectName("sidebarFilterBar")
+        tb = QHBoxLayout(toolbar)
+        tb.setContentsMargins(6, 4, 6, 4)
+        tb.setSpacing(6)
+        self.sidebar_filter = QLineEdit()
+        self.sidebar_filter.setPlaceholderText("Filter settings…")
+        self.sidebar_filter.setClearButtonEnabled(True)
+        self.sidebar_filter.setToolTip(
+            "Show only the settings whose label, button or tooltip mentions\n"
+            "what you type. Matching sections expand; the rest hide. "
+            "Clear the box to restore everything.")
+        self.sidebar_filter.textChanged.connect(
+            self._on_sidebar_filter_changed)
+        tb.addWidget(self.sidebar_filter, 1)
+        self.btn_sidebar_expand = QPushButton("Expand")
+        self.btn_sidebar_expand.setProperty("kind", "ghost")
+        self.btn_sidebar_expand.setToolTip(
+            "Expand every visible section in this panel.")
+        self.btn_sidebar_expand.clicked.connect(
+            lambda: self._on_sidebar_fold_all(True))
+        tb.addWidget(self.btn_sidebar_expand)
+        self.btn_sidebar_fold = QPushButton("Fold")
+        self.btn_sidebar_fold.setProperty("kind", "ghost")
+        self.btn_sidebar_fold.setToolTip(
+            "Fold every visible section in this panel.")
+        self.btn_sidebar_fold.clicked.connect(
+            lambda: self._on_sidebar_fold_all(False))
+        tb.addWidget(self.btn_sidebar_fold)
+        outer.addWidget(toolbar)
+        self.sidebar_filter_status = QLabel("")
+        self.sidebar_filter_status.setStyleSheet(
+            "font-size: 11px; opacity: 0.75; padding: 0 8px;")
+        self.sidebar_filter_status.setVisible(False)
+        outer.addWidget(self.sidebar_filter_status)
+        outer.addWidget(scroll, 1)
+        return container
+
+    # -- Sidebar filter --------------------------------------------------
+
+    def _index_sidebar_rows(self, layout) -> None:
+        """Snapshot (section, [(row, searchable text)]) for the filter.
+
+        Runs once, after every section has been added to the layout —
+        which is why it is called with the finished layout rather than
+        from each ``add`` call site.
+        """
+        sections = []
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            widget = item.widget() if item is not None else None
+            if not isinstance(widget, CollapsibleSection):
+                continue
+            rows = []
+            for j in range(widget.body_layout.count()):
+                row_item = widget.body_layout.itemAt(j)
+                row = row_item.widget() if row_item is not None else None
+                if row is None:
+                    continue
+                rows.append((row, self._sidebar_row_text(row)))
+            sections.append((widget, rows))
+        self._sidebar_sections = sections
+
+    @staticmethod
+    def _sidebar_row_text(row) -> str:
+        """Lowercased haystack for one filterable row.
+
+        QLabel and QAbstractButton captions (FieldRow labels, plain
+        buttons, checkboxes) plus every tooltip in the row — the tooltips
+        are where the pane's recall keywords actually live ("colour",
+        "blend", "timestamp"), so searching matches what the eye and the
+        mouse both see. Line-edit *contents* are deliberately excluded:
+        a typed hex code is not a setting's name.
+        """
+        from PySide6.QtWidgets import QAbstractButton, QLabel as _QLabel
+        parts = []
+        widgets = [row, *row.findChildren(QWidget)]
+        for widget in widgets:
+            if isinstance(widget, (_QLabel, QAbstractButton)):
+                try:
+                    text = widget.text()
+                except Exception:
+                    text = ""
+                if text:
+                    parts.append(str(text))
+            tip = widget.toolTip()
+            if tip:
+                parts.append(str(tip))
+        return " ".join(parts).lower()
+
+    def _on_sidebar_filter_changed(self, text: str) -> None:
+        query = str(text or "").strip().lower()
+        sections = getattr(self, "_sidebar_sections", [])
+        if not sections:
+            return
+        if query and getattr(self, "_pane_fold_saved", None) is None:
+            # Only the fold state from BEFORE filtering started is safe to
+            # restore later; re-saving mid-filter would capture the
+            # auto-expanded state and the restore would be a no-op.
+            self._pane_fold_saved = {
+                section.title: section.btn_head.isChecked()
+                for section, _rows in sections}
+        total = matched = 0
+        for section, rows in sections:
+            any_match = False
+            for row, haystack in rows:
+                hit = (not query) or (query in haystack)
+                row.setVisible(hit)
+                if query:
+                    total += 1
+                    if hit:
+                        matched += 1
+                        any_match = True
+            section.setVisible((not query) or any_match)
+            if query and any_match:
+                section.set_expanded(True)
+        if not query:
+            saved = getattr(self, "_pane_fold_saved", None)
+            if saved:
+                for section, _rows in sections:
+                    if section.title in saved:
+                        section.set_expanded(saved[section.title])
+            self._pane_fold_saved = None
+            self.sidebar_filter_status.setVisible(False)
+            return
+        self.sidebar_filter_status.setText(
+            f"{matched} of {total} settings match" if matched
+            else f'No settings match "{query}"')
+        self.sidebar_filter_status.setVisible(True)
+
+    def _on_sidebar_fold_all(self, expanded: bool) -> None:
+        for section, _rows in getattr(self, "_sidebar_sections", []):
+            # isHidden(), not isVisible(): the latter also requires the whole
+            # ancestor chain to be shown, which never happens offscreen.
+            if not section.isHidden():
+                section.set_expanded(bool(expanded))
 
     # -- Background image ------------------------------------------------
 
@@ -1251,8 +1647,10 @@ class DashboardPage(QWidget):
 
     def _build_typography_group(self, title: str, prefix: str,
                                 expanded: bool = True) -> CollapsibleSection:
-        """Shared 4-field pattern (font, style, size, color) used for both
-        title and notes typography -- avoids writing the same block twice."""
+        """Shared (font, style, size, color) typography block.
+
+        The title group additionally gets alignment / line gap / padding --
+        the same layout model as the KPI Text section. Notes stays as-is."""
         group = CollapsibleSection(title, expanded=expanded)
 
         font_key = f"{prefix}_font"
@@ -1286,6 +1684,36 @@ class DashboardPage(QWidget):
 
         color_key = f"{prefix}_color"
         group.add(FieldRow("Color", self._make_color_field(color_key)))
+
+        if prefix == "ex_title":
+            # Same layout model as the KPI Text section: the heading's
+            # alignment is its own setting, multi-line spacing can collapse
+            # to a single line-height, and the card's inner padding is no
+            # longer fixed.
+            self.ex_title_align = self._make_align_combo("ex_title_align")
+            group.add(FieldRow(
+                "Title align", self.ex_title_align,
+                "Horizontal alignment of the heading text."))
+            self.ex_title_gap = QSpinBox()
+            self.ex_title_gap.setRange(0, 32)
+            self.ex_title_gap.setValue(int(self.bridge.get(
+                "ex_title_gap", _STYLE_DEFAULTS["ex_title_gap"])))
+            self.ex_title_gap.valueChanged.connect(
+                lambda v: self._on_field_changed("ex_title_gap", v))
+            group.add(FieldRow(
+                "Line gap", self.ex_title_gap,
+                "Extra line spacing for multi-line titles, in pixels. "
+                "Zero keeps a single line-height."))
+            self.ex_title_pad = QSpinBox()
+            self.ex_title_pad.setRange(0, 32)
+            self.ex_title_pad.setValue(int(self.bridge.get(
+                "ex_title_pad", _STYLE_DEFAULTS["ex_title_pad"])))
+            self.ex_title_pad.valueChanged.connect(
+                lambda v: self._on_field_changed("ex_title_pad", v))
+            group.add(FieldRow(
+                "Card padding", self.ex_title_pad,
+                "Inner padding of the title card in pixels. Zero removes "
+                "the space between the heading and the card's edge."))
 
         return group
 
@@ -1339,6 +1767,21 @@ class DashboardPage(QWidget):
             _STYLE_DEFAULTS["ex_kpi_label_size"])))
         self.ex_kpi_label_upper.setChecked(bool(style.get(
             "ex_kpi_label_upper", _STYLE_DEFAULTS["ex_kpi_label_upper"])))
+        _align_text = lambda key: str(style.get(
+            key, _STYLE_DEFAULTS[key]) or "left").strip().lower().capitalize()
+        if _align_text("ex_kpi_val_align") not in ("Left", "Center", "Right"):
+            self.ex_kpi_val_align.setCurrentText("Left")
+        else:
+            self.ex_kpi_val_align.setCurrentText(_align_text("ex_kpi_val_align"))
+        if _align_text("ex_kpi_label_align") not in ("Left", "Center", "Right"):
+            self.ex_kpi_label_align.setCurrentText("Left")
+        else:
+            self.ex_kpi_label_align.setCurrentText(
+                _align_text("ex_kpi_label_align"))
+        self.ex_kpi_gap.setValue(int(style.get(
+            "ex_kpi_gap", _STYLE_DEFAULTS["ex_kpi_gap"])))
+        self.ex_kpi_pad.setValue(int(style.get(
+            "ex_kpi_pad", _STYLE_DEFAULTS["ex_kpi_pad"])))
         self.ex_bg_image_opacity.setValue(int(style.get(
             "ex_bg_image_opacity",
             _STYLE_DEFAULTS["ex_bg_image_opacity"]) or 0))
@@ -1369,6 +1812,19 @@ class DashboardPage(QWidget):
                 size_widget.setValue(int(style.get(
                     f"{prefix}_size", _STYLE_DEFAULTS[f"{prefix}_size"])))
 
+        title_align = getattr(self, "ex_title_align", None)
+        if title_align is not None:
+            _t_align = str(style.get(
+                "ex_title_align",
+                _STYLE_DEFAULTS["ex_title_align"]) or "left").strip().lower().capitalize()
+            title_align.setCurrentText(
+                _t_align if _t_align in ("Left", "Center", "Right") else "Left")
+        for attr, key in (("ex_title_gap", "ex_title_gap"),
+                          ("ex_title_pad", "ex_title_pad")):
+            w = getattr(self, attr, None)
+            if w is not None:
+                w.setValue(int(style.get(key, _STYLE_DEFAULTS[key])))
+
         # Slicer typography sizes (the colour halves are swatches in
         # _color_swatches and synced with the rest above).
         for attr, key in (("ex_slicer_label_size", "ex_slicer_label_size"),
@@ -1376,6 +1832,25 @@ class DashboardPage(QWidget):
             w = getattr(self, attr, None)
             if w is not None:
                 w.setValue(int(style.get(key, _STYLE_DEFAULTS.get(key, 13)) or 13))
+
+    def _make_align_combo(self, key: str) -> QComboBox:
+        """Left/Center/Right combo writing a lowercase value to the bridge.
+
+        Shared by the KPI section (value and label, styled independently)
+        and the Title Typography group. The stored value is lowercase; the
+        visible item is capitalised; unknown stored values fall back to
+        Left so a hand-edited session cannot blank the board.
+        """
+        combo = QComboBox()
+        combo.addItems(["Left", "Center", "Right"])
+        default = _STYLE_DEFAULTS.get(key, "left")
+        current = str(self.bridge.get(key, default) or "left").strip().lower()
+        if current not in ("left", "center", "right"):
+            current = "left"
+        combo.setCurrentText(current.capitalize())
+        combo.currentTextChanged.connect(
+            lambda v, k=key: self._on_field_changed(k, str(v).lower()))
+        return combo
 
     def _make_color_field(self, key: str) -> QWidget:
         """One reusable color-picker row: a clickable swatch that opens
@@ -1467,18 +1942,19 @@ class DashboardPage(QWidget):
             return
         self._schedule_regen(continuous=True)
 
-    def _on_theme_changed(self, _mode: str) -> None:
+    def _on_theme_changed(self, mode: str) -> None:
         """Handle a dark<->light switch.
 
-        The board deliberately does NOT re-render. A report is a document with
-        its own palette, and it keeps it whichever app theme is active -- the
-        same reason a Tableau dashboard stays white inside a dark IDE, and the
-        reason a chosen preset looks identical in both modes instead of shifting
-        under the user.
-
-        The app chrome around the canvas is restyled by the global stylesheet,
-        and the swatches are refreshed so the panel never contradicts the board.
+        An UNSTYLED board follows the app theme: the export defaults resolve
+        against the current mode, so switching re-paints the canvas and card
+        chrome to the matching light/dark palette. Keys the user set
+        explicitly are stored on the bridge and are re-applied unchanged, so
+        a deliberate colour scheme survives the switch exactly as chosen.
         """
+        try:
+            self._apply_live_style(_LIVE_STYLE_KEYS)
+        except Exception:
+            log.debug("theme-change live style failed", exc_info=True)
         try:
             self._sync_style_widgets_from_bridge()
         except Exception:
@@ -1524,6 +2000,8 @@ class DashboardPage(QWidget):
         if getattr(self, "_syncing_widgets", False):
             return
         self.bridge.set(key, value)
+        if key == "ex_accent":
+            self._sync_tab_accent()
         if key in _LIVE_STYLE_KEYS and self._apply_live_style((key,)):
             return
         self._schedule_regen(continuous=continuous)
@@ -1583,6 +2061,7 @@ class DashboardPage(QWidget):
             value = merged.get(key)
             if value is not None:
                 self.bridge.set(key, value)
+        self._sync_tab_accent()
         self.bridge.set("ex_preset", str(name))
         if not self._apply_live_style(_OVERRIDABLE_COLORS):
             self._schedule_regen()
@@ -1604,6 +2083,7 @@ class DashboardPage(QWidget):
             return
         for key in _OVERRIDABLE_COLORS:
             self.bridge.set(key, _STYLE_DEFAULTS.get(key, ""))
+        self._sync_tab_accent()
         # The background image goes too, and deliberately: "Reset to defaults"
         # that leaves a picture behind is not a reset, and the image is the one
         # setting whose presence the user is least likely to notice afterwards.
@@ -1643,6 +2123,266 @@ class DashboardPage(QWidget):
         slow.stop()
         (slow if continuous else fast).start()
 
+    # -- Multi-page (item 2) --------------------------------------------------
+
+    def _page_state(self) -> dict:
+        """Assemble the current page state from the bridge + persisted maps.
+
+        The active page's slices are always rebuilt from live bridge keys, so
+        the persisted maps can never drift from what is on screen.
+        """
+        try:
+            from services import page_state
+            return page_state.assemble_from_bridge(self.bridge.get)
+        except Exception as exc:
+            log.debug("page state assembly failed: %s", exc)
+            from services import page_state
+            return page_state.normalize_page_state(None)
+
+    @staticmethod
+    def _split_geometry_blob(blob) -> tuple:
+        """Split a merged free-canvas blob into chart/KPI/slicer maps.
+
+        The merged blob is what the bridge persists under ``tile_geometry``:
+        chart uids + ``__title__`` are the chart map, bare digit keys are
+        page-local KPI indices, ``slicer:<i>`` keys the page-local slicer
+        indices (combined global+local space), ``_mode_free`` is dropped.
+        """
+        tile, kpi, slicer = {}, {}, {}
+        for key, value in (blob or {}).items():
+            key = str(key)
+            if key == _MODE_KEY:
+                continue
+            if key.startswith("slicer:"):
+                slicer[key[len("slicer:"):]] = value
+            elif key.isdigit():
+                kpi[key] = value
+            else:
+                tile[key] = value
+        return tile, kpi, slicer
+
+    def _enriched_slicer_defs(self, slicers: list) -> list:
+        """Supply real slider bounds / value lists for the given slicers.
+
+        Factored out of ``_export_inputs`` so a paged export can enrich every
+        page's effective slicer list, not just the active one.
+        """
+        import polars as pl
+
+        out: list = []
+        dataset = self.bridge.polars_dataset(create_if_missing=False)
+        for source in slicers or []:
+            item = dict(source or {})
+            spec = dict(item.get("spec") or {})
+            if dataset is not None and str(item.get("widget") or "").lower() == "slider":
+                try:
+                    col, dtype = item.get("column"), dataset.schema.get(item.get("column"))
+                    if col and dtype in (pl.Date, pl.Datetime):
+                        low, high = dataset.frame.select(pl.col(col).min(), pl.col(col).max()).collect().row(0)
+                        spec.update({"min": str(low)[:10], "max": str(high)[:10], "bounds_kind": "datetime"})
+                    elif col and dtype is not None and dtype.is_numeric():
+                        low, high = dataset.frame.select(pl.col(col).min(), pl.col(col).max()).collect().row(0)
+                        spec.update({"min": low, "max": high, "step": 1 if dtype.is_integer() else 0.01,
+                                     "bounds_kind": "numeric"})
+                except Exception:
+                    log.debug("could not prepare export slider bounds", exc_info=True)
+            item["spec"] = spec
+            out.append(item)
+        return out
+
+    # -- Multi-page operations --------------------------------------------------
+
+    def _refresh_page_tabs(self) -> None:
+        strip = getattr(self, "page_tabs", None)
+        if strip is None:
+            return
+        state = self._page_state()
+        strip.set_pages(state["pages"], state["active"])
+
+    def _switch_page(self, pid: str) -> None:
+        """Persist the outgoing page from live keys, then load *pid*."""
+        from services import page_state
+
+        state = self._page_state()
+        ids = {p["id"] for p in state["pages"]}
+        pid = str(pid)
+        if pid not in ids:
+            self._refresh_page_tabs()
+            return
+        if pid == state["active"]:
+            self._refresh_page_tabs()
+            return
+        outgoing = page_state.assemble_from_bridge(self.bridge.get)
+        outgoing["active"] = pid
+        try:
+            page_state.apply_to_bridge(self.bridge.set, outgoing)
+        except Exception as exc:
+            log.exception("page switch failed: %s", exc)
+            self._refresh_page_tabs()
+            return
+        self._refresh_page_tabs()
+        # Reload the slicer placement cache from the incoming page's stored
+        # geometry explicitly. apply_to_bridge swaps the live keys, and the
+        # cache used to be refreshed only implicitly via _refresh_kpis ->
+        # _current_geometry -- so a refactor of either could silently leave
+        # the outgoing page's slicer slots in place. Make the reload explicit.
+        try:
+            charts = self.bridge.get("charts", []) or []
+            kpis = self.bridge.get("kpis", []) or []
+            cols = int(self.bridge.get("grid_cols_n", 2) or 2)
+            self._current_geometry(charts, kpis, cols)
+        except Exception:
+            log.debug("slicer geometry reload after page switch failed",
+                      exc_info=True)
+        self._refresh_kpis()
+        self._refresh_slicer_count()
+        self._schedule_regen()
+
+    def _page_action_add(self) -> None:
+        from services import page_state
+
+        state = self._page_state()
+        pages = list(state["pages"])
+        pid = page_state.new_page_id()
+        pages.append({"id": pid, "name": f"Page {len(pages) + 1}"})
+        self.bridge.set("pages", pages)
+        self._switch_page(pid)
+
+    def _page_action_rename(self, pid: str) -> None:
+        state = self._page_state()
+        pid = str(pid)
+        current = next((p.get("name", "") for p in state["pages"]
+                        if p["id"] == pid), "")
+        new_name, ok = QInputDialog.getText(
+            self, "Rename Page", "Page name:", text=str(current))
+        new_name = str(new_name or "").strip()
+        if not ok or not new_name:
+            return
+        pages = [{"id": p["id"],
+                  "name": new_name if p["id"] == pid else p.get("name", p["id"])}
+                 for p in state["pages"]]
+        self.bridge.set("pages", pages)
+        self._refresh_page_tabs()
+
+    def _page_action_delete(self, pid: str) -> None:
+        from services import page_state
+
+        state = self._page_state()
+        pages = list(state["pages"])
+        if len(pages) <= 1:
+            QMessageBox.information(self, "Delete Page",
+                                    "A report needs at least one page.")
+            return
+        pid = str(pid)
+        victim = next((p for p in pages if p["id"] == pid), None)
+        if victim is None:
+            return
+        reply = QMessageBox.question(
+            self, "Delete Page",
+            f"Delete page '{victim.get('name', pid)}'?\n\n"
+            "Its charts, KPIs and slicers move to the first remaining page.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        remaining = [p for p in pages if p["id"] != pid]
+        target = remaining[0]["id"]
+        chart_pages = dict(state["chart_pages"])
+        for uid, owner in list(chart_pages.items()):
+            if owner == pid:
+                chart_pages[uid] = target
+        page_kpis = {k: list(v) for k, v in state["page_kpis"].items()}
+        page_slicers = {k: [dict(s) for s in v] for k, v in state["page_slicers"].items()}
+        page_geometry = {k: dict(v) for k, v in state["page_geometry"].items()}
+        page_kpis[target] = page_kpis.get(target, []) + page_kpis.pop(pid, [])
+        page_slicers[target] = page_slicers.get(target, []) + page_slicers.pop(pid, [])
+        victim_blob = dict(page_geometry.pop(pid, {}) or {})
+        # Chart tiles (and only those) survive the move by uid; KPI/slicer
+        # tiles would collide on bare indices, so those cards auto-place.
+        merged_blob = dict(page_geometry.get(target) or {})
+        for key, value in victim_blob.items():
+            ks = str(key)
+            if ks == _MODE_KEY or ks.isdigit() or ks.startswith("slicer:") or ks == _TITLE_UID:
+                continue
+            merged_blob[ks] = value
+        page_geometry[target] = merged_blob
+        active = target if state["active"] == pid else state["active"]
+        raw = {"version": 1, "active": active, "pages": remaining,
+               "chart_pages": chart_pages,
+               "page_geometry": page_geometry,
+               "page_kpis": page_kpis,
+               "page_slicers": page_slicers}
+        try:
+            page_state.apply_to_bridge(self.bridge.set, raw)
+        except Exception as exc:
+            log.exception("page delete failed: %s", exc)
+            self._refresh_page_tabs()
+            return
+        self._refresh_page_tabs()
+        # Reload the slicer placement cache from the incoming page's stored
+        # geometry explicitly. apply_to_bridge swaps the live keys, and the
+        # cache used to be refreshed only implicitly via _refresh_kpis ->
+        # _current_geometry -- so a refactor of either could silently leave
+        # the outgoing page's slicer slots in place. Make the reload explicit.
+        try:
+            charts = self.bridge.get("charts", []) or []
+            kpis = self.bridge.get("kpis", []) or []
+            cols = int(self.bridge.get("grid_cols_n", 2) or 2)
+            self._current_geometry(charts, kpis, cols)
+        except Exception:
+            log.debug("slicer geometry reload after page switch failed",
+                      exc_info=True)
+        self._refresh_kpis()
+        self._refresh_slicer_count()
+        self._schedule_regen()
+
+    def _pages_payload(self, raw_charts: list, state: dict) -> Optional[list]:
+        """Build the per-page payload for the paged export, or None.
+
+        Returns None when the report has a single page -- the saved file is
+        then byte-identical to a pre-pages export.
+
+        Figures are NOT re-baked per page: the embedded live engine filters
+        every chart from its own page's selection on load, which is the same
+        live architecture the single-page export uses. Slicer values are
+        memoised by the filter service, so a second export is cheap.
+        """
+        from services.export_service import build_export_charts
+
+        pages = state.get("pages") or []
+        if len(pages) < 2:
+            return None
+        raw_charts = list(raw_charts or [])
+        first_pid = pages[0]["id"]
+        chart_pages = state.get("chart_pages") or {}
+        meta_map = {c[0]: self.bridge.get_chart_meta(c[0]) for c in raw_charts}
+        notes = {c[0]: self.bridge.get_note(c[0]) for c in raw_charts}
+        globs = [dict(s) for s in (state.get("page_slicers") or {}).get("__global__", [])
+                 if isinstance(s, dict)]
+        out: list = []
+        for page in pages:
+            pid = page["id"]
+            local = [c for c in raw_charts
+                     if chart_pages.get(str(c[0]), first_pid) == pid]
+            kpis = [dict(k) for k in (state.get("page_kpis") or {}).get(pid, [])
+                    if isinstance(k, dict)]
+            effective = [dict(s) for s in globs]
+            effective += [dict(s) for s in (state.get("page_slicers") or {}).get(pid, [])
+                          if isinstance(s, dict)]
+            effective = self._enriched_slicer_defs(effective)
+            export_charts = build_export_charts(local, meta_map=meta_map, notes=notes)
+            values = self._slicer_values(effective, self.bridge.df)
+            tile_g, kpi_g, slicer_g = self._split_geometry_blob(
+                (state.get("page_geometry") or {}).get(pid) or {})
+            out.append({"id": pid, "name": page.get("name", pid),
+                        "charts": export_charts,
+                        "kpis": kpis,
+                        "slicers": effective,
+                        "slicer_values": values,
+                        "tile_geometry": tile_g,
+                        "kpi_geometry": kpi_g,
+                        "slicer_geometry": slicer_g})
+        return out
+
     def _snapshot_inputs(self) -> dict:
         """Cheap bridge reads for the background input assembler.
 
@@ -1651,7 +2391,24 @@ class DashboardPage(QWidget):
         ReportInputsWorker; this must stay instant because it runs on the
         UI thread after every drag release and slicer click.
         """
-        charts = self.bridge.get("charts", [])
+        all_charts = self.bridge.get("charts", [])
+        raw_charts = list(all_charts)
+        page_state = self._page_state()
+        active_pid = page_state["active"]
+        first_pid = page_state["pages"][0]["id"]
+        chart_pages = dict(page_state["chart_pages"])
+        # Every chart belongs to exactly one page; charts that have never been
+        # seen (generated while some page was active) land on the active page.
+        dirty = False
+        for c in all_charts or []:
+            uid = str(c[0]) if c else ""
+            if uid and uid not in chart_pages:
+                chart_pages[uid] = active_pid
+                dirty = True
+        if dirty:
+            self.bridge.set("chart_pages", chart_pages)
+        charts = [c for c in all_charts or []
+                  if chart_pages.get(str(c[0]), first_pid) == active_pid]
         slicers = list(self.bridge.get("slicers", []) or [])
         cols = int(self.bridge.get("grid_cols_n", 2))
         tile_geom, kpi_geom = self._current_geometry(charts,
@@ -1696,6 +2453,10 @@ class DashboardPage(QWidget):
             "slicer_geometry": dict(
                 getattr(self, "_slicer_geom", {}) or {}),
             "geometry_mode": "free",
+            "active_page": active_pid,
+            "page_list": page_state["pages"],
+            "chart_pages": chart_pages,
+            "raw_charts": raw_charts,
         }
 
     def _regen_preview(self) -> None:
@@ -1759,6 +2520,7 @@ class DashboardPage(QWidget):
         if token != self._regen_token:
             return
         snap = getattr(self, "_pending_snap", None) or {}
+        self._last_inputs_payload = dict(partial.get("report_payload") or {})
         d = dict(snap)
         d.update(partial)
         # Supersede any in-flight stage-2 build before starting this one, so a
@@ -1789,6 +2551,20 @@ class DashboardPage(QWidget):
         self._preview_worker = worker
         worker.start()
 
+    def _sync_tab_accent(self) -> None:
+        """Point the page-tab strip at the board's current accent colour.
+
+        Falls back to the built-in indigo when the user clears the override
+        (an empty Accent means "follow the built-in report palette").
+        """
+        try:
+            default = _STYLE_DEFAULTS.get("ex_accent", _PageTabBar._DEFAULT_ACCENT)
+            accent = str(self.bridge.get("ex_accent", default) or default).strip()
+            if self.page_tabs is not None:
+                self.page_tabs.set_accent(accent)
+        except Exception as exc:
+            log.debug("tab accent sync skipped: %s", exc)
+
     @staticmethod
     def _preview_extra_css() -> str:
         """Fonts the canvas must be offered explicitly.
@@ -1804,11 +2580,97 @@ class DashboardPage(QWidget):
             log.debug("bundled font CSS unavailable for canvas", exc_info=True)
             return ""
 
+    @staticmethod
+    def _render_context(snap: dict) -> tuple:
+        """Cheap equality snapshot of everything a rebuild would change.
+
+        The incremental canvas injector is allowed to splice a newly added
+        chart's card into the already-loaded document ONLY when nothing else
+        about the board would differ. Anything not in this tuple (tile
+        geometry, slicer/KPI placement) is deliberately excluded: the DOM is
+        already there, moved by the gesture itself.
+
+        Empty notes are dropped because adding a chart adds an empty note
+        entry for it -- without this filter the context would differ on every
+        chart add and the injector would never fire.
+        """
+        notes = {u: t for u, t in (snap.get("notes") or {}).items()
+                   if str(t or "").strip()}
+        return (snap.get("session_name"), snap.get("dashboard_title"),
+                snap.get("orientation"), snap.get("state"),
+                snap.get("kpis"), snap.get("slicers"), notes,
+                int(snap.get("grid_cols_n") or 2),
+                snap.get("active_page"),
+                tuple(str(p.get("id")) for p in (snap.get("page_list") or ())))
+
+    def _commit_render(self, snap: dict, *, injected: bool) -> None:
+        self._rendered_uids = {c[0] for c in (snap.get("charts") or [])
+                               if c and c[0]}
+        self._last_render_context = self._render_context(snap)
+        payload = getattr(self, "_last_inputs_payload", None) or {}
+        if not injected:
+            # Payload columns the loaded document embeds; the injector must
+            # not splice in a chart whose recipe reads columns the document
+            # does not carry (a rebuilt-from-scratch payload would have added
+            # them, and the live engine would otherwise paint an empty card).
+            self._rendered_payload_cols = frozenset(payload.get("columns") or ())
+            self._rendered_has_live = bool(payload.get("columns"))
+
+    def _try_inject_charts(self, added, snap: dict) -> bool:
+        """Splice cards for added charts into the loaded canvas, no reload.
+
+        Falls back to the normal full rebuild (returns False) whenever the
+        augmentation could not reproduce exactly what a rebuild would show:
+        board not ready, context drifted, a map chart is involved, or the
+        live dataset does not carry the new chart's columns.
+        """
+        canvas = getattr(self, "report_canvas", None)
+        if canvas is None or not canvas.is_ready():
+            return False
+        if self._render_context(snap) != getattr(self, "_last_render_context", None):
+            return False
+        added_charts = [c for c in (snap.get("charts") or []) if c and c[0] in added]
+        if not added_charts:
+            return False
+        if getattr(self, "_rendered_has_live", False):
+            try:
+                from modules.report_data import payload_columns
+            except Exception:
+                return False
+            rendered_cols = set(getattr(self, "_rendered_payload_cols", ()))
+            recipes = snap.get("recipes") or {}
+            for chart in added_charts:
+                needed = payload_columns({chart[0]: recipes.get(chart[0]) or {}}, [], [])
+                if not set(needed) <= rendered_cols:
+                    return False
+        try:
+            from modules.echarts_export import chart_fragments_for_injection
+            fragments = chart_fragments_for_injection(
+                added_charts, snap.get("tile_geometry") or {},
+                notes=snap.get("notes") or {}, state=snap.get("state") or {},
+                board_width=1600.0, z_index_base=100)
+        except Exception:
+            log.debug("chart fragment build failed; full reload", exc_info=True)
+            return False
+        if not fragments:
+            return False
+        from modules.report_editor import injection_js
+        canvas.run_js(injection_js(fragments))
+        log.info("injected %d chart card(s) into the live canvas", len(fragments))
+        return True
+
     def _on_preview_ready(self, token: int, html: str) -> None:
         """Show a finished build -- unless a newer one superseded it."""
         if token != self._regen_token:
             return
+        snap = getattr(self, "_pending_snap", None) or {}
+        added = getattr(self, "_pending_added_uids", None) or []
+        self._pending_added_uids = []
+        if added and self._try_inject_charts(set(added), snap):
+            self._commit_render(snap, injected=True)
+            return
         self.report_canvas.set_report(html)
+        self._commit_render(snap, injected=False)
 
     def _on_preview_failed(self, token: int, error: str) -> None:
         if token != self._regen_token:
@@ -2159,18 +3021,25 @@ class DashboardPage(QWidget):
         slicers[idx] = updated
         self._write_slicers(slicers)
         self._refresh_slicer_count()
-        self._refresh_charts()
         # The loaded report owns the live filter engine. Its change listener
         # updates only affected ECharts instances and KPI values in-place; a
         # document rebuild here used to re-filter every recipe, serialize the
-        # full embedded dataset, and reload WebEngine on every selection.
-        # The bridge state above is retained for later save/export/regeneration.
+        # full embedded dataset, and reload WebEngine on every selection --
+        # destroying the very dropdown the user was clicking ("whole canvas
+        # reloads, controls unresponsive" report, 2026-11-24). Do NOT schedule
+        # one from here. The bridge state above is retained for later
+        # save/export/regeneration.
 
     def _on_canvas_action(self, uid: str, action: str) -> None:
         """A per-card button on the canvas was pressed.
 
         The buttons live inside the report now, so the page owns what they mean.
         """
+        if uid == "__injection__":
+            # The in-place chart injection failed and cleaned itself up;
+            # rebuild the document so the board shows the stored state.
+            self._schedule_regen()
+            return
         if not uid:
             return
         # The title card carries no action bar at all (see report_editor), so it
@@ -2466,7 +3335,22 @@ class DashboardPage(QWidget):
         self.bridge.set("slicers", normalized)
 
     def _sync_slicers_live(self) -> bool:
-        """Patch every supported slicer widget and its filter metadata in place."""
+        """Patch every supported slicer widget and its filter metadata in place.
+
+        Any failure -- a bad dataset reference, a non-finite bound, a JSON
+        serialisation error, anything at all -- is logged and reported as
+        False so the caller falls back to a full rebuild. Before this guard,
+        one exception here aborted the call chain without scheduling a rebuild
+        and the slicer simply never appeared, with no error anywhere.
+        """
+        try:
+            return self._sync_slicers_live_inner()
+        except Exception:
+            log.exception("live slicer sync failed; falling back to a full rebuild")
+            return False
+
+    def _sync_slicers_live_inner(self) -> bool:
+        """Implementation of :meth:`_sync_slicers_live` (see its docstring)."""
         import polars as pl
         if not self.report_canvas.is_ready():
             return False
@@ -2926,27 +3810,7 @@ class DashboardPage(QWidget):
         # Supply real slider bounds to both the editable canvas and the saved
         # HTML. The filter spec remains the same; these fields describe only
         # the control range and are ignored by the filtering algebra.
-        dataset = self.bridge.polars_dataset(create_if_missing=False)
-        if dataset is not None:
-            enriched = []
-            for source in slicers:
-                item = dict(source or {})
-                spec = dict(item.get("spec") or {})
-                if str(item.get("widget") or "").lower() == "slider":
-                    try:
-                        col, dtype = item.get("column"), dataset.schema.get(item.get("column"))
-                        if col and dtype in (pl.Date, pl.Datetime):
-                            low, high = dataset.frame.select(pl.col(col).min(), pl.col(col).max()).collect().row(0)
-                            spec.update({"min": str(low)[:10], "max": str(high)[:10], "bounds_kind": "datetime"})
-                        elif col and dtype is not None and dtype.is_numeric():
-                            low, high = dataset.frame.select(pl.col(col).min(), pl.col(col).max()).collect().row(0)
-                            spec.update({"min": low, "max": high, "step": 1 if dtype.is_integer() else 0.01,
-                                         "bounds_kind": "numeric"})
-                    except Exception:
-                        log.debug("could not prepare export slider bounds", exc_info=True)
-                item["spec"] = spec
-                enriched.append(item)
-            slicers = enriched
+        slicers = self._enriched_slicer_defs(slicers)
         # FULL column-pruned dataset for the in-browser engine of the SAVED
         # file (no row cap). Built here because this is the only layer that
         # has the DataFrame -- build_export_report itself is headless.
@@ -2968,10 +3832,10 @@ class DashboardPage(QWidget):
             except Exception:
                 log.debug('report payload not built; static export', exc_info=True)
                 report_payload = None
+        export_charts = build_export_charts(charts, meta_map=meta_map, notes=notes)
         return {
             "charts": charts,
-            "export_charts": build_export_charts(
-                charts, meta_map=meta_map, notes=notes),
+            "export_charts": export_charts,
             "session_name": (self.session_name.text().strip()
                              or "Lytrize Report"),
             "orientation": ("landscape"
@@ -3038,6 +3902,13 @@ class DashboardPage(QWidget):
         fmt = getattr(self, "_pending_export_fmt", "html")
         d = dict(snap)
         d.update(partial)
+        if d.get("pages") is None:
+            try:
+                d["pages"] = self._pages_payload(d.get("raw_charts") or d.get("charts"),
+                                                 self._page_state())
+            except Exception:
+                log.exception("page payload build failed; single-page export")
+                d["pages"] = None
         # Buttons were already disabled by _assemble_export_inputs;
         # _start_export disables again (idempotent) and launches the build.
         self._start_export(d, fmt=fmt)
@@ -3080,6 +3951,7 @@ class DashboardPage(QWidget):
             slicer_values=d["slicer_values"],
             report_payload=d.get("report_payload"),
             geometry_mode=d["geometry_mode"],
+            pages=d.get("pages"),
             parent=self,
         )
         self._export_worker.finished_ok.connect(self._on_export_finished)
@@ -3142,6 +4014,12 @@ class DashboardPage(QWidget):
             return
         try:
             Path(file_path).write_text(html, encoding="utf-8")
+            try:
+                self.bridge.record_report_built(
+                    self.session_name.text().strip() or self.dash_title.text().strip() or safe_file,
+                    "html")
+            except Exception:
+                log.debug("report-built bookkeeping failed", exc_info=True)
             QMessageBox.information(self, "Export Complete",
                                     f"Dashboard saved to:\n{file_path}")
         except Exception as exc:
@@ -3330,6 +4208,12 @@ class DashboardPage(QWidget):
         )
         if file_path:
             if pixmap.save(file_path, "PNG"):
+                try:
+                    self.bridge.record_report_built(
+                        self.session_name.text().strip() or self.dash_title.text().strip() or safe_file,
+                        "png")
+                except Exception:
+                    log.debug("report-built bookkeeping failed", exc_info=True)
                 QMessageBox.information(self, "Export Complete",
                                         f"Dashboard image saved to:\n{file_path}")
             else:
@@ -3442,6 +4326,13 @@ class DashboardPage(QWidget):
         dataset_hash, dataset_uri = save_dataset(df)
         slicers_json = json.dumps(list(self.bridge.get("slicers", []) or []))
         try:
+            from services import page_state
+            pages_json = page_state.page_state_json(
+                page_state.assemble_from_bridge(self.bridge.get))
+        except Exception as exc:
+            log.warning("page state assembly failed; saving default pages: %s", exc)
+            pages_json = "{}"
+        try:
             if editing_sid:
                 # Update existing session.
                 #
@@ -3477,6 +4368,7 @@ class DashboardPage(QWidget):
                     dataset_uri=dataset_uri,
                     dataset_hash=dataset_hash,
                     slicers_json=slicers_json,
+                    pages_json=pages_json,
                 )
                 clear_draft(user_id)
                 invalidate_sessions_cache()
@@ -3505,6 +4397,7 @@ class DashboardPage(QWidget):
                     dataset_uri=dataset_uri,
                     dataset_hash=dataset_hash,
                     slicers_json=slicers_json,
+                    pages_json=pages_json,
                 )
                 clear_draft(user_id)
                 invalidate_sessions_cache()
@@ -3571,6 +4464,20 @@ class DashboardPage(QWidget):
         # arrangement naming a deleted chart keeps contributing cells and gets
         # written back out on every drag, growing the saved blob each session.
         self._prune_geometry([c[0] for c in charts])
+
+        # The board this regen is about to render: note which charts are NEW
+        # relative to the committed document. A chart generated while the
+        # board is on screen gets injected into the live DOM instead of
+        # forcing a full document reload.
+        rendered = getattr(self, "_rendered_uids", None)
+        current_uids = [c[0] for c in charts if c and c[0]]
+        if rendered is None:
+            # Never committed a render yet: the full build is required.
+            self._pending_added_uids = []
+        else:
+            added = [u for u in current_uids if u not in rendered]
+            removed = [u for u in rendered if u not in set(current_uids)]
+            self._pending_added_uids = added if added and not removed else []
 
         self.lbl_empty.setVisible(len(charts) == 0)
         self._schedule_regen()
@@ -3804,6 +4711,18 @@ class DashboardPage(QWidget):
                     except Exception:
                         log.debug("session bundle slicer restore failed",
                                   exc_info=True)
+                    # Pages last: apply_to_bridge mirrors the ACTIVE page's
+                    # geometry/KPIs/slicers from the persisted maps, so it
+                    # must run after the single-page fields above. A legacy
+                    # blob ({}) installs only the Overview bookkeeping and
+                    # leaves what was just restored intact.
+                    try:
+                        from services import page_state
+                        page_state.apply_to_bridge(self.bridge.set,
+                                                   sm.get("pages_json"))
+                    except Exception:
+                        log.debug("session pages restore failed",
+                                  exc_info=True)
         else:
             # Not viewing saved — use current session state
             editing_name = self.bridge.get("editing_session_name")
@@ -3821,3 +4740,4 @@ class DashboardPage(QWidget):
         # Navigating to the page must show the real count: a draft restored in
         # the background can hold slicers this page has never seen.
         self._refresh_slicer_count()
+        self._refresh_page_tabs()

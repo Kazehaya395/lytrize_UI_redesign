@@ -10,8 +10,8 @@ signals to the main thread, which then applies the result.
 """
 from __future__ import annotations
 
+import json
 import logging
-import threading
 from typing import Any, Optional
 
 import polars as pl
@@ -50,17 +50,10 @@ class SessionBridge(QObject):
         self._last_df: Optional[pl.DataFrame] = None
         self._polars_dataset = None
 
-        # Async draft-save queue (latest-wins). save_draft() serialises the
-        # whole session (charts JSON + SQLite write) which stalls the UI
-        # on a large session, so the write runs on ONE background thread:
-        # at most one save in flight plus one pending carrying the newest
-        # snapshot. Tests that need determinism set _save_sync or call
-        # flush_draft_save().
-        self._save_lock = threading.Lock()
-        self._save_in_flight = False
-        self._save_pending = None
-        self._save_sync = False   # flipped by tests only
-
+        # save_draft() is synchronous: the SQLite write is small enough
+        # that handing it to a background thread was not worth the race
+        # (autosave could land after the app closed and lose the draft).
+        # Tests can call save_draft() and read the row back immediately.
     # -- Access to the underlying manager --
     @property
     def manager(self) -> SessionManager:
@@ -191,7 +184,74 @@ class SessionBridge(QObject):
         from services.database_service import record_dataset_analysed
         file_name = self._manager.get("file_name")
         file_signature = self._manager.get("file_signature")
-        return record_dataset_analysed(user_id, file_name or "", file_signature or "")
+        if not file_signature:
+            # Only the file-picker path ever stored one; Excel/DB/clipboard
+            # imports, and any other frame that arrived without it, would
+            # silently never count. Derive a stable, cheap one from the
+            # frame itself so EVERY import route counts.
+            file_signature = self._derive_dataset_signature(file_name or "dataset")
+        if not file_signature:
+            return False
+        try:
+            self._manager.set("file_signature", file_signature)
+        except Exception:
+            pass
+        return record_dataset_analysed(user_id, file_name or "", file_signature)
+
+    def _derive_dataset_signature(self, file_name: str) -> str:
+        """Cheap deterministic fingerprint of the loaded frame.
+
+        |shape + column names + a sample of the first rows| -- same file
+        re-imported yields the same signature (counted once); a changed
+        CSV/xlsx of the same name flips it (counted again). No data is
+        fingerprinted byte-wise, so this stays instant on large frames.
+        """
+        try:
+            df = self.df
+        except Exception:
+            df = None
+        if df is None:
+            return ""
+        try:
+            shape = getattr(df, "shape", None)
+            if shape is None:
+                cols = list(getattr(df, "columns", []))
+                rows = int(df.height) if hasattr(df, "height") else "?"
+            else:
+                rows, ncols = int(shape[0]), int(shape[1])
+                cols = list(df.columns)
+            try:
+                sample = df.head(3).to_dicts() if hasattr(df, "head") else None
+            except Exception:
+                sample = None
+            try:
+                key = (str(file_name), tuple(cols), rows, str(sample))
+                import hashlib
+                digest = hashlib.sha1(repr(key).encode("utf-8", "backslashreplace")).hexdigest()[:12]
+            except Exception:
+                digest = f"{rows}x{len(cols)}"
+            return f"{file_name}:{digest}"
+        except Exception:
+            return ""
+
+    def record_report_built(self, title: str = "", export_kind: str = "html") -> bool:
+        """Count that a dashboard report was built (exported to a file)."""
+        user_id = self._manager.get("user_id")
+        if not user_id:
+            return False
+        try:
+            from services.database_service import record_report_built
+        except Exception:
+            return False
+        rows = 0
+        try:
+            df = self.df
+            shape = getattr(df, "shape", None) if df is not None else None
+            if shape:
+                rows = int(shape[0])
+        except Exception:
+            rows = 0
+        return bool(record_report_built(user_id, title, export_kind, rows))
 
     # -- Generic state access --
     def get(self, key: str, default: Any = None) -> Any:
@@ -218,7 +278,6 @@ class SessionBridge(QObject):
     def save_draft(self) -> None:
         """Persist the current draft state via the database service."""
         from services.database_service import save_draft as db_save_draft
-        from services.chart_service import charts_to_json
         import json
 
         user_id = self._manager.get("user_id")
@@ -231,32 +290,56 @@ class SessionBridge(QObject):
             for k, v in self._manager.items()
             if k.startswith("chart_meta_") and isinstance(v, dict)
         }
-        notes = dict(self._manager._notes_shadow)
+        notes = dict(self._manager.get("chart_notes", {}) or {})
         # Free-canvas placement. Without this the draft restores every chart
         # but re-auto-places it, so a relaunch (autosave fires on every edit)
         # silently undid every drag -- the "canvas position resets" report.
         tile_geometry = self._manager.get("tile_geometry", {}) or {}
+        # Multi-page state, assembled fresh from the live bridge keys. A
+        # corrupt pages_json is never fatal: saving still persists the rest.
+        try:
+            from services import page_state
+            pages_json = page_state.page_state_json(
+                page_state.assemble_from_bridge(self._manager.get))
+        except Exception as exc:
+            log.warning("save_draft: page_state assembly failed: %s", exc)
+            pages_json = "{}"
 
-        # charts_to_json only emits chart_type from tuple slot 4, but charts
+        # charts_to_json only emits chart_type from tuple slot 5, but charts
         # are stored as bare 3-tuples -- the type lives in a separate
         # "chart_type_<uid>" key. Rebuild 6-tuples so the type survives
         # autosave; without it a restored chart has no analysis binding and
-        # is orphaned.
+        # is orphaned. (Slot 4 is desc -- notes go in via meta_map/notes.)
         full_charts = []
         for uid, title, model in charts:
             ct = self._manager.get(f"chart_type_{uid}", "")
-            full_charts.append((uid, title, model, ct, {}, {}))
+            full_charts.append((uid, title, model, "", ct,
+                                chart_meta.get(uid, {})))
 
+        # Positional misalignment here silently stored the file name in the
+        # charts_json column, the charts JSON in editing_session_id and the
+        # KPI list in dashboard_title (the DB layer swallows the type
+        # errors), so a relaunch found a draft row with no parseable charts
+        # and restored an empty session.  Pass arguments by name and use the
+        # real serializer so the row round-trips.
         try:
+            from services.chart_service import charts_to_json
+            charts_json = charts_to_json(full_charts, notes=notes,
+                                         meta_map=chart_meta)
             db_save_draft(
                 user_id,
-                self._manager.get("session_name") or "Untitled",
-                self._manager.get("file_name"),
-                self._manager.get("file_signature"),
-                json.dumps(full_charts, default=str),
-                self._manager.get("slicers", []),
-                tile_geometry,
-                self._manager.get("kpis", []),
+                self._manager.get("page") or "analysis",
+                charts_json,
+                file_name=self._manager.get("file_name") or "",
+                editing_session_id=self._manager.get("editing_session_id"),
+                editing_session_name=self._manager.get("editing_session_name"),
+                editing_file_name=self._manager.get("editing_file_name") or "",
+                dashboard_title=self._manager.get("dashboard_title") or "",
+                kpis_json=json.dumps(self._manager.get("kpis", [])),
+                chart_meta_json=json.dumps(chart_meta),
+                layout_mode=self._manager.get("layout_mode") or "portrait",
+                tile_geometry_json=json.dumps(tile_geometry),
+                pages_json=pages_json,
             )
         except Exception as exc:
             log.error("save_draft: %s", exc)
@@ -343,6 +426,30 @@ class SessionBridge(QObject):
             tile_geometry = {}
         if isinstance(tile_geometry, dict) and tile_geometry:
             self._manager.set("tile_geometry", tile_geometry)
+
+        # -- Multi-page state -- (drafts saved before pages existed fall
+        # back to a single Overview page carrying the restored geometry.)
+        try:
+            from services import page_state
+            raw_pages = draft.get("pages_json")
+            if raw_pages:
+                page_state.apply_to_bridge(self._manager.set, raw_pages)
+            elif isinstance(tile_geometry, dict) and tile_geometry:
+                # Legacy draft: wrap everything onto one default page so the
+                # multi-page machinery finds a coherent state.
+                pid = page_state.DEFAULT_PAGE_ID
+                page_state.apply_to_bridge(self._manager.set, {
+                    "version": 1, "active": pid,
+                    "pages": [{"id": pid, "name": page_state.DEFAULT_PAGE_NAME}],
+                    "chart_pages": {},
+                    "page_geometry": {pid: dict(tile_geometry)},
+                    "page_kpis": {pid: list(self._manager.get("kpis", []) or [])},
+                    "page_slicers": {pid: [], "__global__": list(self._manager.get("slicers", []) or [])},
+                })
+            else:
+                page_state.apply_to_bridge(self._manager.set, None)
+        except Exception as exc:
+            log.warning("restore_draft: page state failed: %s", exc)
 
         log.info("restore_draft: restored %d chart(s) for user %s",
                  len(charts), user_id)

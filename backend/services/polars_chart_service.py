@@ -210,7 +210,7 @@ def _display(layout: Optional[dict], typography: Optional[dict], palette) -> dic
         pie_value_size = typography.get("value_label_size", pie_value_size)
     return {
         "title_size": typography.get("header_size", 20),
-        "title_align": typography.get("header_align", "left"),
+        "title_align": _header_align(typography.get("header_align", "left")),
         "title_weight": 700 if "bold" in str(typography.get("header_font_style", "")).lower()
         else 600,
         "text_color": typography.get("axis_tick_color", "auto"),
@@ -992,7 +992,7 @@ def build_matrix_table_chart(dataset: PolarsDataset, config: dict, *,
         "title_size": int((typography or {}).get("header_size", 20)),
         "title_color": str((typography or {}).get("header_color", "auto")),
         "title_font_style": str((typography or {}).get("header_font_style", "Bold")),
-        "title_align": str((typography or {}).get("header_align", "left")),
+        "title_align": _header_align((typography or {}).get("header_align")),
         "text_color": str((typography or {}).get("axis_tick_color", "auto")),
         "chart_background": "transparent",
     }
@@ -1148,9 +1148,21 @@ def detect_outliers_polars(dataset: PolarsDataset, columns: list,
     return results
 
 
+def _header_align(value, default="left"):
+    """Clamp the header alignment key to the three the renderer honours.
+
+    Unknown stored values fall back to *default*, matching the Plotly
+    display pass, so a stale/corrupt config never reaches ECharts as an
+    ignored string.
+    """
+    a = str(value or "").strip().lower()
+    return a if a in ("left", "center", "right") else default
+
+
 def build_outlier_charts(dataset: PolarsDataset, columns: list, *,
                          multiplier: float = 1.5,
                          typography: Optional[dict] = None,
+                         roles: Optional[dict] = None,  # accepted for a uniform builder signature; columns are explicit
                          normal_sample_limit: int = 8_000,
                          outlier_sample_limit: int = 20_000) -> list[dict]:
     """Build ECharts scatter models with Polars-computed IQR fences.
@@ -1234,7 +1246,8 @@ def build_outlier_charts(dataset: PolarsDataset, columns: list, *,
 
 def build_data_quality_charts(dataset: PolarsDataset, *,
                               sample_rows: int = 100,
-                              max_columns: int = 80) -> list[dict]:
+                              max_columns: int = 80,
+                              roles: Optional[dict] = None) -> list[dict]:  # uniform builder signature; scans every column
     """Summarize missing values and duplicate rows as native ECharts models.
 
     Missing counts treat both Polars nulls and floating NaNs as missing, to
@@ -1486,6 +1499,12 @@ def build_choropleth_chart(dataset: PolarsDataset, config: dict, *,
         found = admin1_aliases.get(text)
         if found:
             return found
+        # Ambiguous bare names (for example "Florida", which Uruguay also
+        # publishes) stay unresolvable worldwide, but a US-flavoured column
+        # still means the US state; us_state_aliases is USA-only.
+        found = state_aliases.get(text)
+        if found:
+            return found
         words = text.split()
         # Accept common qualifiers when the source contains a state/province
         # name plus its country (for example "California, USA"). The bare
@@ -1506,20 +1525,20 @@ def build_choropleth_chart(dataset: PolarsDataset, config: dict, *,
     denominator = max(len(normalized_values), 1)
     if (prefer_state and max(state_hits, admin1_hits) / denominator >= 0.4):
         map_id, map_asset, aliases, names, resolver = (
-            "lytrize_ne_admin1_50m", "admin1-50m", admin1_aliases,
+            "lytrize_ne_admin1_10m", "admin1-10m", admin1_aliases,
             lookup.get("admin1_names", lookup["us_state_names"]),
             admin1_key)
     elif prefer_country and country_hits / denominator >= 0.4:
         map_id, map_asset, aliases, names, resolver = (
-            "lytrize_ne_countries_110m", "countries-110m", country_aliases,
+            "lytrize_ne_countries_50m", "countries-50m", country_aliases,
             lookup["country_names"], country_key)
     elif country_hits / denominator >= 0.4:
         map_id, map_asset, aliases, names, resolver = (
-            "lytrize_ne_countries_110m", "countries-110m", country_aliases,
+            "lytrize_ne_countries_50m", "countries-50m", country_aliases,
             lookup["country_names"], country_key)
     elif admin1_hits / denominator >= 0.4:
         map_id, map_asset, aliases, names, resolver = (
-            "lytrize_ne_admin1_50m", "admin1-50m", admin1_aliases,
+            "lytrize_ne_admin1_10m", "admin1-10m", admin1_aliases,
             lookup.get("admin1_names", lookup["us_state_names"]),
             admin1_key)
     else:
@@ -1633,15 +1652,19 @@ def build_choropleth_chart(dataset: PolarsDataset, config: dict, *,
     if projection not in {"natural earth", "mercator", "equirectangular"}:
         projection = "natural earth"
     scope = str(config.get("choropleth_scope") or "world").lower()
-    if map_id == "lytrize_ne_admin1_50m" and scope == "world":
+    if map_id == "lytrize_ne_admin1_10m" and scope == "world":
         scope = "usa"
+    # Approximate longitude spans (degrees) for the known scopes, used to
+    # re-frame the view against the real panel size in the renderer: ECharts
+    # sizes the projection's base fit to 0.92*min(W,H), so a zoom picked
+    # without knowing the panel opens country views zoomed out.
     scope_view = {
-        "world": ([0, 0], 1), "usa": ([-98, 39], 2.5),
-        "europe": ([15, 52], 2.5), "asia": ([95, 34], 1.7),
-        "africa": ([20, 0], 2), "north america": ([-100, 42], 1.8),
-        "south america": ([-60, -15], 2),
+        "world": ([0, 0], 1, None), "usa": ([-98, 39], 5.5, 59.0),
+        "europe": ([15, 52], 5.5, 40.0), "asia": ([95, 34], 3.6, 115.0),
+        "africa": ([20, 0], 4.6, 66.0), "north america": ([-100, 42], 4.1, 78.0),
+        "south america": ([-60, -15], 4.6, 60.0),
     }
-    center, zoom = scope_view.get(scope, scope_view["world"])
+    center, zoom, map_frame_span = scope_view.get(scope, scope_view["world"])
     title = str(layout.get("title") or
                 f"Choropleth: {operation.upper()}({value_col or 'Rows'}) by {geo_col}")
     if unresolved:
@@ -1651,6 +1674,7 @@ def build_choropleth_chart(dataset: PolarsDataset, config: dict, *,
         "text_color": str(typography.get("axis_tick_color", "auto")),
         "map_asset": map_asset, "map_id": map_id,
         "map_center": center, "map_zoom": zoom,
+        "map_frame_span": map_frame_span,
         "map_projection": projection,
         "map_scope": scope,
         "map_borders": bool(config.get("choropleth_show_borders",
@@ -1738,11 +1762,39 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
 
     lat = config.get("lat_col")
     lon = config.get("lon_col")
-    if not _ly_numeric_ok(lat) or not _ly_numeric_ok(lon):
+    if not _ly_numeric_ok(lat):
         lat = next((c for c in names if "lat" in c.lower() and _ly_numeric_ok(c)), None)
-        lon = next((c for c in names if any(k in c.lower() for k in ("lon", "lng", "long")) and _ly_numeric_ok(c)), None)
+    if not _ly_numeric_ok(lon) or lon == lat:
+        # A numeric pick that resolves to the SAME column as latitude is
+        # unusable (kept as-is it stretched the whole map onto one axis).
+        lon = next((c for c in names if any(k in c.lower() for k in ("lon", "lng", "long"))
+                    and _ly_numeric_ok(c) and c != lat), None)
     location = config.get("location_col")
     location = location if location in schema else None
+    if location in (lat, lon):
+        # A coordinate column is not a place name: grouping by it produced
+        # "910 locations" with bare longitude values on hover instead of
+        # city names.
+        location = None
+    if not location:
+        # Zero-config fallback for the common transactions-export shape (a
+        # string column named like a place): makes per-city aggregation and
+        # city-named hover work without filling a second field first.
+        string_like = [getattr(pl, "String", None), getattr(pl, "Categorical", None)]
+        string_like = [s for s in string_like if s is not None]
+
+        def _is_string_like(col):
+            try:
+                return schema.get(col) in string_like
+            except Exception:
+                return False
+        for token in ("city", "town", "locality", "municipality", "state",
+                      "province", "region", "county", "place", "location"):
+            candidate = next((c for c in names
+                              if token in str(c).lower() and _is_string_like(c)), None)
+            if candidate:
+                location = candidate
+                break
     value_col = config.get("value_col")
     value_col = value_col if _ly_numeric_ok(value_col) else None
     color_col = config.get("color_col")
@@ -1751,7 +1803,7 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
     sampled = mode.startswith("sample")
     density = not sampled
     input_count = None
-    map_id, map_asset = "lytrize_ne_countries_110m", "countries-110m"
+    map_id, map_asset = "lytrize_ne_countries_50m", "countries-50m"
     lookup = _natural_earth_lookup()
 
     selected_cols = []
@@ -1773,6 +1825,9 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
             found = admin1_aliases.get(normalized)
             if found:
                 return found
+            found = state_aliases.get(normalized)
+            if found:
+                return found
             words = normalized.split()
             for qualifier in ("united states of america", "united states", "usa", "us"):
                 q = qualifier.split()
@@ -1791,7 +1846,7 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
                             for token in ("state", "province", "region", "admin1"))
         if admin1_hits and (admin1_hits > country_hits or
                             (prefer_admin1 and admin1_hits >= country_hits)):
-            map_id, map_asset = "lytrize_ne_admin1_50m", "admin1-50m"
+            map_id, map_asset = "lytrize_ne_admin1_10m", "admin1-10m"
             centers, resolver = lookup.get("admin1_centers", lookup["us_state_centers"]), resolve_admin1
         elif country_hits:
             centers, resolver = lookup["country_centers"], aliases
@@ -1847,24 +1902,81 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
                 default=None, return_dtype=pl.Float64).alias("__ly_lat"),
         ).filter(pl.col("__ly_lat").is_not_null() & pl.col("__ly_lon").is_not_null())
 
-    # If an explicit location and value are selected, aggregate one marker per
-    # location, matching the legacy product behavior while keeping compute in Polars.
-    group_location = bool(location and value_col)
+    # If a place column and any measure are present, aggregate one marker per
+    # place. The measure is the Value column, or the Colour column when it is
+    # numeric -- is_fraud being the canonical case. Per-place aggregation is
+    # what "fraud sum in US cities" means; a 45x45 density grid can only ever
+    # answer "how many points landed in a cell".
+    colour_is_numeric = False
+    try:
+        _cdtype = schema.get(color_col) if color_col else None
+        colour_is_numeric = bool(_cdtype is not None and
+                                 (_cdtype.is_numeric() or _cdtype == pl.Boolean))
+    except Exception:
+        colour_is_numeric = False
+    metric_col = value_col or (color_col if colour_is_numeric else None)
+    agg_normalized = str(config.get("agg_func") or "mean").strip().lower()
+    agg_normalized = {"avg": "mean", "average": "mean"}.get(agg_normalized,
+                                                           agg_normalized)
+    if agg_normalized not in {"sum", "mean", "median", "count", "min", "max"}:
+        agg_normalized = "mean"
+    agg_label = {"mean": "AVG", "sum": "SUM", "median": "MEDIAN",
+                 "count": "COUNT", "min": "MIN", "max": "MAX"}.get(
+                     agg_normalized, agg_normalized.upper())
+    group_location = bool(location and metric_col)
+    # value[2] (the tooltip number + colorbar) carries the colour aggregate
+    # when a numeric colour column owns the colorbar, else the metric. The
+    # tooltip label must say which, or the number is meaningless.
+    colour_drives_value = bool(group_location and colour_is_numeric
+                               and color_col != metric_col)
+    if colour_drives_value:
+        metric_title = f"{agg_label}({color_col})"
+    elif metric_col:
+        metric_title = f"{agg_label}({metric_col})" if (density or group_location) else str(metric_col)
+    else:
+        metric_title = "Count"
+
     map_render_kind = "density" if density and not group_location else "scatter"
     effective_sampled = sampled and not group_location
     if effective_sampled:
         input_count = int(frame.select(pl.len()).collect().item())
     if group_location:
-        agg = str(config.get("agg_func") or "mean").strip().lower()
-        agg = {"avg": "mean", "average": "mean"}.get(agg, agg)
-        if agg not in {"sum", "mean", "median", "count", "min", "max"}:
-            agg = "mean"
+        agg = agg_normalized
         group_aggs = [
             pl.col("__ly_lon").first(), pl.col("__ly_lat").first(),
-            _map_agg_expr(value_col, agg, schema).alias("__ly_metric"),
+            _map_agg_expr(metric_col, agg, schema).alias("__ly_metric"),
         ]
-        if color_col and color_col != value_col:
-            group_aggs.append(pl.col(color_col).drop_nulls().first().alias("__ly_color"))
+        if color_col:
+            # The colour column must survive the GROUP BY: with
+            # color_col == value_col the grouped frame no longer carries it,
+            # so every point lost both its colour and the colorbar (a single
+            # static blue series was all the user ever saw). Re-express it as
+            # __ly_color in every case -- the numeric aggregate for numeric
+            # columns (the value itself when it is also the colour signal),
+            # a string label for booleans/dates/mixed, otherwise the raw
+            # first value.
+            color_dtype = schema.get(color_col)
+            color_is_bool = False
+            color_is_numeric = False
+            try:
+                color_is_bool = bool(color_dtype is not None and color_dtype == pl.Boolean)
+                color_is_numeric = bool(color_dtype is not None and
+                                        color_dtype.is_numeric() and
+                                        color_dtype != pl.Boolean)
+            except Exception:
+                color_is_numeric = False
+            if color_is_bool:
+                group_aggs.append(pl.col(color_col).drop_nulls().cast(pl.String)
+                                  .first().alias("__ly_color"))
+            elif color_is_numeric:
+                # EVERY numeric colour is aggregated with the same function as
+                # the metric. The old "first row wins" path made the colorbar
+                # and the tooltip read a random 0/1 flag from one row.
+                group_aggs.append(_map_agg_expr(color_col, agg, schema)
+                                  .alias("__ly_color"))
+            else:
+                group_aggs.append(pl.col(color_col).drop_nulls().first()
+                                  .alias("__ly_color"))
         if config.get("size_col") in schema and config.get("size_col") != value_col:
             group_aggs.append(_map_agg_expr(config["size_col"], agg, schema).alias("__ly_size"))
         for i, (column, fn, _label) in enumerate(extras):
@@ -1880,13 +1992,12 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
     elif density:
         # A bounded 45x45 grid means all source rows contribute while the
         # resulting model remains small enough for interactive Qt WebEngine.
-        density_metric = value_col or (
-            color_col if color_col and schema[color_col].is_numeric() else None)
+        density_metric = metric_col
         density_aggs = [pl.col("__ly_lat").mean(), pl.col("__ly_lon").mean(),
                         pl.len().alias("__ly_count")]
         if density_metric:
             density_aggs.append(
-                _numeric_values_expr(density_metric, schema).mean().alias("__ly_metric"))
+                _map_agg_expr(density_metric, agg_normalized, schema).alias("__ly_metric"))
         if color_col and not schema[color_col].is_numeric() and color_col not in (location,):
             density_aggs.append(pl.col(color_col).drop_nulls().first().alias("__ly_color"))
         for index, (column, operation, _label) in enumerate(extras):
@@ -1921,7 +2032,44 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
         numeric_values = [x["value"][2] for x in data]
         categorical = False
     else:
-        metric_key = "__ly_metric" if group_location else value_col
+        def _is_color_scalar(value):
+            # Polars Boolean arrives as Python bool, which isinstance()s as
+            # int and silently defeated both the categorical detector (every
+            # boolean was skipped, leaving zero colour groups) and the numeric
+            # detector. Treat bools as labels everywhere in the colour path;
+            # only real int/float are continuous colour signals.
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+        def _schema_is_numeric(name):
+            try:
+                dtype = schema.get(name)
+                return bool(dtype is not None and dtype.is_numeric()
+                            and dtype != pl.Boolean)
+            except Exception:
+                return False
+
+        # The colour source is always the (possibly re-aggregated) __ly_color
+        # whenever a location aggregation ran and a colour column was picked;
+        # otherwise it is the raw column.
+        color_source = "__ly_color" if group_location and color_col else color_col
+        numeric_color_column = bool(color_col and _schema_is_numeric(color_col))
+        if color_col is not None:
+            # A numeric colour column feeds the continuous colorbar directly;
+            # anything else (strings, booleans, mixed) colours via categorical
+            # groups and never touches the colorbar. Without a numeric colour
+            # the colorbar follows the aggregated metric when there is one.
+            metric_key = color_source if numeric_color_column else (
+                "__ly_metric" if group_location else None)
+        else:
+            metric_key = "__ly_metric" if group_location else value_col
+        categories = []
+        for row in rows:
+            candidate = row.get(color_source) if color_source else None
+            if candidate is not None and not _is_color_scalar(candidate):
+                label = str(candidate)
+                if label not in categories:
+                    categories.append(label)
+        categorical = bool(color_col and categories and len(categories) <= 25)
         requested_size = config.get("size_col")
         if bool(layout.get("size_by_value")) and group_location:
             size_col = "__ly_metric"
@@ -1929,20 +2077,6 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
             if not requested_size and bool(layout.get("size_by_value")):
                 requested_size = value_col
             size_col = requested_size if requested_size in schema else None
-        categories = []
-        color_source = "__ly_color" if group_location and color_col and color_col != value_col else color_col
-        numeric_color_column = bool(color_col and schema[color_col].is_numeric())
-        if numeric_color_column and group_location and color_source != value_col:
-            metric_key = color_source
-        elif numeric_color_column and not metric_key:
-            metric_key = color_source
-        for row in rows:
-            candidate = row.get(color_source) if color_source else None
-            if candidate is not None and not isinstance(candidate, (int, float)):
-                label = str(candidate)
-                if label not in categories:
-                    categories.append(label)
-        categorical = bool(color_col and categories and len(categories) <= 25)
         numeric_values, series = [], []
         groups = categories if categorical else [None]
         size_key = ("__ly_size" if group_location and size_col and
@@ -1974,7 +2108,8 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
                 except (TypeError, ValueError):
                     continue
                 metric = row.get(metric_key) if metric_key else None
-                numeric_color = (float(metric) if metric is not None and isinstance(metric, (int, float)) else None)
+                numeric_color = (float(metric) if metric is not None and
+                                 _is_color_scalar(metric) else None)
                 if numeric_color is not None and math.isfinite(numeric_color):
                     numeric_values.append(numeric_color)
                 size_value = row.get(size_key) if size_key else None
@@ -1986,8 +2121,14 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
                     size_value = size_low + (size_value - size_min_raw) * (size_high - size_low) / (size_max_raw - size_min_raw)
                 else:
                     size_value = max(size_low, 8)
-                details = {label: _json_scalar(row.get(f"__ly_extra_{i}") if group_location else row.get(col))
-                           for i, (col, fn, label) in enumerate(extras)}
+                details = {}
+                if (group_location and metric_col
+                        and metric_key != "__ly_metric"
+                        and metric_col != color_col):
+                    details[f"{agg_label}({metric_col})"] = _json_scalar(row.get("__ly_metric"))
+                details.update(
+                    {label: _json_scalar(row.get(f"__ly_extra_{i}") if group_location else row.get(col))
+                     for i, (col, fn, label) in enumerate(extras)})
                 point_name = row.get(location) if location else None
                 if point_name is None:
                     point_name = row.get(row_index)
@@ -2017,12 +2158,25 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
     scope_centers = {"usa": [-98, 39], "europe": [15, 52], "asia": [95, 34],
                      "africa": [20, 0], "north america": [-100, 42],
                      "south america": [-60, -15]}
+    map_frame_span = None
     if scope != "world":
         center = scope_centers.get(scope, center)
+        map_frame_span = {"usa": 59.0, "europe": 40.0, "asia": 115.0,
+                          "africa": 66.0, "north america": 78.0,
+                          "south america": 60.0}.get(scope)
     elif values_for_center and lon_for_center:
-        span = max(max(lon_for_center) - min(lon_for_center),
-                   max(values_for_center) - min(values_for_center))
-        zoom = max(1.0, min(12.0, 90.0 / max(span, 7.5)))
+        # Frame the actual data, not the mean of it: a bbox centre with a zoom
+        # that fills the card width. The old mean-centre + 90/span heuristic
+        # opened country-specific datasets at world scale ("map shows up
+        # zoomed out ... data is US"). The latitude span is stretched for the
+        # Mercator/Natural Earth y-factor so wide-country datasets still fit,
+        # and the zoom is capped so a single-city dataset doesn't max out.
+        lon_lo, lon_hi = min(lon_for_center), max(lon_for_center)
+        lat_lo, lat_hi = min(values_for_center), max(values_for_center)
+        center = [(lon_lo + lon_hi) / 2, (lat_lo + lat_hi) / 2]
+        span = max(lon_hi - lon_lo, (lat_hi - lat_lo) * 1.35, 7.5)
+        zoom = max(1.5, min(12.0, 240.0 / span))
+        map_frame_span = float(span)
     min_value = min(numeric_values) if numeric_values else 0
     max_value = max(numeric_values) if numeric_values else 1
     if min_value == max_value:
@@ -2032,7 +2186,8 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
         "text_color": str(typography.get("axis_tick_color", "auto")),
         "chart_background": "transparent", "legend": {"show": categorical, "position": "bottom", "layout": "horizontal", "font_size": 10},
         "map_asset": map_asset, "map_id": map_id, "map_center": center,
-        "map_zoom": zoom, "map_projection": str(config.get("choropleth_projection") or "natural earth"),
+        "map_zoom": zoom, "map_frame_span": map_frame_span,
+        "map_projection": str(config.get("choropleth_projection") or "natural earth"),
         "map_scope": scope, "map_borders": bool(config.get("show_borders", True)),
         "map_basemap": "satellite" if "satellite" in str(config.get("map_style", "")).lower() else "boundaries",
         "map_theme": "dark" if "dark" in str(config.get("map_style", "")).lower() else "light",
@@ -2040,10 +2195,14 @@ def build_map_plot_chart(dataset: PolarsDataset, config: dict, *,
         "map_border_color": "#64748b" if "dark" in str(config.get("map_style", "")).lower() else "#9aa8ba",
         "map_mode": map_render_kind, "map_sampled": effective_sampled,
         "map_unresolved": unresolved_names,
-        "map_numeric_color": bool(numeric_values and not density),
+        # NOTE: `density` stays True for the grid aggregation path only; a
+        # grouped location map (rendered as geo scatter) must still be able
+        # to drive the colorbar, so gate on the effective render kind.
+        "map_numeric_color": bool(numeric_values and map_render_kind != "density"),
         "map_point_count": int(input_count if effective_sampled else
                                 (sum(int(r.get("__ly_count") or 0) for r in rows)
                                  if density and not group_location else len(rows))),
+        "map_value_title": metric_title,
         "map_marker_opacity": float(config.get("marker_opacity", 0.82)),
         "map_marker_min": int(config.get("marker_size_min", 4)), "map_marker_max": int(config.get("marker_size_max", 22)),
         "map_marker_size": int(layout.get("marker_size", 6)),
@@ -2093,7 +2252,7 @@ def _categorical_display(layout: Optional[dict], typography: Optional[dict],
     return {
         "theme_mode": theme_mode,
         "title_size": typography.get("header_size", 20),
-        "title_align": typography.get("header_align", "left"),
+        "title_align": _header_align(typography.get("header_align", "left")),
         "title_weight": 700 if "bold" in str(typography.get("header_font_style", "")).lower() else 600,
         "text_color": typography.get("axis_tick_color", "auto"),
         "palette": palette,
@@ -2366,6 +2525,7 @@ def apply_chart_model_display_options(model: dict, layout: dict,
             "colorbar_orientation": str(layout.get("colorbar_orientation", previous.get("colorbar_orientation", "auto"))).lower(),
             "colorbar_border": bool(layout.get("show_border", previous.get("colorbar_border", False))),
             "map_marker_size": int(layout.get("marker_size", previous.get("map_marker_size", 6))),
+            "map_marker_opacity": float(layout.get("marker_opacity", previous.get("map_marker_opacity", 0.82))),
             "map_size_by_value": bool(layout.get("size_by_value", previous.get("map_size_by_value", False))),
         }
         title = str(layout.get("title") or "").strip()
@@ -2435,7 +2595,7 @@ def apply_chart_model_display_options(model: dict, layout: dict,
             "table_header_font_family": str(typography.get("header_family", typography.get("family", previous.get("table_header_font_family", "Inter")))),
             "title_size": int(typography.get("header_size", previous.get("title_size", 14))),
             "title_font_style": str(typography.get("header_font_style", previous.get("title_font_style", "Bold"))),
-            "title_align": str(typography.get("header_align", previous.get("title_align", "left"))),
+            "title_align": _header_align(typography.get("header_align", previous.get("title_align", "left"))),
             "title_color": str(typography.get("header_color", previous.get("title_color", "auto"))),
             "text_color": str(typography.get("axis_tick_color", previous.get("text_color", "auto"))),
         }
@@ -2517,10 +2677,24 @@ def apply_chart_model_display_options(model: dict, layout: dict,
         display["y_title"] = layout["y_label"] if "y_label" in layout else previous.get("y_title", "Count")
         display["show_grid"] = bool(layout.get("show_grid", previous.get("show_grid", True)))
         display["show_border"] = bool(layout.get("show_border", previous.get("show_border", False)))
-        display["histogram_bins"] = int((layout or {}).get(
-            "histogram_bins", previous.get("histogram_bins", 35)))
-        display["histogram_opacity"] = float((layout or {}).get(
-            "histogram_opacity", previous.get("histogram_opacity", 0.75)))
+        try:
+            bins_raw = (layout or {}).get(
+                "histogram_bins", previous.get("histogram_bins", 35))
+            display["histogram_bins"] = max(1, int(round(float(bins_raw))))
+        except (TypeError, ValueError):
+            # One bad layout key must not take down the whole display pass.
+            if "histogram_bins" in previous:
+                display["histogram_bins"] = previous["histogram_bins"]
+        try:
+            opacity_raw = (layout or {}).get(
+                "histogram_opacity", previous.get("histogram_opacity", 0.75))
+            opacity = float(opacity_raw)
+            if opacity != opacity:  # NaN
+                raise ValueError("opacity is NaN")
+            display["histogram_opacity"] = max(0.1, min(1.0, opacity))
+        except (TypeError, ValueError):
+            if "histogram_opacity" in previous:
+                display["histogram_opacity"] = previous["histogram_opacity"]
         display["theme_mode"] = theme_mode
         result["display"] = display
         title = str((layout or {}).get("title") or "").strip()
@@ -2547,6 +2721,10 @@ def apply_chart_model_display_options(model: dict, layout: dict,
             "line_width": int((layout or {}).get("line_width", previous.get("line_width", 2))),
             "line_shape": str((layout or {}).get("line_shape", previous.get("line_shape", "linear"))),
             "line_fill": str((layout or {}).get("line_fill", previous.get("line_fill", "none"))),
+            # The adapter decides whether the trendline's points are drawn from
+            # display.markers; the scatter branch never wrote it, so the live
+            # "Show markers" toggle did nothing.
+            "markers": bool((layout or {}).get("show_markers", previous.get("markers", True))),
             "renderer": ("svg" if str((layout or {}).get(
                 "render_mode", previous.get("renderer", "canvas"))).lower() == "svg"
                 else "canvas"),
@@ -2602,15 +2780,28 @@ def build_time_series_chart(dataset: PolarsDataset, config: dict, *,
         raise TypeError("build_time_series_chart requires a PolarsDataset")
     config = dict(config or {})
     schema = dataset.schema
-    date_col = config.get("x")
-    if isinstance(date_col, (list, tuple)):
-        date_col = date_col[0] if date_col else None
+
+    def _first(value):
+        if isinstance(value, (list, tuple)):
+            return value[0] if value else None
+        return value
+
+    date_col = _first(config.get("x"))
+    if date_col in (None, "", "None"):
+        # ``build_analysis_config`` forwards the resolved columns as
+        # ``x_cols``/``y_cols`` rather than the raw ``x``/``y`` widget keys,
+        # so read those too -- otherwise the desktop path (which goes
+        # through the config builder) produced an empty chart every time.
+        date_col = _first(config.get("x_cols"))
     if date_col in (None, "", "None"):
         date_cols = list((roles or {}).get("datetime") or [])
         date_col = next((col for col in date_cols if col in schema), None)
-    metric = config.get("y")
-    if isinstance(metric, (list, tuple)):
-        metric = metric[0] if metric else None
+    metric = _first(config.get("y"))
+    if metric in (None, "", "None"):
+        metric = _first(config.get("y_cols"))
+    if metric in (None, "", "None"):
+        num_pool = list((roles or {}).get("numeric") or [])
+        metric = next((col for col in num_pool if col in schema), None)
     if metric in (None, "", "None") or metric not in schema or metric == dataset.row_id:
         return None
     if date_col not in schema or date_col == dataset.row_id:

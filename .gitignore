@@ -13,7 +13,7 @@ venv/
 .venv/
 env/
 my_venv/
-
+uv.lock
 
 # ── IDE ────────────────────────────────────────────────────────────────────
 .vscode/
@@ -44,6 +44,7 @@ backend/.streamlit
 
 
 # ── Temporary / scratch files ─────────────────────────────────────────────
-extra(Do Not Delete)/
+extra/
 Old codebase(Do not delete)/
 tests/
+extra(Do Not Delete)

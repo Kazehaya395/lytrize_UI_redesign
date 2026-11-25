@@ -377,6 +377,17 @@ class MainWindow(QMainWindow):
             init_db()
         except Exception as exc:
             log.warning("init_db failed: %s", exc)
+            # Silent failure was the "Home counters / Sessions show zero on a
+            # fresh install" report: every DB-backed card reads 0 with nothing
+            # on screen to say why. Stash it on the bridge; Home shows the
+            # reason instead of a mystery zero.
+            self.bridge.set("db_init_error", str(exc))
+            try:
+                self.status.showMessage(
+                    "⚠ Database unavailable — sessions and counters will not persist. "
+                    f"({exc})", 15000)
+            except Exception:
+                pass
 
         try:
             guest = get_or_create_guest_user()

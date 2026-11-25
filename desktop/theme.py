@@ -179,7 +179,13 @@ def app_font() -> QFont:
     # UI font independently -- on some Windows 10 installs that lands on a
     # legacy bitmap-style face with no curly quotes/em dash and no smoothing,
     # which is what made the app look like it was from the XP era.
-    font = QFont("Inter", BASE_FONT_PT)
+    font = QFont()
+    # A family LIST, not a single family: Inter has no emoji glyphs, so a
+    # machine without a system emoji font (minimal Linux, some Windows 10
+    # VMs) drew every UI icon as a tofu box. Qt resolves per glyph against
+    # the list, and "Noto Emoji" is bundled with the app.
+    font.setFamilies(["Inter", "Noto Emoji"])
+    font.setPointSize(BASE_FONT_PT)
     try:
         font.setStyleStrategy(QFont.PreferAntialias)
     except Exception:

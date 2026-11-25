@@ -166,22 +166,38 @@ class AdvancedChartSettings(CategoricalSettings):
         # renderer-independent rows do not make sense for flow, hierarchy,
         # calendar, funnel, or map visuals, so remove them from the form rather
         # than leaving controls that appear to work but cannot affect options.
+        # The categorical template's axis / value-label rows were split once
+        # the dual-axis work landed: the single "Show value labels" checkbox
+        # became the "Value labels" + "Secondary labels" rows, and the axis
+        # rows became "Y-axis (left)" + "Y-axis (right)". Masks naming the old
+        # strings silently stopped matching, leaking axis, label and line
+        # controls into chart types that cannot render any of them. The names
+        # below are the CURRENT row labels.
+        _AXIS_FAMILY = {"Y-axis (left)", "Y-axis (right)",
+                        "Value labels", "Secondary labels",
+                        "Primary Y-axis labels", "Secondary Y-axis labels"}
         irrelevant = {
-            "sankey": {"X-axis", "Y-axis", "Legend title", "Legend position",
-                       "Legend layout", "Click", "Show value labels", "Label pos",
-                       "Bar mode", "Bar gap", "Show grid", "Show border"},
-            "sunburst": {"X-axis", "Y-axis", "Legend title", "Legend position",
-                         "Legend layout", "Click", "Show value labels", "Label pos",
-                         "Bar mode", "Bar gap", "Show grid", "Show border"},
-            "calendar_heatmap": {"X-axis", "Y-axis", "Legend title", "Legend position",
-                                 "Legend layout", "Click", "Show value labels", "Label pos",
-                                 "Bar mode", "Bar gap", "Show grid", "Show border"},
-            "waterfall": {"Legend title", "Legend position", "Legend layout", "Click",
-                          "Show value labels", "Label pos", "Bar mode", "Bar gap",
-                          "Show border"},
-            "funnel": {"X-axis", "Y-axis", "Legend title", "Legend position",
+            "sankey": {"X-axis", "Legend title", "Legend position",
+                       "Legend layout", "Click", "Label pos",
+                       "Bar mode", "Bar gap", "Show grid", "Show border",
+                       "Line width"} | _AXIS_FAMILY,
+            "sunburst": {"X-axis", "Legend title", "Legend position",
+                         "Legend layout", "Click", "Label pos",
+                         "Bar mode", "Bar gap", "Show grid", "Show border",
+                         "Line width"} | _AXIS_FAMILY,
+            "calendar_heatmap": {"X-axis", "Legend title", "Legend position",
+                                 "Legend layout", "Click", "Label pos",
+                                 "Bar mode", "Bar gap", "Show grid", "Show border",
+                                 "Line width"} | _AXIS_FAMILY,
+            "waterfall": {"Legend title", "Legend position", "Legend layout",
+                          "Click", "Label pos", "Bar mode", "Bar gap",
+                          "Show border", "Line width",
+                          "Y-axis (right)", "Secondary labels",
+                          "Secondary Y-axis labels",
+                          "Value labels", "Primary Y-axis labels"},
+            "funnel": {"X-axis", "Legend title", "Legend position",
                        "Legend layout", "Click", "Label pos", "Bar mode", "Bar gap",
-                       "Show grid", "Show border"},
+                       "Show grid", "Show border", "Line width"} | _AXIS_FAMILY,
         }
         self._mask_rows(root, irrelevant.get(self.family, set()))
         extras = {

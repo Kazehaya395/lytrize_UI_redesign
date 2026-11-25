@@ -255,10 +255,3 @@ class ScatterPlotSettings(TimeSeriesSettings):
         self._add_scatter_rows(root)
         return root
 
-    def build_typography(self):
-        root = super().build_typography()
-        # Scatter has no value labels; its point colour comes from the series
-        # palette/Colour by field and its point size from Layout's M. size.
-        # Keep tooltip color because hover is active.
-        self._mask_rows(root, ("Value color", "Value Color", "Value size"))
-        return root

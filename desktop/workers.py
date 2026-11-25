@@ -103,6 +103,52 @@ class ImportWorker(QThread):
         return frame
 
 
+class DatabaseLoadWorker(QThread):
+    """Load a table or query from a SQL database in a background thread.
+
+    The database counterpart of :class:`ImportWorker`. The source is built
+    through ``services.data_source`` (the plugin seam), and the row limit is
+    pushed INTO the query as an outer LIMIT server-side -- an unbounded
+    ``SELECT *`` against a production table must never materialise just
+    because someone clicked Load. Errors are credentials-redacted before
+    they reach the UI.
+    """
+
+    finished_ok = Signal(object)      # emits pl.DataFrame (no row-id)
+    polars_ready = Signal(object)     # emits PolarsDataset snapshot
+    failed = Signal(str)              # redacted error message
+
+    def __init__(self, spec: dict, parent=None) -> None:
+        super().__init__(parent)
+        self._spec = dict(spec or {})
+
+    def run(self) -> None:
+        try:
+            from services import data_source as ds
+            spec = self._spec
+            kwargs = {"engine": str(spec.get("engine") or "")}
+            limit = spec.get("limit")
+            if limit:
+                kwargs["limit"] = int(limit)
+            if spec.get("table"):
+                kwargs["table"] = spec["table"]
+            elif spec.get("query"):
+                kwargs["query"] = spec["query"]
+            source = ds.make_source(str(spec.get("kind", "postgres")),
+                                    uri=str(spec.get("uri", "")), **kwargs)
+            dataset = source.to_dataset()
+            frame = dataset.frame.collect()
+            row_id = getattr(dataset, "row_id", None)
+            if row_id and row_id in frame.columns:
+                frame = frame.drop(row_id)
+            self.finished_ok.emit(frame)
+            self.polars_ready.emit(dataset)
+        except Exception as exc:
+            from services.data_source import _redact
+            log.error("DatabaseLoadWorker failed: %s", exc)
+            self.failed.emit(_redact(str(exc)))
+
+
 def _to_polars(df) -> "pl.DataFrame":
     """Convert a pandas frame to Polars, tolerating an unusable input."""
     import polars as pl
@@ -394,6 +440,7 @@ class ExportWorker(QThread):
                  report_payload: Optional[dict] = None,
                  report_specs: Optional[dict] = None,
                  geometry_mode: str = "free",
+                 pages: Optional[list] = None,
                  parent=None) -> None:
         super().__init__(parent)
         # ALREADY-BUILT export tuples, not the raw session charts. The session
@@ -427,6 +474,9 @@ class ExportWorker(QThread):
         self._report_payload = dict(report_payload) if report_payload else None
         self._report_specs = dict(report_specs) if report_specs else None
         self._geometry_mode = str(geometry_mode or "free")
+        # Per-page export slices (dashboard multi-page). None keeps the
+        # single-page document byte-identical to before.
+        self._pages = list(pages) if pages else None
 
     def run(self) -> None:
         try:
@@ -446,6 +496,7 @@ class ExportWorker(QThread):
                 report_payload=self._report_payload,
                 report_specs=self._report_specs,
                 geometry_mode=self._geometry_mode,
+                pages=self._pages,
             )
             self.finished_ok.emit(html, safe_file)
         except Exception as exc:
@@ -629,6 +680,16 @@ class ReportInputsWorker(QThread):
                                 "charts left unfiltered", exc_info=True)
                     frames = {}
                 if frames:
+                    from services.chart_service import (
+                        frame_fingerprint, recipe_cache_get,
+                        recipe_cache_key, recipe_cache_put,
+                    )
+                    from services.slicer_service import slicers_for_chart
+                    # Content fingerprint of the parent frame, computed once
+                    # per regen. None -> cache bypassed for this pass
+                    # (correctness first: a frame we cannot fingerprint is
+                    # never served from cache).
+                    df_fingerprint = frame_fingerprint(df)
                     out = []
                     for chart in charts:
                         # A newer regen superseded this one: stop re-running
@@ -643,7 +704,27 @@ class ReportInputsWorker(QThread):
                         if uid not in frames:
                             out.append(chart)
                             continue
+                        cache_key = None
+                        if df_fingerprint:
+                            try:
+                                cache_key = recipe_cache_key(
+                                    df_fingerprint,
+                                    slicers_for_chart(slicers, uid),
+                                    recipes.get(uid) or {})
+                                cached = recipe_cache_get(cache_key)
+                            except Exception:
+                                cache_key, cached = None, None
+                            if cached is not None:
+                                out.append((uid, chart[1], cached[2],
+                                            *chart[3:]))
+                                continue
                         rebuilt = run_chart_recipe(recipes[uid], frames[uid])
+                        if rebuilt is not None and cache_key:
+                            try:
+                                recipe_cache_put(cache_key, rebuilt)
+                            except Exception:
+                                log.debug("recipe cache put failed",
+                                          exc_info=True)
                         out.append((uid, chart[1], rebuilt[2], *chart[3:])
                                    if rebuilt else chart)
                     charts = out

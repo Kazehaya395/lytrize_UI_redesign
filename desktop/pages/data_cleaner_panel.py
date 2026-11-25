@@ -79,9 +79,9 @@ def count_changed_values(before: pl.Series, after: pl.Series) -> int:
     """
     before_s = before.cast(pl.Utf8)
     after_s = after.cast(pl.Utf8)
-    differ = before_s != after_s
+    equal = (before_s == after_s).fill_null(False)
     both_null = before.is_null() & after.is_null()
-    return int((differ & ~both_null).sum())
+    return int((~(equal | both_null)).sum())
 
 
 # UI issue: input bars stretched across the full window width look bad on

@@ -46,10 +46,20 @@ function appliesTo(s, uid) {
   if (String(s.scope || "report").toLowerCase() !== "chart") return true;
   return String(s.target || getSpec(s).target || "") === String(uid);
 }
-function activeFor(slicers, sel, uid) {
+/* A slicer may carry page: "<page-id>". A page-scoped slicer filters only
+ * charts and KPIs living on that page; report-wide (scope=report, no page)
+ * slicers filter everywhere. Passing page=null/undefined keeps the old
+ * behaviour byte for byte (used by the single-page export). */
+function slicerPage(s) {
+  var p = String((s || {}).page || "").trim();
+  return p && p !== "__global__" ? p : null;
+}
+function activeFor(slicers, sel, uid, page) {
   var o = [];
   (slicers || []).forEach(function (s) {
     if (!s || !s.column) return;
+    var sp = slicerPage(s);
+    if (sp && page !== sp) return;
     if (!appliesTo(s, uid)) return;
     if (isActive(s, sel)) o.push(s);
   });
@@ -58,10 +68,10 @@ function activeFor(slicers, sel, uid) {
 function hasActive(slicers, sel) {
   return (slicers || []).some(function (s) { return isActive(s, sel); });
 }
-function filterIdx(payload, slicers, sel, uid, cache) {
+function filterIdx(payload, slicers, sel, uid, cache, page) {
   var n = payload.total_rows || 0;
   if (!n || !payload.columns) return [];
-  var act = activeFor(slicers, sel, uid);
+  var act = activeFor(slicers, sel, uid, page);
   // One board update asks for the same report-wide selection once per chart
   // and again for KPIs. Cache by the active slicers and their selected values
   // so a million-row mask is built once per distinct scope, not per card.

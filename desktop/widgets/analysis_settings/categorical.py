@@ -6,9 +6,10 @@ Design note (why this subclasses StatisticalSettings):
     type-agnostic rows come from the template, and only the tabs that
     genuinely differ are touched. See ``extra/CHART_IMPLEMENTATION_RULES.md``.
 
-    * Generate -- rebuilt, because the categorical form has eight controls in
-      the old panel's order (single-selects, not the template's multi-select
-      metrics). They flow across the pane (``base.FlowGrid``): as many per
+    * Generate -- rebuilt, because the categorical form has nine controls in
+      the panel's order (single-selects, not the template's multi-select
+      metrics): the old panel's eight plus Sort by, which was added after the
+      initial migration and stays. They flow across the pane (``base.FlowGrid``): as many per
       line as fit, every line filled edge to edge, the remainder wrapped onto
       the next line at the left. The old panel's ``st.columns(8)`` did the
       same thing -- a fixed three-per-row grid filled only the left third of
@@ -25,17 +26,19 @@ Feature reference (old codebase -- names/types/ranges/defaults only, never
 the Streamlit grouping):
 
     Generate panel (``analysis/__init__.py``, the ``categorical`` branch of
-    ``_render_config_panel_body``) renders eight columns in this order::
+    ``_render_config_panel_body``) renders these columns in this order::
 
         Dimension | Metric | Aggregation | \\U0001f4ca Direction | Top N |
         Secondary Y-Axis | Secondary Agg | Palette
 
     ``_WIDGET_SPEC["categorical"]`` declares x/y as lists (the runner loops
-    over dimensions x metrics and emits one chart per combination) and also
-    declares ``sort`` -- but the old panel NEVER rendered a Sort control for
-    this type (only pie_chart did), so like correlation's masked palette it is
-    deliberately not built and not collected: a control the old UI never had
-    is not a control this one may invent.
+    over dimensions x metrics and emits one chart per combination).
+
+    It ALSO gained a Sort by control after the initial migration (agreed
+    and kept): it is wired end-to-end -- the panel collects ``sort_by``,
+    prefill accepts both ``sort_by`` and the WIDGET_SPEC name ``sort``, and
+    the service normalises ``sort_by`` -> ``sort`` before dispatch. So the
+    form renders nine controls; Sort by sits between Direction and Top N.
 
     ``CHART_TYPE_SETTINGS["categorical"]`` says ``has_axes=True`` and
     ``has_legend=False``, but that flag describes the old Streamlit panel, not

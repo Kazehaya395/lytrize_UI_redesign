@@ -79,10 +79,6 @@ class MapPlotSettings(CorrelationSettings):
             if not hasattr(self, attr):
                 setattr(self, attr, None)
 
-    def build_typography(self):
-        root = super().build_typography()
-        self._mask_rows(root, ("Value size", "Value color", "Value Color"))
-        return root
 
     # -- Generate ----------------------------------------------------------
     def _combo_section(self, title, hint, items, current, on_change):
@@ -157,8 +153,7 @@ class MapPlotSettings(CorrelationSettings):
         add('Aggregation', box)
 
         box, self._combo_style = self._combo_section(
-            'Style', ('Offline boundary colors or optional Esri satellite imagery. '
-                      'Online imagery sends the visible map area to Esri; your data stays local.'),
+            'Style', 'Local boundaries, or Esri satellite imagery (online).',
             MAP_STYLES, MAP_STYLES[0], self._on_style)
         add('Style', box)
 
@@ -243,7 +238,7 @@ class MapPlotSettings(CorrelationSettings):
             tl.addWidget(cell)
         add('Options', section_box(
             'Options', toggles,
-            'Invert flips the colour scale; Borders toggles local boundary lines'))
+            'Invert flips scale; Borders toggles lines.'))
 
         rl.addWidget(flow)
         rl.addStretch()
@@ -419,8 +414,6 @@ class MapPlotSettings(CorrelationSettings):
         # fires here -- re-gate the sections explicitly or a restored
         # choropleth would come back showing the scatter-only fields.
         self._sync_mode_sections()
-
-
 
 
     def _add_map_rows(self, root):
